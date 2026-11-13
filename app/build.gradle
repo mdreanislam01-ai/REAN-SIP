@@ -51,7 +51,8 @@ android {
 
 dependencies {
     // Professional SIP stack (UDP / TCP / TLS, G.711, G.722, Opus, AEC)
-    implementation 'org.linphone:linphone-sdk-android:5.3.+'
+    // Pin a published SDK release for reproducible APK builds.
+    implementation 'org.linphone:linphone-sdk-android:5.3.107'
 
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'androidx.appcompat:appcompat:1.7.0'

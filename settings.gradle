@@ -10,7 +10,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven { url 'https://linphone.org/maven_repository/' }
+        // Official Linphone Android SDK repository (the old linphone.org alias was retired).
+        maven { url 'https://download.linphone.org/releases/android/maven_repository/' }
     }
 }
 rootProject.name = "Rean Dialer"
