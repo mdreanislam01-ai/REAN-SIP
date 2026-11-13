@@ -193,7 +193,7 @@ object CoreManager {
 
         return try {
             val params = c.createCallParams(null) ?: return false
-            params.enableVideo(false)
+            params.setVideoEnabled(false)
             c.inviteAddressWithParams(address, params)
             true
         } catch (t: Throwable) {
@@ -206,7 +206,7 @@ object CoreManager {
         try {
             val c = core ?: return
             val params = c.createCallParams(call) ?: return
-            params.enableVideo(false)
+            params.setVideoEnabled(false)
             call.acceptWithParams(params)
         } catch (t: Throwable) {
             Log.e(TAG, "answer failed", t)
