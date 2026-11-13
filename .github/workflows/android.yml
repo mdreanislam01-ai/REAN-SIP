@@ -71,5 +71,6 @@ jobs:
         run: |
           gh release delete dev-latest --yes --cleanup-tag || true
           gh release create dev-latest artifacts/*.apk artifacts/checksums.sha256 \
+            --target "$GITHUB_SHA" \
             --title "Rean Dialer — latest dev build (#$GITHUB_RUN_NUMBER)" \
             --notes "Automated APK build from commit $GITHUB_SHA (branch: $GITHUB_REF_NAME). Verify the download with checksums.sha256." || true
