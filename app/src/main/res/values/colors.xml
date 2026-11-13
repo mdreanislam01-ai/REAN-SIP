@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ocean_950">#061827</color>
+    <color name="ocean_900">#08243A</color>
+    <color name="ocean_850">#0A304B</color>
+    <color name="ocean_800">#0C3D5D</color>
+    <color name="ocean_700">#0A6E9B</color>
+    <color name="ocean_600">#008DC6</color>
+    <color name="ocean_500">#00A9E8</color>
+    <color name="ocean_300">#71D1F5</color>
+    <color name="ocean_100">#D6F3FF</color>
+    <color name="surface_dark">#0C2032</color>
+    <color name="surface_card">#112B40</color>
+    <color name="surface_card_pressed">#173C57</color>
+    <color name="text_primary">#F4FAFD</color>
+    <color name="text_secondary">#A8C2D0</color>
+    <color name="text_muted">#6F919F</color>
+    <color name="success">#42D392</color>
+    <color name="warning">#FFBE55</color>
+    <color name="danger">#FF5D6C</color>
+    <color name="white">#FFFFFF</color>
+    <color name="transparent">#00000000</color>
+</resources>
