@@ -43,7 +43,9 @@ jobs:
           if [ "$RESULT" -ne 0 ]; then
             # Mirror the useful tail into a check annotation, so compilation errors
             # remain visible even when GitHub's raw Actions log is unavailable.
-            DETAILS=$(tail -n 45 build.log | tr '\n' ' ' | sed 's/::/: :/g')
+            DETAILS=$(grep -E '(^e: | error: |^FAILURE:|^\* What went wrong:|^\* Exception is:|^> Task :.*FAILED|^Caused by:)' build.log | tail -n 35 | tr '\n' ' ' | sed 's/::/: :/g')
+            # Fallback for a failure which didn't emit a concise compiler line.
+            [ -n "$DETAILS" ] || DETAILS=$(tail -n 45 build.log | tr '\n' ' ' | sed 's/::/: :/g')
             echo "::error title=Gradle build failure::$DETAILS"
             exit "$RESULT"
           fi
