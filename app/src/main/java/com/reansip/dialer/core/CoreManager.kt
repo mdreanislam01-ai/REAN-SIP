@@ -226,7 +226,7 @@ object CoreManager {
 
     fun setMicMuted(muted: Boolean) {
         micMuted = muted
-        try { core?.enableMic(!muted) } catch (t: Throwable) { Log.w(TAG, "mic", t) }
+        try { core?.setMicEnabled(!muted) } catch (t: Throwable) { Log.w(TAG, "mic", t) }
     }
 
     fun isMicMuted(): Boolean = micMuted
