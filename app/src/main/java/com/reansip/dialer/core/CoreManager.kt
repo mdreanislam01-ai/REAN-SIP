@@ -192,8 +192,8 @@ object CoreManager {
         } ?: return false
 
         return try {
-            val params = c.createCallParams(null)
-            params.videoEnabled = false
+            val params = c.createCallParams(null) ?: return false
+            params.enableVideo(false)
             c.inviteAddressWithParams(address, params)
             true
         } catch (t: Throwable) {
@@ -205,8 +205,8 @@ object CoreManager {
     fun answer(call: Call) {
         try {
             val c = core ?: return
-            val params = c.createCallParams(call)
-            params.videoEnabled = false
+            val params = c.createCallParams(call) ?: return
+            params.enableVideo(false)
             call.acceptWithParams(params)
         } catch (t: Throwable) {
             Log.e(TAG, "answer failed", t)
@@ -221,11 +221,15 @@ object CoreManager {
         try { core?.terminateAllCalls() } catch (t: Throwable) { Log.w(TAG, "terminateAll", t) }
     }
 
+    @Volatile
+    private var micMuted = false
+
     fun setMicMuted(muted: Boolean) {
-        try { core?.micEnabled = !muted } catch (t: Throwable) { Log.w(TAG, "mic", t) }
+        micMuted = muted
+        try { core?.enableMic(!muted) } catch (t: Throwable) { Log.w(TAG, "mic", t) }
     }
 
-    fun isMicMuted(): Boolean = core?.let { !it.micEnabled } ?: false
+    fun isMicMuted(): Boolean = micMuted
 
     /** Returns true when ON hold after the toggle. */
     fun toggleHold(call: Call): Boolean {
@@ -308,7 +312,7 @@ object CoreManager {
 
     private val coreListener = object : CoreListenerStub() {
 
-        override fun onRegistrationStateChanged(
+        override fun onAccountRegistrationStateChanged(
             core: Core,
             account: Account,
             state: RegistrationState,
