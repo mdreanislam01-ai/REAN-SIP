@@ -35,7 +35,18 @@ jobs:
           /opt/gradle-8.10.2/bin/gradle --version
 
       - name: Build debug APK
-        run: gradle assembleDebug --stacktrace --no-daemon
+        run: |
+          set +e
+          gradle assembleDebug --stacktrace --no-daemon > build.log 2>&1
+          RESULT=$?
+          cat build.log
+          if [ "$RESULT" -ne 0 ]; then
+            # Mirror the useful tail into a check annotation, so compilation errors
+            # remain visible even when GitHub's raw Actions log is unavailable.
+            DETAILS=$(tail -n 45 build.log | tr '\n' ' ' | sed 's/::/: :/g')
+            echo "::error title=Gradle build failure::$DETAILS"
+            exit "$RESULT"
+          fi
 
       - name: Package artifacts
         run: |
