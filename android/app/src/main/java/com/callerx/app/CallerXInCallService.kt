@@ -2,6 +2,7 @@ package com.callerx.app
 
 import android.content.Intent
 import android.telecom.Call
+import android.telecom.CallAudioState
 import android.telecom.InCallService
 import android.telecom.PhoneAccount
 import android.telecom.TelecomManager
@@ -41,6 +42,10 @@ class CallerXInCallService : InCallService() {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 .putExtra("callerx_open_call", true))
         } catch (_: Exception) { }
+    }
+
+    fun setSpeakerRoute(on: Boolean) {
+        try { setAudioRoute(if (on) CallAudioState.ROUTE_SPEAKER else CallAudioState.ROUTE_EARPIECE) } catch (_: Exception) { }
     }
 
     override fun onCallRemoved(call: Call) {
