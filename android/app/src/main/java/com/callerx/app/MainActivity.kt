@@ -1562,7 +1562,7 @@ private fun ContactDetailScreen(activity: MainActivity, person: Person, recents:
         contactEmail = withContext(Dispatchers.IO) {
             try {
                 var email = ""
-                context.contentResolver.query(Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_URI, Uri.encode(norm)), arrayOf(ContactsContract.PhoneLookup._ID), null, null, null)?.use { c ->
+                context.contentResolver.query(Uri.parse("content://com.android.contacts/phone_lookup/" + Uri.encode(norm)), arrayOf(ContactsContract.PhoneLookup._ID), null, null, null)?.use { c ->
                     if (c.moveToNext()) {
                         val id = c.getString(0)
                         context.contentResolver.query(ContactsContract.CommonDataKinds.Email.CONTENT_URI, arrayOf(ContactsContract.CommonDataKinds.Email.ADDRESS), ContactsContract.CommonDataKinds.Email.CONTACT_ID + "=?", arrayOf(id), null)?.use { e -> if (e.moveToNext()) email = e.getString(0).orEmpty() }
