@@ -298,7 +298,7 @@ class MainActivity : ComponentActivity() {
             val auth = Factory.instance().createAuthInfo(username.trim(), null, password, null, null, cleanDomain)
             val params = c.createAccountParams()
             val identity = Factory.instance().createAddress("sip:${username.trim()}@$cleanDomain")
-            if (displayName.isNotBlank()) { try { identity.displayName = displayName.trim() } catch (_: Exception) { } }
+            if (displayName.isNotBlank()) { try { identity?.displayName = displayName.trim() } catch (_: Exception) { } }
             val server = Factory.instance().createAddress("sip:$cleanDomain:${port.trim()};transport=${transport.lowercase()}")
             params.setIdentityAddress(identity)
             params.setServerAddress(server)
@@ -379,11 +379,11 @@ class MainActivity : ComponentActivity() {
             val enabledLower = enabled.map { it.lowercase() }.toSet()
             try {
                 c.audioPayloadTypes.forEach { pt ->
-                    pt.enabled = enabledLower.contains(pt.mimeType.lowercase())
+                    pt.enable(enabledLower.contains(pt.mimeType.lowercase()))
                 }
             } catch (_: Exception) { }
-            try { c.enableEchoCancellation(prefs.getBoolean("audio_echo", true)) } catch (_: Exception) { }
-            try { c.enableNoiseSuppression(prefs.getBoolean("audio_noise", true)) } catch (_: Exception) { }
+            try { c.echoCancellationEnabled = prefs.getBoolean("audio_echo", true) } catch (_: Exception) { }
+            try { c.noiseSuppressionEnabled = prefs.getBoolean("audio_noise", true) } catch (_: Exception) { }
             try { c.micGainDb = prefs.getFloat("audio_mic_gain", 2f) } catch (_: Exception) { }
         } catch (_: Exception) { }
     }
@@ -891,7 +891,7 @@ private fun CallerXApp(activity: MainActivity) {
                     badge = if (blockedCount > 0) "$blockedCount" else null)
             }
             item {
-                SettingRow(Icons.Filled.BatteryCharging, Color(0xFFD97706), iconBg(Color(0xFFFEF3C7), Color(0xFFD97706)),
+                SettingRow(Icons.Filled.PowerSettingsNew, Color(0xFFD97706), iconBg(Color(0xFFFEF3C7), Color(0xFFD97706)),
                     "Power Mode", "$powerMode · " + if (powerMode == "Unrestricted") "Best for background SIP" else "Battery conscious", onPower)
             }
             item {
@@ -1477,9 +1477,7 @@ private fun CallerXApp(activity: MainActivity) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth().padding(top = 24.dp)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(statusText ?: "You are up to date!", color = if (latestTag != null && isNewerVersion(latestTag!!, versionName)) MaterialTheme.colorScheme.primary else Color(0xFF059669), fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                    Text(if (latestNotes.isNotBlank()) latestNotes.take(600) else "• Enhanced Dual-SIM & SIP call badges
-• Low-latency Opus HD audio codec support
-• Automatic call recording & cloud backup", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                    Text(if (latestNotes.isNotBlank()) latestNotes.take(600) else "• Enhanced Dual-SIM & SIP call badges" + "\n" + "• Low-latency Opus HD audio codec support" + "\n" + "• Automatic call recording & cloud backup", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
                 }
             }
             if (latestTag != null && isNewerVersion(latestTag!!, versionName) && latestUrl != null) {

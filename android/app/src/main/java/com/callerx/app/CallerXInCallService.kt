@@ -44,7 +44,7 @@ class CallerXInCallService : InCallService() {
         super.onCallAdded(call)
         val incomingNumber = call.details.handle?.schemeSpecificPart.orEmpty()
         if (isBlocked(incomingNumber)) {
-            try { call.reject(false) } catch (_: Exception) { try { call.disconnect() } catch (_: Exception) { } }
+            try { call.disconnect() } catch (_: Exception) { }
             return
         }
         TelecomCallBridge.service = this
