@@ -6,7 +6,9 @@ The UI is built from the supplied `CallerX.html` design (Calls, Messages, Contac
 ## Features
 
 - নেটিভ Jetpack Compose UI — dialer keypad, recents, messages, contacts, settings
-- SIP calling (UDP / TCP / TLS / WSS) via Linphone SDK 5.4
+- SIP calling (UDP / TCP / TLS) via Linphone SDK 5.4
+- Incoming call ringtone + vibration, outgoing call ringback tone (bundled WAV tones)
+- STUN/ICE NAT traversal so calls work behind mobile carrier NAT
 - Incoming/outgoing native call screens, mute, speaker, hold, end call
 - Android dialer role qualification, cellular calls routed through the selected SIM account
 - Runtime microphone, notification, SMS and contacts permission handling
@@ -27,10 +29,10 @@ The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow files runs the **Build CallerX APK** GitHub Actions workflow. It builds the debug APK, uploads it as a workflow artifact, and publishes it to the rolling GitHub release:
 
-**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.4.2>**
+**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.4.3>**
 
 ## Notes
 
 - This is a debug build, signed with the default debug key. For Play Store distribution a release keystore is required.
-- SIP registration requires a SIP provider with secure WSS and WebRTC audio enabled.
+- The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.

@@ -16,8 +16,14 @@ import android.provider.CallLog
 import android.provider.Telephony
 import java.text.DateFormat
 import java.util.Date
+import android.media.AudioAttributes
+import android.os.Build
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.view.View
+import java.io.File
+import kotlinx.coroutines.delay
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -98,6 +104,8 @@ class MainActivity : ComponentActivity() {
     var activeCallSource by mutableStateOf("SIP VOIP · HD AUDIO")
     private var activeCall: Call? = null
     var errorMessage by mutableStateOf("")
+    var callConnected by mutableStateOf(false)
+    private var incomingVibrationOn = false
     var dialIntentNumber by mutableStateOf("")
     var callUiRequested by mutableStateOf(false)
     var dialerRoleTick by mutableIntStateOf(0)
@@ -210,7 +218,8 @@ class MainActivity : ComponentActivity() {
 
     private fun initializeLinphone() {
         try {
-            val c = Factory.instance().createCore(null, null, applicationContext)
+            val soundsDir = prepareSounds()
+            val c = Factory.instance().createCore(buildCoreConfig(soundsDir), null, applicationContext)
             core = c
             c.addListener(object : CoreListenerStub() {
                 override fun onAccountRegistrationStateChanged(core: Core, account: Account, state: RegistrationState, message: String) {
@@ -220,20 +229,35 @@ class MainActivity : ComponentActivity() {
                             RegistrationState.Ok -> "SIP Online"
                             RegistrationState.Progress -> "Registering…"
                             RegistrationState.Failed -> "SIP Registration Failed"
+                            RegistrationState.Cleared -> "SIP Offline"
                             else -> "SIP Offline"
+                        }
+                        if (state == RegistrationState.Failed) {
+                            errorMessage = "SIP registration failed: $message — check username, password, server domain, port and transport (UDP/TCP/TLS) with your SIP provider."
                         }
                     }
                 }
                 override fun onCallStateChanged(core: Core, call: Call, state: Call.State, message: String) {
                     runOnUiThread {
                         activeCall = if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) null else call
-                        if (state == Call.State.IncomingReceived) {
-                            activeCallName = call.remoteAddress?.displayName?.takeIf { it.isNotBlank() } ?: "Incoming caller"
-                            activeNumber = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
+                        when (state) {
+                            Call.State.IncomingReceived -> {
+                                activeCallName = call.remoteAddress?.displayName?.takeIf { it.isNotBlank() } ?: "Incoming caller"
+                                activeNumber = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
+                                callConnected = false
+                                startIncomingVibration()
+                            }
+                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> callConnected = false
+                            Call.State.Connected -> { callConnected = true; stopIncomingVibration() }
+                            Call.State.StreamsRunning -> { callConnected = true; stopIncomingVibration() }
+                            Call.State.End, Call.State.Released, Call.State.Error -> stopIncomingVibration()
+                            else -> { }
                         }
                         callState = when (state) {
                             Call.State.IncomingReceived -> "Incoming SIP call"
-                            Call.State.OutgoingInit, Call.State.OutgoingProgress, Call.State.OutgoingRinging -> "Calling…"
+                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> "Calling…"
+                            Call.State.OutgoingRinging -> "Ringing…"
+                            Call.State.OutgoingEarlyMedia -> "Connecting audio…"
                             Call.State.Connected -> "Connected"
                             Call.State.StreamsRunning -> "In call"
                             Call.State.End, Call.State.Released -> "Call ended"
@@ -249,15 +273,150 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Copies the bundled ring/ringback tones out of the APK assets so liblinphone can play them. */
+    private fun prepareSounds(): File {
+        val dir = File(filesDir, "sounds")
+        try {
+            if (!dir.exists()) dir.mkdirs()
+            for (name in listOf("ring.wav", "ringback.wav")) {
+                val out = File(dir, name)
+                if (!out.exists() || out.length() < 1024) {
+                    assets.open("sounds/$name").use { input -> out.outputStream().use { input.copyTo(it) } }
+                }
+            }
+        } catch (e: Exception) {
+            errorMessage = "Call tones could not be installed: ${e.message ?: "asset error"}"
+        }
+        return dir
+    }
+
+    /**
+     * Writes a linphonerc with the pieces an empty Core is missing: local ring/ringback tones
+     * (without these a call is completely silent — no ringtone, no ringback), STUN+ICE NAT policy
+     * (without this, media through carrier NAT fails and calls silently die) and audio codecs.
+     */
+    private fun buildCoreConfig(soundsDir: File): String? {
+        return try {
+            val cfg = File(filesDir, "linphonerc")
+            val ring = File(soundsDir, "ring.wav").absolutePath
+            val ringback = File(soundsDir, "ringback.wav").absolutePath
+            cfg.writeText(
+                """
+                [net]
+                download_bw=0
+                upload_bw=0
+                mtu=1300
+                stun_server=stun.l.google.com:19302
+                protocols=stun,ice
+                nat_policy_ref=default_nat_policy
+
+                [default_nat_policy]
+                protocols=stun,ice
+                stun_server=stun.l.google.com:19302
+
+                [sound]
+                ring=$ring
+                ringback=$ringback
+                remote_ring=$ring
+                echocancellation=1
+                echocancellation_tail_len=250
+
+                [rtp]
+                audio_rtp_port=7078
+                video_rtp_port=0
+
+                [video]
+                enabled=0
+
+                [audio_codec_0]
+                mime=opus
+                rate=48000
+                channels=2
+                enabled=1
+
+                [audio_codec_1]
+                mime=PCMU
+                rate=8000
+                channels=1
+                enabled=1
+
+                [audio_codec_2]
+                mime=PCMA
+                rate=8000
+                channels=1
+                enabled=1
+
+                [audio_codec_3]
+                mime=G722
+                rate=8000
+                channels=1
+                enabled=1
+
+                [audio_codec_4]
+                mime=telephone-event
+                rate=8000
+                channels=1
+                enabled=1
+
+                [sip]
+                guess_hostname=0
+                use_ipv6=0
+                inc_timeout=60
+                register_only_when_network_is_up=1
+                ping_with_options=1
+                """.trimIndent()
+            )
+            cfg.absolutePath
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun startIncomingVibration() {
+        if (incomingVibrationOn) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.VIBRATE) != PackageManager.PERMISSION_GRANTED) return
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) getSystemService(Vibrator::class.java) else @Suppress("DEPRECATION") getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
+            vibrator ?: return
+            if (!vibrator.hasVibrator()) return
+            val pattern = longArrayOf(0, 800, 600)
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0), attrs)
+            } else {
+                @Suppress("DEPRECATION") vibrator.vibrate(pattern, 0)
+            }
+            incomingVibrationOn = true
+        } catch (_: Exception) { }
+    }
+
+    private fun stopIncomingVibration() {
+        if (!incomingVibrationOn) return
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) getSystemService(Vibrator::class.java) else @Suppress("DEPRECATION") getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
+            vibrator?.cancel()
+        } catch (_: Exception) { }
+        incomingVibrationOn = false
+    }
+
     fun registerSip(username: String, password: String, domain: String, port: String, transport: String) {
         val c = core ?: run { initializeLinphone(); core } ?: return
+        val cleanUser = username.trim().substringBefore("@")
+        var cleanDomain = domain.trim().removePrefix("sip:").removeSuffix("/").substringBefore(';')
+        if (username.trim().contains("@")) cleanDomain = username.trim().substringAfter("@").removePrefix("sip:")
+        if (cleanUser.isEmpty() || password.isEmpty() || cleanDomain.isEmpty()) {
+            errorMessage = "Enter your SIP username, password and server domain before registering."
+            return
+        }
         try {
             c.clearAccounts()
             c.clearAllAuthInfo()
-            val cleanDomain = domain.trim().removePrefix("sip:").substringBefore(';')
-            val auth = Factory.instance().createAuthInfo(username.trim(), null, password, null, null, cleanDomain)
+            val auth = Factory.instance().createAuthInfo(cleanUser, null, password, null, null, cleanDomain)
             val params = c.createAccountParams()
-            val identity = Factory.instance().createAddress("sip:${username.trim()}@$cleanDomain")
+            val identity = Factory.instance().createAddress("sip:$cleanUser@$cleanDomain")
             val server = Factory.instance().createAddress("sip:$cleanDomain:${port.trim()};transport=${transport.lowercase()}")
             params.setIdentityAddress(identity)
             params.setServerAddress(server)
@@ -274,30 +433,40 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun startSipCall(number: String, name: String) {
+    fun startSipCall(number: String, name: String): Boolean {
         activeCallSource = "SIP VOIP · HD AUDIO"
+        val clean = number.trim().replace(" ", "").replace("-", "")
+        if (clean.isEmpty()) { errorMessage = "Enter a phone number or SIP address first."; return false }
+        if (!registered) {
+            errorMessage = "SIP account is not registered yet. Open Settings → SIP Account, enter your username, password, server and tap Save & Register. Wait until the status shows “SIP Online”, then call again."
+            return false
+        }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             activeNumber = number; activeCallName = name
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
-            return
+            return true
         }
-        val c = core ?: return
-        try {
-            val clean = number.trim().replace(" ", "").replace("-", "")
+        val c = core ?: run { errorMessage = "VoIP engine is not ready yet. Restart CallerX and try again."; return false }
+        return try {
             val domain = c.defaultAccount?.params?.identityAddress?.domain.orEmpty()
             val target = if (clean.startsWith("sip:") || clean.contains("@")) clean else "sip:$clean@$domain"
             val address = c.interpretUrl(target)
-            if (address == null) { errorMessage = "Enter a valid SIP address or register a SIP account first."; return }
+            if (address == null) { errorMessage = "“$number” is not a valid SIP address. Dial the number your SIP provider expects (with or without +/00 prefix)."; return false }
             activeCallName = name
-            activeCall = c.inviteAddress(address)
+            activeNumber = clean
+            callConnected = false
+            val call = c.inviteAddress(address)
+            if (call == null) { errorMessage = "The call could not be started. Check your network connection and SIP account, then try again."; return false }
+            activeCall = call
             callState = "Calling…"
-        } catch (e: Exception) { errorMessage = "Call could not start: ${e.message ?: "network unavailable"}" }
+            true
+        } catch (e: Exception) { errorMessage = "Call could not start: ${e.message ?: "network unavailable"}"; false }
     }
 
-    fun answerCall() { try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
+    fun answerCall() { stopIncomingVibration(); try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
     fun answerCellCall() { try { TelecomCallBridge.currentCall?.answer(0) } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
     fun endCellCall() { try { TelecomCallBridge.currentCall?.disconnect() } catch (e: Exception) { errorMessage = "Could not end call: ${e.message}" } }
-    fun endCall() { try { core?.currentCall?.terminate() ?: core?.terminateAllCalls() } catch (_: Exception) { core?.terminateAllCalls() } }
+    fun endCall() { stopIncomingVibration(); try { core?.currentCall?.terminate() ?: core?.terminateAllCalls() } catch (_: Exception) { core?.terminateAllCalls() } }
     fun toggleMute(muted: Boolean) {
         if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setMuted(muted); return }
         core?.currentCall?.microphoneMuted = muted
@@ -373,6 +542,13 @@ private fun CallerXApp(activity: MainActivity) {
             activity.callUiRequested = false
         }
     }
+    LaunchedEffect(activity.callState) {
+        if (screen == "call" && TelecomCallBridge.currentCall == null &&
+            (activity.callState == "Call ended" || activity.callState.startsWith("Call failed"))) {
+            delay(1600)
+            if (screen == "call") screen = if (activity.callConnected) "summary" else "home"
+        }
+    }
     val color = Palette[accent.coerceIn(Palette.indices)]
     val scheme = if (dark) darkColorScheme(primary = color, secondary = color, background = Color(0xFF101318), surface = Color(0xFF1B2027))
         else lightColorScheme(primary = color, secondary = color, background = Color(0xFFF6F8FA), surface = Color.White)
@@ -387,7 +563,7 @@ private fun CallerXApp(activity: MainActivity) {
                 onMute = { muted = !muted; activity.toggleMute(muted) }, onSpeaker = { speaker = !speaker; activity.setSpeaker(speaker) },
                 onHold = { held -> activity.toggleHold(held) }, onAnswer = { if (isCellCall) activity.answerCellCall() else activity.answerCall() },
                 onDecline = { if (isCellCall) activity.endCellCall() else activity.endCall(); screen = "home" },
-                onEnd = { if (isCellCall) activity.endCellCall() else activity.endCall(); afterCall = true; screen = "summary" })
+                onEnd = { if (isCellCall) activity.endCellCall() else activity.endCall(); afterCall = true; screen = if (isCellCall || activity.callConnected) "summary" else "home" })
         } else if (screen == "summary") {
             SummaryScreen(activity.activeCallName, activity.activeNumber, onDone = { screen = "home"; tab = "Calls" })
         } else if (screen == "sip") {
@@ -476,7 +652,7 @@ private fun CallerXApp(activity: MainActivity) {
             AlertDialog(onDismissRequest = { showCallSheet = false }, title = { Text("Call with…") }, text = { Column { Text(selected?.number ?: number, color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(14.dp)); (listOf("SIP / VoIP") + listOf("SIM 1", "SIM 2").filter { prefs.getBoolean("setting:$it", false) }).forEach { method -> TextButton(onClick = {
                 showCallSheet = false
                 val dialedNumber = selected?.number ?: number
-                if (method == "SIP / VoIP") { activity.activeNumber = dialedNumber; activity.activeCallName = selected?.name ?: "Dialed number"; activity.startSipCall(activity.activeNumber, activity.activeCallName); screen = "call" }
+                if (method == "SIP / VoIP") { activity.activeNumber = dialedNumber; activity.activeCallName = selected?.name ?: "Dialed number"; if (activity.startSipCall(activity.activeNumber, activity.activeCallName)) screen = "call" }
                 else { activity.startCellCall(dialedNumber, if (method == "SIM 2") 1 else 0); screen = "home" }
             }) { Icon(Icons.Filled.Call, null, tint = color); Spacer(Modifier.width(10.dp)); Text(method) } } } }, confirmButton = { TextButton(onClick = { showCallSheet = false }) { Text("Cancel") } })
         }
