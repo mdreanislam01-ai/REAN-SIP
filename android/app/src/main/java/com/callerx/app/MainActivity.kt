@@ -50,6 +50,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.launch
 import org.linphone.core.*
 
 // Theme presets (from the user's Settings HTML design). Selecting one recolors the
@@ -851,7 +852,7 @@ private fun CallerXApp(activity: MainActivity) {
 @Composable private fun CallRow(person: Person, color: Color, onOpen: () -> Unit, onCall: () -> Unit) {
     val isMissed = person.callType == CallLog.Calls.MISSED_TYPE
     val isOutgoing = person.callType == CallLog.Calls.OUTGOING_TYPE
-    val dirIcon = if (isMissed) Icons.Filled.PhoneMissed else if (isOutgoing) Icons.Filled.ArrowUpRight else Icons.Filled.ArrowDownLeft
+    val dirIcon = if (isMissed) Icons.Filled.PhoneMissed else if (isOutgoing) Icons.Filled.CallMade else Icons.Filled.CallReceived
     val dirColor = if (isMissed) Color(0xFFE11D48) else if (isOutgoing) Color(0xFF2563EB) else Color(0xFF059669)
     val dirLabel = if (isMissed) "Missed call" else if (isOutgoing) "Outgoing call" else "Incoming call"
     Column(Modifier.fillMaxWidth()) {
@@ -904,7 +905,7 @@ private fun CallerXApp(activity: MainActivity) {
 @Composable private fun HistoryRow(person: Person) {
     val isMissed = person.callType == CallLog.Calls.MISSED_TYPE
     val isOutgoing = person.callType == CallLog.Calls.OUTGOING_TYPE
-    val dirIcon = if (isMissed) Icons.Filled.PhoneMissed else if (isOutgoing) Icons.Filled.ArrowUpRight else Icons.Filled.ArrowDownLeft
+    val dirIcon = if (isMissed) Icons.Filled.PhoneMissed else if (isOutgoing) Icons.Filled.CallMade else Icons.Filled.CallReceived
     val dirColor = if (isMissed) Color(0xFFE11D48) else if (isOutgoing) Color(0xFF2563EB) else Color(0xFF059669)
     val dirLabel = if (isMissed) "Missed call" else if (isOutgoing) "Outgoing call" else "Incoming call"
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
