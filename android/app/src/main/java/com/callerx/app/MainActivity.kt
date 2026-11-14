@@ -119,6 +119,21 @@ private fun loadSipCallLog(context: Context): List<Person> {
         Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", time = formatCallTime(dateMs), callType = type, source = "SIP", durationSec = durationSec, dateMs = dateMs)
     }.sortedByDescending { it.dateMs }
 }
+
+private data class SimLine(val slot: Int, val carrier: String, val number: String)
+
+private fun loadSimLines(context: Context): List<SimLine> {
+    return try {
+        val subs = context.getSystemService(SubscriptionManager::class.java)?.activeSubscriptionInfoList.orEmpty()
+        subs.sortedBy { it.simSlotIndex }.map { sub ->
+            SimLine(
+                slot = sub.simSlotIndex,
+                carrier = sub.carrierName?.toString().orEmpty().ifBlank { sub.displayName?.toString().orEmpty() },
+                number = try { sub.number.orEmpty() } catch (_: SecurityException) { "" }
+            )
+        }
+    } catch (_: Exception) { emptyList() }
+}
 private fun loadSms(context: Context): List<Pair<String,String>> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return emptyList()
     val rows = mutableListOf<Pair<String,String>>()
@@ -712,6 +727,24 @@ private fun CallerXApp(activity: MainActivity) {
                 activity.errorMessage = "Enable SIM 1, SIM 2 or register SIP to make calls."
             }
         } else {
+            val digits = normalizeDigits(person.number)
+            val defaultLine = if (digits.isNotBlank()) prefs.getString("default_line:$digits", null) else null
+            val dialed = person.number
+            when (defaultLine) {
+                "SIP" -> if (activity.registered) {
+                    activity.activeNumber = dialed; activity.activeCallName = person.name
+                    activity.startSipCall(dialed, person.name); screen = "call"
+                    return
+                }
+                "SIM 1" -> if (prefs.getBoolean("setting:SIM 1", true)) {
+                    activity.startCellCall(dialed, 0); screen = "home"
+                    return
+                }
+                "SIM 2" -> if (prefs.getBoolean("setting:SIM 2", true)) {
+                    activity.startCellCall(dialed, 1); screen = "home"
+                    return
+                }
+            }
             selected = person
             showCallSheet = true
         }
@@ -828,12 +861,77 @@ private fun CallerXApp(activity: MainActivity) {
             }
         }
         if (showCallSheet && (screen == "home" || selected != null)) {
-            AlertDialog(onDismissRequest = { showCallSheet = false }, title = { Text("Call with…") }, text = { Column { Text(selected?.number ?: number, color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(14.dp)); (listOf("SIP / VoIP") + listOf("SIM 1", "SIM 2").filter { prefs.getBoolean("setting:$it", true) }).forEach { method -> TextButton(onClick = {
+            val dialedPerson = selected ?: Person("Dialed number", number, "?")
+            val dialedNumber = dialedPerson.number
+            val dialedName = dialedPerson.name
+            val simLines = remember { loadSimLines(context) }
+            var setDefault by remember { mutableStateOf(false) }
+            val sipUser = sipUsername.ifBlank { prefs.getString("user", "") ?: "" }
+            val isRegistered = activity.registered
+            fun dialWith(method: String) {
                 showCallSheet = false
-                val dialedNumber = selected?.number ?: number
-                if (method == "SIP / VoIP") { activity.activeNumber = dialedNumber; activity.activeCallName = selected?.name ?: "Dialed number"; activity.startSipCall(activity.activeNumber, activity.activeCallName); screen = "call" }
-                else { activity.startCellCall(dialedNumber, if (method == "SIM 2") 1 else 0); screen = "home" }
-            }) { Icon(Icons.Filled.Call, null, tint = color); Spacer(Modifier.width(10.dp)); Text(method) } } } }, confirmButton = { TextButton(onClick = { showCallSheet = false }) { Text("Cancel") } })
+                val digits = normalizeDigits(dialedNumber)
+                if (setDefault && digits.isNotBlank()) {
+                    prefs.edit().putString("default_line:$digits", method).apply()
+                }
+                when (method) {
+                    "SIP" -> { activity.activeNumber = dialedNumber; activity.activeCallName = dialedName; activity.startSipCall(dialedNumber, dialedName); screen = "call" }
+                    "SIM 1" -> { activity.startCellCall(dialedNumber, 0); screen = "home" }
+                    else -> { activity.startCellCall(dialedNumber, 1); screen = "home" }
+                }
+            }
+            androidx.compose.ui.window.Dialog(onDismissRequest = { showCallSheet = false }) {
+                Card(shape = RoundedCornerShape(24.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                        Text(if (dialedName.isBlank() || dialedName == "Dialed number") "Call from" else "Call \"$dialedName\" from", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                        Text(dialedNumber, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
+                        HorizontalDivider(Modifier.padding(vertical = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .4f))
+                        CallSheetRow(iconBg = Color(0xFF4F46E5), icon = Icons.Filled.Public, iconTint = Color.White, badgeNumber = null, badgeColor = Color.Transparent,
+                            title = {
+                                Text("SIP", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.width(8.dp))
+                                Surface(shape = RoundedCornerShape(50), color = if (isRegistered) Color(0xFFD1FAE5) else MaterialTheme.colorScheme.surfaceVariant) {
+                                    Row(Modifier.padding(horizontal = 8.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Box(Modifier.size(7.dp).clip(CircleShape).background(if (isRegistered) Color(0xFF10B981) else Color(0xFF94A3B8)))
+                                        Spacer(Modifier.width(5.dp))
+                                        Text(if (isRegistered) "Online · HD Audio" else "Offline", color = if (isRegistered) Color(0xFF047857) else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                    }
+                                }
+                            },
+                            subtitle = sipUser.ifBlank { "No SIP account" },
+                            onClick = { dialWith("SIP") })
+                        Spacer(Modifier.height(12.dp))
+                        if (prefs.getBoolean("setting:SIM 1", true)) {
+                            val line1 = simLines.firstOrNull { it.slot == 0 }
+                            CallSheetRow(iconBg = Color(0xFFDBEAFE), icon = Icons.Filled.Call, iconTint = Color(0xFF2563EB), badgeNumber = "1", badgeColor = Color(0xFF2563EB),
+                                title = {
+                                    Text("SIM 1", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                    if (line1?.carrier?.isNotBlank() == true) { Spacer(Modifier.width(8.dp)); Text(line1.carrier, color = Color(0xFF2563EB), fontSize = 15.sp, fontWeight = FontWeight.Medium) }
+                                },
+                                subtitle = line1?.number.orEmpty(),
+                                onClick = { dialWith("SIM 1") })
+                            Spacer(Modifier.height(12.dp))
+                        }
+                        if (prefs.getBoolean("setting:SIM 2", true)) {
+                            val line2 = simLines.firstOrNull { it.slot == 1 }
+                            CallSheetRow(iconBg = Color(0xFFCCFBF1), icon = Icons.Filled.Call, iconTint = Color(0xFF0D9488), badgeNumber = "2", badgeColor = Color(0xFF0D9488),
+                                title = {
+                                    Text("SIM 2", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                    if (line2?.carrier?.isNotBlank() == true) { Spacer(Modifier.width(8.dp)); Text(line2.carrier, color = Color(0xFF0D9488), fontSize = 15.sp, fontWeight = FontWeight.Medium) }
+                                },
+                                subtitle = line2?.number.orEmpty(),
+                                onClick = { dialWith("SIM 2") })
+                            Spacer(Modifier.height(12.dp))
+                        }
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .4f))
+                        Row(Modifier.fillMaxWidth().clickable { setDefault = !setDefault }.padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = setDefault, onCheckedChange = { setDefault = it })
+                            Spacer(Modifier.width(8.dp))
+                            Text("Set default for this contact", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
+            }
         }
         if (showError && activity.errorMessage.isNotBlank()) AlertDialog(onDismissRequest = { showError = false; activity.errorMessage = "" }, title = { Text("CallerX") }, text = { Text(activity.errorMessage) }, confirmButton = { TextButton(onClick = { showError = false; activity.errorMessage = "" }) { Text("OK") } })
         if (showPermissionWelcome) AlertDialog(
@@ -884,6 +982,40 @@ private fun CallerXApp(activity: MainActivity) {
         else -> medium to MaterialTheme.colorScheme.onSurfaceVariant
     }
     Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+}
+
+@Composable private fun CallSheetRow(
+    iconBg: Color,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    iconTint: Color,
+    badgeNumber: String?,
+    badgeColor: Color,
+    title: @Composable RowScope.() -> Unit,
+    subtitle: String,
+    onClick: () -> Unit
+) {
+    Surface(onClick = onClick, shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface, border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f))) {
+        Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(60.dp)) {
+                Box(Modifier.size(56.dp).clip(RoundedCornerShape(16.dp)).background(iconBg).align(Alignment.Center), contentAlignment = Alignment.Center) {
+                    Icon(icon, null, tint = iconTint, modifier = Modifier.size(26.dp))
+                }
+                if (badgeNumber != null) {
+                    Box(Modifier.size(20.dp).clip(CircleShape).background(badgeColor).align(Alignment.TopEnd), contentAlignment = Alignment.Center) {
+                        Text(badgeNumber, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) { title() }
+                if (subtitle.isNotBlank()) {
+                    Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(22.dp))
+        }
+    }
 }
 
 @Composable private fun CallRow(person: Person, color: Color, onOpen: () -> Unit, onCall: () -> Unit) {
