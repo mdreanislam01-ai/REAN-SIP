@@ -1940,7 +1940,8 @@ private fun DialKey(digit: String, letters: String, onTap: () -> Unit, onLongPre
         }
     }
 }
-Composable
+
+@Composable
 private fun ProfileScreen(onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit, onNotifications: () -> Unit) {
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         TopBar("My Profile", onBack)
