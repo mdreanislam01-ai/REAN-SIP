@@ -153,7 +153,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        window.statusBarColor = android.graphics.Color.rgb(33, 71, 184)
+        window.navigationBarColor = android.graphics.Color.rgb(234, 240, 252)
         intent?.data?.schemeSpecificPart?.let { dialIntentNumber = it }
         callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
         initializeLinphone()
@@ -371,9 +373,11 @@ private fun CallerXApp(activity: MainActivity) {
                     } else {
                         Header(tab, activity.registrationMessage, searchOpen, { searchOpen = !searchOpen }, query, { query = it }, { screen = "profile" }, { screen = "sip" })
                         if (tab == "Calls") {
+                            Box(Modifier.weight(1f)) {
+                                Column(Modifier.fillMaxSize()) {
                             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 14.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Text("Dial", Modifier.weight(1f), fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                                IconButton(onClick = { keypadOpen = !keypadOpen }) { Icon(Icons.Filled.Dialpad, if (keypadOpen) "Hide keypad" else "Open keypad") }
+                                IconButton(onClick = { val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager; clip.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let { number = it.filter { c -> c.isDigit() || c == '+' } } }) { Icon(Icons.Filled.ContentPaste, "Paste number") }
                                 IconButton(onClick = { number = "" }) { Icon(Icons.Filled.DeleteOutline, "Clear number") }
                                 IconButton(onClick = { searchOpen = !searchOpen }) { Icon(Icons.Filled.Search, "Search calls") }
                             }
@@ -390,7 +394,10 @@ private fun CallerXApp(activity: MainActivity) {
                                 categoryMatches && (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
                             }
                             LazyColumn(Modifier.weight(if (keypadOpen) .55f else 1f), contentPadding = PaddingValues(bottom = 4.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
-                            if (keypadOpen) KeypadPanel(number, onNumber = { number = it }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true })
+                            if (keypadOpen) KeypadPanel(number, onNumber = { number = it }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true }, onHide = { keypadOpen = false })
+                                }
+                                if (!keypadOpen) FloatingActionButton(onClick = { keypadOpen = true }, modifier = Modifier.align(Alignment.BottomStart).padding(start = 18.dp, bottom = 14.dp), containerColor = Color(0xFFE8EEFF), contentColor = Color(0xFF17202B), elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 5.dp)) { Icon(Icons.Filled.Dialpad, "Open keypad", modifier = Modifier.size(25.dp)) }
+                            }
                         } else if (tab == "Contacts") {
                             LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) {
                                 item { SectionTitle("FAVORITES") }
@@ -431,14 +438,14 @@ private fun CallerXApp(activity: MainActivity) {
 }
 
 @Composable private fun Header(tab: String, sip: String, searchOpen: Boolean, onSearch: () -> Unit, query: String, onQuery: (String) -> Unit, onProfile: () -> Unit, onSip: () -> Unit) {
-    Row(Modifier.fillMaxWidth().background(Brush.horizontalGradient(listOf(Color(0xFF2147B8), Color(0xFF318BE8)))).padding(start = 18.dp, top = 30.dp, end = 18.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(48.dp).clip(RoundedCornerShape(14.dp)).background(Color.White.copy(alpha = .18f)).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Text("C", color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.Bold) }
-        Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text("CallerX", color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold); if (tab != "Calls") Text(tab, color = Color.White.copy(alpha = .85f), fontSize = 13.sp) }
+    Row(Modifier.fillMaxWidth().height(76.dp).background(Brush.horizontalGradient(listOf(Color(0xFF2147B8), Color(0xFF318BE8)))).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(38.dp).clip(RoundedCornerShape(12.dp)).background(Color.White.copy(alpha = .18f)).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Text("C", color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold) }
+        Spacer(Modifier.width(10.dp)); Column(Modifier.weight(1f)) { Text("CallerX", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold); if (tab != "Calls") Text(tab, color = Color.White.copy(alpha = .85f), fontSize = 12.sp) }
         AssistChip(onClick = onSip, label = { Text(sip, color = Color.White, fontWeight = FontWeight.SemiBold) }, leadingIcon = { Icon(Icons.Filled.Circle, null, tint = if (sip == "SIP Online") Color(0xFF39D6A1) else Color(0xFFFF7272), modifier = Modifier.size(12.dp)) }, colors = AssistChipDefaults.assistChipColors(containerColor = Color(0xFF102D69).copy(alpha = .45f)))
     }
 }
 
-@Composable private fun KeypadPanel(number: String, onNumber: (String) -> Unit, onCall: () -> Unit) {
+@Composable private fun KeypadPanel(number: String, onNumber: (String) -> Unit, onCall: () -> Unit, onHide: () -> Unit) {
     val keys = listOf("1" to "", "2" to "ABC", "3" to "DEF", "4" to "GHI", "5" to "JKL", "6" to "MNO", "7" to "PQRS", "8" to "TUV", "9" to "WXYZ", "*" to "", "0" to "+", "#" to "")
     Surface(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp), shadowElevation = 8.dp) {
         Column(Modifier.padding(horizontal = 24.dp, vertical = 5.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -448,7 +455,7 @@ private fun CallerXApp(activity: MainActivity) {
             }
             keys.chunked(3).forEach { row -> Row(Modifier.fillMaxWidth().weight(1f), verticalAlignment = Alignment.CenterVertically) { row.forEach { (digit, letters) -> Column(Modifier.weight(1f).fillMaxHeight().clickable { onNumber(number + digit) }, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Text(digit, fontSize = 29.sp, color = MaterialTheme.colorScheme.onSurface, lineHeight = 31.sp); if (letters.isNotEmpty()) Text(letters, fontSize = 9.sp, color = Color(0xFF579575), fontWeight = FontWeight.Bold, letterSpacing = 2.sp) } } } }
             Row(Modifier.fillMaxWidth().height(58.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceEvenly) {
-                IconButton(onClick = { }) { Icon(Icons.Filled.Dialpad, "Keypad", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+                IconButton(onClick = onHide) { Icon(Icons.Filled.Dialpad, "Hide keypad", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
                 FilledIconButton(onClick = onCall, modifier = Modifier.size(58.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFF20A45A), contentColor = Color.White)) { Icon(Icons.Filled.Call, "Call", modifier = Modifier.size(27.dp)) }
                 IconButton(onClick = { if (number.isNotEmpty()) onNumber(number.dropLast(1)) }) { Icon(Icons.Filled.Backspace, "Delete", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
