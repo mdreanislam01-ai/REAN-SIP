@@ -47,6 +47,9 @@
                 <data android:scheme="tel" />
             </intent-filter>
         </activity>
+        <receiver
+            android:name=".CallNotificationReceiver"
+            android:exported="false" />
         <service
             android:name=".CallerXInCallService"
             android:permission="android.permission.BIND_INCALL_SERVICE"
