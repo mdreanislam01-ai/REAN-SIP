@@ -52,19 +52,21 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.8
-          name: CallerX Android APK v1.5.8
+          tag_name: callerx-v1.5.9
+          name: CallerX Android APK v1.5.9
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.8 — call-route sheet redesigned like the reference image:
-            - Big rounded route cards: square themed icon (globe for SIP, phone for SIMs), large
-              SIP / SIM 1 / SIM 2 label, status pill (Online / Offline for SIP, carrier name such as
-              Banglalink / Robi for SIMs) and a right chevron
-            - "Set default for this contact" checkbox below the cards
-            - Pill-shaped Cancel button at the bottom right
-            - All behaviour unchanged: tapping a card calls via that route, the checkbox stores the
-              per-contact default, SIM visibility settings still apply
+            v1.5.9 — settings headers fixed & profile is now editable:
+            - Every sub-screen header (SIP accounts, SIP form, Settings, Blocked numbers) now uses
+              the unified TopBar with the real status bar inset, so headings are never pushed under
+              the status bar on any screen
+            - All headers (TopBar + the Settings tab heading) are coloured with the active theme
+              accent, matching the home heading
+            - Settings > My Profile is fully editable: name, mobile number, Gmail/email and status
+              are saved on the device and shown on the profile hero
+            - Profile photo: "Change photo" opens the system photo picker, the picture is stored in
+              app storage and shown in the round avatar; "Remove photo" clears it
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true
