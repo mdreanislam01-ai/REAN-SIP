@@ -52,16 +52,17 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.1
-          name: CallerX Android APK v1.5.1
+          tag_name: callerx-v1.5.2
+          name: CallerX Android APK v1.5.2
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.1 — call screen metrics:
-            - Live call duration timer on the call screen (who you are talking to + how long)
-            - Network quality indicator: Wi-Fi / 4G LTE / 5G label plus SIP call quality (Excellent/Good/Fair/Poor)
-            - Recording indicator chip while a call is being recorded, plus a Record/Stop button in call controls
-            - Real call recording via Linphone (files stored in app storage), Auto Call Recording setting now records every call
+            v1.5.2 — back button no longer closes the app:
+            - Back always steps one level up (contact details / settings / SIP / theme / dialer -> previous page)
+            - Back on any screen returns to the main page (call log) instead of exiting
+            - Back during an ongoing or ringing call keeps the call alive and shows the call log
+            - On the main page: back closes search first, then goes to the Calls tab, then minimises
+              the app to the background (press twice) so CallerX is never killed directly
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true

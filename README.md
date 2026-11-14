@@ -10,6 +10,9 @@ The UI is built from the supplied `CallerX.html` design (Calls, Messages, Contac
 - Incoming call ringtone + vibration, outgoing call ringback tone (bundled WAV tones)
 - STUN/ICE NAT traversal so calls work behind mobile carrier NAT
 - Incoming/outgoing native call screens, mute, speaker, hold, end call
+- Call screen shows live call duration, network type + call quality (Wi-Fi / 5G / 4G LTE, Excellent → Poor) and recording status
+- Real call recording (Record button + Auto Call Recording), saved inside app storage
+- Back button never closes the app — it steps back to the previous page / main page (call log), and minimises instead of exiting
 - Ongoing-call notification with Mute / Speaker / End actions
 - Multi-account SIP manager (add/edit/delete, enable, default account, Auto-Boot, UDP/TCP/TLS, proxy)
 - Default call route (SIP / SIM 1 / SIM 2) so calls never ask twice; per-contact defaults
@@ -35,7 +38,7 @@ The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow files runs the **Build CallerX APK** GitHub Actions workflow. It builds the debug APK, uploads it as a workflow artifact, and publishes it to the rolling GitHub release:
 
-**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.1>**
+**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.2>**
 
 ## Notes
 
