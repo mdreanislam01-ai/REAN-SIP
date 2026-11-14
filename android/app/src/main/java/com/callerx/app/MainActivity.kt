@@ -54,7 +54,7 @@ private val Palette = listOf(
     Color(0xFF087DB8), Color(0xFF16845B), Color(0xFF7053B5), Color(0xFFD47622),
     Color(0xFFC34F86), Color(0xFF455FC2), Color(0xFF168C8C), Color(0xFFCA4545), Color(0xFF68717D)
 )
-private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0)
+private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "")
 private val people = emptyList<Person>()
 private fun loadContacts(context: Context): List<Person> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return emptyList()
@@ -67,8 +67,13 @@ private fun loadContacts(context: Context): List<Person> {
 private fun loadCallLog(context: Context): List<Person> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) return emptyList()
     val result = mutableListOf<Person>()
-    context.contentResolver.query(CallLog.Calls.CONTENT_URI, arrayOf(CallLog.Calls.CACHED_NAME, CallLog.Calls.NUMBER, CallLog.Calls.DATE, CallLog.Calls.TYPE), null, null, CallLog.Calls.DATE + " DESC")?.use { c ->
-        while (c.moveToNext()) { val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); val date = c.getLong(2); val missed = c.getInt(3) == CallLog.Calls.MISSED_TYPE; result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", spam = false, time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(date)), callType = c.getInt(3))) }
+    val subSlots = try { context.getSystemService(SubscriptionManager::class.java).activeSubscriptionInfoList.orEmpty().associate { it.subscriptionId.toString() to (it.simSlotIndex + 1) } } catch (_: Exception) { emptyMap() }
+    context.contentResolver.query(CallLog.Calls.CONTENT_URI, arrayOf(CallLog.Calls.CACHED_NAME, CallLog.Calls.NUMBER, CallLog.Calls.DATE, CallLog.Calls.TYPE, CallLog.Calls.PHONE_ACCOUNT_ID), null, null, CallLog.Calls.DATE + " DESC")?.use { c ->
+        while (c.moveToNext()) {
+            val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); val date = c.getLong(2); val accountId = c.getString(4).orEmpty()
+            val source = subSlots[accountId]?.let { "SIM $it" } ?: if (accountId.isNotBlank() && accountId.toIntOrNull() == null) "SIP" else "SIM 1"
+            result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(date)), callType = c.getInt(3), source = source))
+        }
     }
     return result
 }
@@ -115,6 +120,16 @@ class MainActivity : ComponentActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
             runtimePermissionLauncher.launch(arrayOf(Manifest.permission.READ_SMS))
         }
+    }
+
+    fun markAllSmsRead() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) { errorMessage = "Grant SMS access first."; return }
+        try {
+            val values = android.content.ContentValues().apply { put(Telephony.Sms.READ, 1) }
+            val changed = contentResolver.update(Telephony.Sms.Inbox.CONTENT_URI, values, "${Telephony.Sms.READ}=0", null)
+            errorMessage = if (changed > 0) "Marked $changed messages as read." else "There are no unread SMS messages."
+        } catch (_: SecurityException) { errorMessage = "Android allows marking SMS as read only for the default SMS app. Set CallerX as your default SMS app to use this action." }
+        resumeTick++
     }
 
     fun requestStartupPermissions() {
@@ -171,8 +186,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
-        window.statusBarColor = android.graphics.Color.rgb(33, 71, 184)
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        window.statusBarColor = android.graphics.Color.WHITE
         window.navigationBarColor = android.graphics.Color.rgb(234, 240, 252)
         intent?.data?.schemeSpecificPart?.let { dialIntentNumber = it }
         callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
@@ -393,38 +408,48 @@ private fun CallerXApp(activity: MainActivity) {
                         if (tab == "Calls") {
                             Box(Modifier.weight(1f)) {
                                 Column(Modifier.fillMaxSize()) {
-                            Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 14.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Text("Dial", Modifier.weight(1f), fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                                IconButton(onClick = { val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager; clip.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let { number = it.filter { c -> c.isDigit() || c == '+' } } }) { Icon(Icons.Filled.ContentPaste, "Paste number") }
-                                IconButton(onClick = { number = "" }) { Icon(Icons.Filled.DeleteOutline, "Clear number") }
-                                IconButton(onClick = { searchOpen = !searchOpen }) { Icon(Icons.Filled.Search, "Search calls") }
+                            var source by remember { mutableStateOf("All Sources") }
+                            Row(Modifier.fillMaxWidth().padding(start = 18.dp, end = 12.dp, top = 12.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) { Text("Recents", fontSize = 23.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.4).sp, color = MaterialTheme.colorScheme.primary); Text("SIM 1, SIM 2 & SIP Call History", fontSize = 11.sp, color = Color(0xFF94A3B8), fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 2.dp)) }
+                                IconButton(onClick = { searchOpen = !searchOpen; if (!searchOpen) query = "" }) { Icon(Icons.Filled.Search, "Search calls", tint = Color(0xFF64748B)) }
+                                IconButton(onClick = { filter = "All"; source = "All Sources"; query = ""; searchOpen = false }) { Icon(Icons.Filled.Refresh, "Reset filters", tint = Color(0xFF64748B)) }
                             }
-                            if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp), singleLine = true, placeholder = { Text("Search calls") })
-                            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 5.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                listOf("All", "Outgoing", "Received", "Missed").forEach { label -> FilterChip(selected = filter == label, onClick = { filter = label }, label = { Text(label, maxLines = 1) }) }
+                            if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 3.dp), singleLine = true, placeholder = { Text("Search name or number") }, leadingIcon = { Icon(Icons.Filled.Search, null) })
+                            Row(Modifier.fillMaxWidth().background(Color(0xFFF8FAFC)).padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                listOf("All", "Missed", "Received", "Outgoing").forEach { label -> FilterChip(selected = filter == label, onClick = { filter = label }, label = { Text(label, maxLines = 1, fontSize = 12.sp) }, shape = RoundedCornerShape(18.dp)) }
                             }
-                            var source by remember { mutableStateOf("All sources") }
-                            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 2.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                listOf("All sources", "SIP", "SIM").forEach { label -> FilterChip(selected = source == label, onClick = { source = label }, label = { Text(label) }) }
+                            Row(Modifier.fillMaxWidth().background(Color(0xFFF8FAFC)).padding(horizontal = 16.dp, vertical = 5.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                listOf("All Sources", "SIM 1", "SIM 2", "SIP").forEach { label -> FilterChip(selected = source == label, onClick = { source = label }, label = { Text(label, fontSize = 12.sp) }, shape = RoundedCornerShape(16.dp)) }
                             }
                             val filtered = recentCalls.filter { person ->
                                 val categoryMatches = when (filter) { "Outgoing" -> person.callType == CallLog.Calls.OUTGOING_TYPE; "Received" -> person.callType == CallLog.Calls.INCOMING_TYPE; "Missed" -> person.callType == CallLog.Calls.MISSED_TYPE; else -> true }
-                                categoryMatches && (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
+                                val sourceMatches = source == "All Sources" || person.source == source
+                                categoryMatches && sourceMatches && (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
                             }
                             LazyColumn(Modifier.weight(if (keypadOpen) .55f else 1f), contentPadding = PaddingValues(bottom = 4.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
                             if (keypadOpen) KeypadPanel(number, onNumber = { number = it }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true }, onHide = { keypadOpen = false })
                                 }
-                                if (!keypadOpen) FloatingActionButton(onClick = { keypadOpen = true }, modifier = Modifier.align(Alignment.BottomStart).padding(start = 18.dp, bottom = 14.dp), containerColor = Color(0xFFE8EEFF), contentColor = Color(0xFF17202B), elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 5.dp)) { Icon(Icons.Filled.Dialpad, "Open keypad", modifier = Modifier.size(25.dp)) }
+                                if (!keypadOpen) FloatingActionButton(onClick = { keypadOpen = true }, modifier = Modifier.align(Alignment.BottomEnd).padding(end = 18.dp, bottom = 14.dp), shape = RoundedCornerShape(16.dp), containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White, elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 5.dp)) { Icon(Icons.Filled.Dialpad, "Open keypad", modifier = Modifier.size(23.dp)) }
                             }
                         } else if (tab == "Contacts") {
-                            LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) {
+                            Row(Modifier.fillMaxWidth().padding(start = 18.dp, end = 12.dp, top = 12.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text("Contacts", Modifier.weight(1f), color = MaterialTheme.colorScheme.primary, fontSize = 23.sp, fontWeight = FontWeight.Bold)
+                                IconButton(onClick = { searchOpen = !searchOpen; if (!searchOpen) query = "" }) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, if (searchOpen) "Close contact search" else "Search contacts", tint = Color(0xFF64748B)) }
+                            }
+                            if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), singleLine = true, placeholder = { Text("Search name or number") }, leadingIcon = { Icon(Icons.Filled.Search, null) })
+                            val visibleContacts = contacts.filter { query.isBlank() || it.name.contains(query, true) || it.number.contains(query, true) }
+                            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 16.dp)) {
                                 item { SectionTitle("FAVORITES") }
-                                items(contacts.take(5)) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
-                                item { SectionTitle("ALL CONTACTS") }
-                                if (contacts.isEmpty()) item { Text("No contacts found. Grant Contacts permission or add contacts to your device.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(contacts) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
+                                items(visibleContacts.take(5)) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
+                                item { SectionTitle(if (query.isBlank()) "ALL CONTACTS" else "SEARCH RESULTS") }
+                                if (visibleContacts.isEmpty()) item { Text("No matching contacts. Grant Contacts permission or add contacts to your device.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(visibleContacts) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
                             }
                         } else {
-                            LazyColumn(contentPadding = PaddingValues(bottom = 20.dp)) {
+                            Row(Modifier.fillMaxWidth().padding(start = 18.dp, end = 12.dp, top = 12.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text("Messages", Modifier.weight(1f), color = MaterialTheme.colorScheme.primary, fontSize = 23.sp, fontWeight = FontWeight.Bold)
+                                TextButton(onClick = { activity.markAllSmsRead() }) { Text("Read all", fontSize = 12.sp) }
+                            }
+                            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 20.dp)) {
                                 if (messages.isEmpty()) item { Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) { Text(if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED) "No SMS messages found in the device inbox." else "SMS access is not granted. Android may restrict SMS inbox access unless CallerX is allowed by your device's SMS-app policy.", color = MaterialTheme.colorScheme.onSurfaceVariant); if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) TextButton(onClick = { activity.requestSmsPermission() }) { Text("Grant SMS access") } } }; itemsIndexed(messages) { i, row ->
                                     Row(Modifier.fillMaxWidth().clickable { }.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Avatar(row.first.take(1), color, 48); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text(row.first, fontWeight = FontWeight.SemiBold); Text(row.second, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp) }; Text(if (i == 0) "10:12" else "Yesterday", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -456,10 +481,12 @@ private fun CallerXApp(activity: MainActivity) {
 }
 
 @Composable private fun Header(tab: String, sip: String, searchOpen: Boolean, onSearch: () -> Unit, query: String, onQuery: (String) -> Unit, onProfile: () -> Unit, onSip: () -> Unit) {
-    Row(Modifier.fillMaxWidth().height(76.dp).background(Brush.horizontalGradient(listOf(Color(0xFF2147B8), Color(0xFF318BE8)))).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(38.dp).clip(RoundedCornerShape(12.dp)).background(Color.White.copy(alpha = .18f)).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Text("C", color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold) }
-        Spacer(Modifier.width(10.dp)); Column(Modifier.weight(1f)) { Text("CallerX", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold); if (tab != "Calls") Text(tab, color = Color.White.copy(alpha = .85f), fontSize = 12.sp) }
-        AssistChip(onClick = onSip, label = { Text(sip, color = Color.White, fontWeight = FontWeight.SemiBold) }, leadingIcon = { Icon(Icons.Filled.Circle, null, tint = if (sip == "SIP Online") Color(0xFF39D6A1) else Color(0xFFFF7272), modifier = Modifier.size(12.dp)) }, colors = AssistChipDefaults.assistChipColors(containerColor = Color(0xFF102D69).copy(alpha = .45f)))
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 18.dp, vertical = 10.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(32.dp).clip(RoundedCornerShape(11.dp)).background(MaterialTheme.colorScheme.primary).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Text("C", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+            Spacer(Modifier.width(9.dp)); Text("CallerX", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurface, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-.2).sp)
+            AssistChip(onClick = onSip, label = { Text(sip, color = Color(0xFF23745C), fontSize = 11.sp, fontWeight = FontWeight.Medium) }, leadingIcon = { Icon(Icons.Filled.Circle, null, tint = if (sip == "SIP Online") Color(0xFF22A06B) else Color(0xFFD64B4B), modifier = Modifier.size(8.dp)) }, colors = AssistChipDefaults.assistChipColors(containerColor = Color(0xFFECF8F1)))
+        }
     }
 }
 
@@ -487,7 +514,7 @@ private fun CallerXApp(activity: MainActivity) {
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) { Text(person.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis); if (person.verified) { Spacer(Modifier.width(5.dp)); Icon(Icons.Filled.Verified, null, tint = color, modifier = Modifier.size(16.dp)) }; if (person.spam) { Spacer(Modifier.width(6.dp)); Text("Spam", color = Color(0xFFC64646), fontSize = 11.sp, fontWeight = FontWeight.Bold) } }
-            Text("${when (person.callType) { CallLog.Calls.OUTGOING_TYPE -> "Outgoing call"; CallLog.Calls.MISSED_TYPE -> "Missed call"; else -> "Incoming call" }} · ${person.number}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text("${when (person.callType) { CallLog.Calls.OUTGOING_TYPE -> "Outgoing"; CallLog.Calls.MISSED_TYPE -> "Missed"; else -> "Received" }} · ${person.source.ifBlank { "Call" }} · ${person.number}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         Text(person.time, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
