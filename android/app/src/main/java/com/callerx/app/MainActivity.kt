@@ -14,6 +14,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -265,7 +266,7 @@ private fun CallerXApp(activity: MainActivity) {
                             }
                         } else {
                             LazyColumn(contentPadding = PaddingValues(bottom = 20.dp)) {
-                                listOf("bKash" to "Your transaction was successful. Tk 500.00", "Nusrat Jahan" to "Kalke office e asbi?", "Verification" to "Your CallerX code is 382104").forEachIndexed { i, row ->
+                                itemsIndexed(listOf("bKash" to "Your transaction was successful. Tk 500.00", "Nusrat Jahan" to "Kalke office e asbi?", "Verification" to "Your CallerX code is 382104")) { i, row ->
                                     Row(Modifier.fillMaxWidth().clickable { }.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Avatar(row.first.take(1), color, 48); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text(row.first, fontWeight = FontWeight.SemiBold); Text(row.second, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp) }; Text(if (i == 0) "10:12" else "Yesterday", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }; HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
