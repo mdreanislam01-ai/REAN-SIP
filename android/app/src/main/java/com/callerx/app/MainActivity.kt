@@ -115,7 +115,7 @@ class CallNotificationReceiver : BroadcastReceiver() {
             "callerx.call.end" -> { if (cell) TelecomCallBridge.currentCall?.disconnect() else a?.endCall() }
             "callerx.call.speaker" -> {
                 val on = !(a?.speaker ?: false)
-                if (cell) TelecomCallBridge.service?.setSpeakerRoute(on) else a?.setSpeaker(on)
+                if (cell) TelecomCallBridge.service?.setSpeakerRoute(on) else a?.setSpeakerOn(on)
             }
             "callerx.call.mute" -> {
                 val on = !(a?.muted ?: false)
@@ -676,7 +676,7 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) { errorMessage = "Could not ${if (held) "hold" else "resume"} call: ${e.message}" }
     }
 
-    fun setSpeaker(enabled: Boolean) {
+    fun setSpeakerOn(enabled: Boolean) {
         this.speaker = enabled
         if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setSpeakerRoute(enabled); showCallNotification(); return }
         try {
@@ -1166,7 +1166,7 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
             } else {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                     CallControl(Icons.Filled.MicOff, "Mute", activity.muted, dark, secondaryText) { activity.toggleMute(!activity.muted) }
-                    CallControl(Icons.Filled.VolumeUp, "Speaker", activity.speaker, dark, secondaryText) { activity.setSpeaker(!activity.speaker) }
+                    CallControl(Icons.Filled.VolumeUp, "Speaker", activity.speaker, dark, secondaryText) { activity.setSpeakerOn(!activity.speaker) }
                     CallControl(Icons.Filled.Pause, if (hold) "Resume" else "Hold", hold, dark, secondaryText) { hold = !hold; activity.toggleHold(hold) }
                 }
                 Spacer(Modifier.height(20.dp))
