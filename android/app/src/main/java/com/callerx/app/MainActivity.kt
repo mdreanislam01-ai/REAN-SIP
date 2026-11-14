@@ -424,23 +424,18 @@ private fun CallerXApp(activity: MainActivity) {
                         if (tab == "Calls") {
                             Box(Modifier.weight(1f)) {
                                 Column(Modifier.fillMaxSize()) {
-                            var source by remember { mutableStateOf("All Sources") }
                             Row(Modifier.fillMaxWidth().padding(start = 18.dp, end = 12.dp, top = 12.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) { Text("Recents", fontSize = 23.sp, fontWeight = FontWeight.Bold, letterSpacing = (-.4).sp, color = MaterialTheme.colorScheme.primary); Text("SIM 1, SIM 2 & SIP Call History", fontSize = 11.sp, color = Color(0xFF94A3B8), fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 2.dp)) }
                                 IconButton(onClick = { searchOpen = !searchOpen; if (!searchOpen) query = "" }) { Icon(Icons.Filled.Search, "Search calls", tint = Color(0xFF64748B)) }
-                                IconButton(onClick = { filter = "All"; source = "All Sources"; query = ""; searchOpen = false }) { Icon(Icons.Filled.Refresh, "Reset filters", tint = Color(0xFF64748B)) }
+                                IconButton(onClick = { filter = "All"; query = ""; searchOpen = false }) { Icon(Icons.Filled.Refresh, "Reset filters", tint = Color(0xFF64748B)) }
                             }
                             if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 3.dp), singleLine = true, placeholder = { Text("Search name or number") }, leadingIcon = { Icon(Icons.Filled.Search, null) })
                             Row(Modifier.fillMaxWidth().background(Color(0xFFF8FAFC)).padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 listOf("All", "Missed", "Received", "Outgoing").forEach { label -> FilterChip(selected = filter == label, onClick = { filter = label }, label = { Text(label, maxLines = 1, fontSize = 12.sp) }, shape = RoundedCornerShape(18.dp)) }
                             }
-                            Row(Modifier.fillMaxWidth().background(Color(0xFFF8FAFC)).padding(horizontal = 16.dp, vertical = 5.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                listOf("All Sources", "SIM 1", "SIM 2", "SIP").forEach { label -> FilterChip(selected = source == label, onClick = { source = label }, label = { Text(label, fontSize = 12.sp) }, shape = RoundedCornerShape(16.dp)) }
-                            }
                             val filtered = recentCalls.filter { person ->
                                 val categoryMatches = when (filter) { "Outgoing" -> person.callType == CallLog.Calls.OUTGOING_TYPE; "Received" -> person.callType == CallLog.Calls.INCOMING_TYPE; "Missed" -> person.callType == CallLog.Calls.MISSED_TYPE; else -> true }
-                                val sourceMatches = source == "All Sources" || person.source == source
-                                categoryMatches && sourceMatches && (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
+                                categoryMatches && (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
                             }
                             LazyColumn(Modifier.weight(if (keypadOpen) .55f else 1f), contentPadding = PaddingValues(bottom = 4.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
                             if (keypadOpen) KeypadPanel(number, onNumber = { number = it }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true }, onHide = { keypadOpen = false })
