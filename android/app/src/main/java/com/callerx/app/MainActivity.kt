@@ -382,8 +382,8 @@ class MainActivity : ComponentActivity() {
                     pt.enable(enabledLower.contains(pt.mimeType.lowercase()))
                 }
             } catch (_: Exception) { }
-            try { c.echoCancellationEnabled = prefs.getBoolean("audio_echo", true) } catch (_: Exception) { }
-            try { c.noiseSuppressionEnabled = prefs.getBoolean("audio_noise", true) } catch (_: Exception) { }
+            try { c.setEchoCancellationEnabled(prefs.getBoolean("audio_echo", true)) } catch (_: Exception) { }
+            try { c.config?.setInt("sound", "noise_suppression", if (prefs.getBoolean("audio_noise", true)) 1 else 0) } catch (_: Exception) { }
             try { c.micGainDb = prefs.getFloat("audio_mic_gain", 2f) } catch (_: Exception) { }
         } catch (_: Exception) { }
     }
