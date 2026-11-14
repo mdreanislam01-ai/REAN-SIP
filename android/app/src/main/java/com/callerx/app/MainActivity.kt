@@ -875,21 +875,15 @@ private fun CallerXApp(activity: MainActivity) {
 }
 
 @Composable private fun MediumBadge(medium: String) {
-    val (bg, fg, border) = when (medium) {
-        "SIM 1", "SIM 2" -> Triple(Color(0xFFCCFBF1), Color(0xFF0F766E), Color(0xFF99F6E4))
-        "SIP", "SIP VoIP" -> Triple(Color(0xFFF5F3FF), Color(0xFF6D28D9), Color(0xFFDDD6FE))
-        "WhatsApp" -> Triple(Color(0xFFECFDF5), Color(0xFF047857), Color(0xFFA7F3D0))
-        "Telegram" -> Triple(Color(0xFFF0F9FF), Color(0xFF0369A1), Color(0xFFBAE6FD))
-        else -> Triple(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.colorScheme.onSurfaceVariant, MaterialTheme.colorScheme.outlineVariant)
+    val (label, color) = when (medium) {
+        "SIM 1" -> "SIM 1" to Color(0xFF2563EB)
+        "SIM 2" -> "SIM 2" to Color(0xFF0D9488)
+        "SIP", "SIP VoIP" -> "SIP" to Color(0xFF7C3AED)
+        "WhatsApp" -> "WhatsApp" to Color(0xFF047857)
+        "Telegram" -> "Telegram" to Color(0xFF0369A1)
+        else -> medium to MaterialTheme.colorScheme.onSurfaceVariant
     }
-    val label = when (medium) {
-        "SIM 1", "SIM 2" -> "SIM"
-        "SIP", "SIP VoIP" -> "SIP"
-        else -> medium
-    }
-    Surface(shape = RoundedCornerShape(6.dp), color = bg, border = androidx.compose.foundation.BorderStroke(1.dp, border)) {
-        Text(label, color = fg, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
-    }
+    Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
 }
 
 @Composable private fun CallRow(person: Person, color: Color, onOpen: () -> Unit, onCall: () -> Unit) {
