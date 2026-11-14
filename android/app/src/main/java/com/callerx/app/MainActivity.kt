@@ -72,7 +72,9 @@ private fun loadCallLog(context: Context): List<Person> {
 private fun loadSms(context: Context): List<Pair<String,String>> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return emptyList()
     val rows = mutableListOf<Pair<String,String>>()
-    context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI, arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY), null, null, Telephony.Sms.DATE + " DESC")?.use { c -> while (c.moveToNext()) rows.add((c.getString(0).orEmpty()) to c.getString(1).orEmpty()) }
+    try {
+        context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI, arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY), null, null, Telephony.Sms.DATE + " DESC")?.use { c -> while (c.moveToNext()) rows.add((c.getString(0).orEmpty()) to c.getString(1).orEmpty()) }
+    } catch (_: SecurityException) { }
     return rows
 }
 
@@ -100,7 +102,16 @@ class MainActivity : ComponentActivity() {
         val denied = results.filterValues { !it }.keys
         if (denied.isNotEmpty()) errorMessage = "Some permissions were declined. You can enable them later in Android Settings."
     }
-    private val defaultDialerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { dialerRoleTick++ }
+    private val defaultDialerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        dialerRoleTick++
+        if (!isDefaultDialer()) errorMessage = "Android did not set CallerX as the default dialer. Check Settings → Apps → Default apps → Phone app, then select CallerX. If CallerX is not listed, your Android device may not accept it as a dialer due to its role requirements."
+    }
+
+    fun requestSmsPermission() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+            runtimePermissionLauncher.launch(arrayOf(Manifest.permission.READ_SMS))
+        }
+    }
 
     fun requestStartupPermissions() {
         val permissions = mutableListOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
@@ -376,7 +387,7 @@ private fun CallerXApp(activity: MainActivity) {
                             }
                         } else {
                             LazyColumn(contentPadding = PaddingValues(bottom = 20.dp)) {
-                                if (messages.isEmpty()) item { Text("No SMS messages found. Grant SMS permission to view your inbox.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; itemsIndexed(messages) { i, row ->
+                                if (messages.isEmpty()) item { Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) { Text(if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED) "No SMS messages found in the device inbox." else "SMS access is not granted. Android may restrict SMS inbox access unless CallerX is allowed by your device's SMS-app policy.", color = MaterialTheme.colorScheme.onSurfaceVariant); if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) TextButton(onClick = { activity.requestSmsPermission() }) { Text("Grant SMS access") } } }; itemsIndexed(messages) { i, row ->
                                     Row(Modifier.fillMaxWidth().clickable { }.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Avatar(row.first.take(1), color, 48); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text(row.first, fontWeight = FontWeight.SemiBold); Text(row.second, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp) }; Text(if (i == 0) "10:12" else "Yesterday", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }; HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
