@@ -129,6 +129,7 @@ class MainActivity : ComponentActivity() {
     fun requestDefaultDialer() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
             val roles = getSystemService(RoleManager::class.java)
+            if (!roles.isRoleAvailable(RoleManager.ROLE_DIALER)) { errorMessage = "This Android device does not offer the dialer role to CallerX. Check your phone manufacturer's default-app settings."; return }
             if (roles.isRoleHeld(RoleManager.ROLE_DIALER)) return
             defaultDialerLauncher.launch(roles.createRequestRoleIntent(RoleManager.ROLE_DIALER))
         } else {
