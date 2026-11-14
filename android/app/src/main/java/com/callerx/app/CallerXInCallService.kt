@@ -1,5 +1,6 @@
 package com.callerx.app
 
+import android.content.Context
 import android.content.Intent
 import android.telecom.Call
 import android.telecom.InCallService
@@ -29,8 +30,23 @@ class CallerXInCallService : InCallService() {
         }
     }
 
+    private fun isBlocked(number: String): Boolean {
+        val digits = number.filter { it.isDigit() }.takeLast(11)
+        if (digits.isEmpty()) return false
+        val blocked = getSharedPreferences("callerx", Context.MODE_PRIVATE).getStringSet("blocked_numbers", emptySet()) ?: emptySet()
+        return blocked.any { entry ->
+            val b = entry.substringBefore("|").filter { it.isDigit() }.takeLast(11)
+            b.isNotEmpty() && (b == digits || (b.length >= 10 && digits.length >= 10 && b.takeLast(10) == digits.takeLast(10)))
+        }
+    }
+
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
+        val incomingNumber = call.details.handle?.schemeSpecificPart.orEmpty()
+        if (isBlocked(incomingNumber)) {
+            try { call.disconnect() } catch (_: Exception) { }
+            return
+        }
         TelecomCallBridge.service = this
         TelecomCallBridge.currentCall = call
         call.registerCallback(callback)
