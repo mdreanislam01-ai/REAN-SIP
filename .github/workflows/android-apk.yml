@@ -52,20 +52,16 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.0
-          name: CallerX Android APK v1.5.0
+          tag_name: callerx-v1.5.1
+          name: CallerX Android APK v1.5.1
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.0 — UI redesign & call experience:
-            - Call screen controls repositioned (Mute/Speaker/Hold + End anchored at the bottom)
-            - New call-method sheet: SIP (Online · HD Audio badge), SIM 1 / SIM 2 cards with carrier names, “Set default for this contact”
-            - Default call route: calls always go out from the saved route (SIP/SIM 1/SIM 2) without asking again
-            - Contact details & call log redesigned (call history with total talk time, caller ID card, tags, notes, block)
-            - “Call ended” summary page removed — after a call you land on the call log
-            - NoXsip-style SIP account manager: multiple accounts, add/edit/delete, enable toggle, default account, Auto-Boot, UDP/TCP/TLS, proxy
-            - Ongoing-call notification with Mute / Speaker / End actions
-            - Theme accent now applies to every screen including settings; all settings rows are functional
+            v1.5.1 — call screen metrics:
+            - Live call duration timer on the call screen (who you are talking to + how long)
+            - Network quality indicator: Wi-Fi / 4G LTE / 5G label plus SIP call quality (Excellent/Good/Fair/Poor)
+            - Recording indicator chip while a call is being recorded, plus a Record/Stop button in call controls
+            - Real call recording via Linphone (files stored in app storage), Auto Call Recording setting now records every call
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true
