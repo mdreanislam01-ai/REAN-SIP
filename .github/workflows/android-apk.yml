@@ -39,7 +39,7 @@ jobs:
           result=$?
           if [ "$result" -ne 0 ]; then
             tail -n 25 build.log
-            summary=$(grep -E -A3 -B1 'What went wrong|Execution failed|Could not|e: |error:|> Task .* FAILED' build.log | tail -n 18 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            summary=$(grep -E -i -A2 -B1 'e: |error:|unresolved reference|type mismatch|cannot infer|overload resolution|not enough information|cannot access|what went wrong|execution failed' build.log | head -n 30 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
             echo "::error::$summary"
             exit "$result"
           fi
