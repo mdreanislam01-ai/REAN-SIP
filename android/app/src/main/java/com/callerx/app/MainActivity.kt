@@ -104,6 +104,21 @@ private fun loadCallLog(context: Context): List<Person> {
     }
     return result
 }
+
+private fun loadSipCallLog(context: Context): List<Person> {
+    val prefs = context.getSharedPreferences("callerx", Context.MODE_PRIVATE)
+    val entries = prefs.getStringSet("sip_call_log", emptySet()) ?: emptySet()
+    return entries.mapNotNull { e ->
+        val parts = e.split("|")
+        if (parts.size != 5) return@mapNotNull null
+        val dateMs = parts[0].toLongOrNull() ?: return@mapNotNull null
+        val number = parts[1]
+        val type = parts[2].toIntOrNull() ?: CallLog.Calls.INCOMING_TYPE
+        val durationSec = parts[3].toIntOrNull() ?: 0
+        val name = parts[4]
+        Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", time = formatCallTime(dateMs), callType = type, source = "SIP", durationSec = durationSec, dateMs = dateMs)
+    }.sortedByDescending { it.dateMs }
+}
 private fun loadSms(context: Context): List<Pair<String,String>> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return emptyList()
     val rows = mutableListOf<Pair<String,String>>()
@@ -300,6 +315,7 @@ class MainActivity : ComponentActivity() {
                         }
                         if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) {
                             if (sipRecordingActive) { try { call.stopRecording() } catch (_: Exception) { }; sipRecordingActive = false }
+                            saveSipCall(call)
                         }
                         activeCall = if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) null else call
                         if (state == Call.State.IncomingReceived) {
@@ -493,6 +509,31 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) { null }
     }
 
+    private var sipLogDoneFor: Call? = null
+
+    // Saves a finished SIP call into the local call history so it shows in
+    // Recents with a "SIP" badge (SIP calls never reach the Android CallLog).
+    private fun saveSipCall(call: Call) {
+        try {
+            if (sipLogDoneFor === call) return
+            sipLogDoneFor = call
+            val number = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
+            if (number.isBlank()) return
+            val duration = try { call.duration } catch (_: Exception) { 0 }
+            val type = when {
+                call.dir == Call.Dir.Outgoing -> CallLog.Calls.OUTGOING_TYPE
+                duration > 0 -> CallLog.Calls.INCOMING_TYPE
+                else -> CallLog.Calls.MISSED_TYPE
+            }
+            val name = activeCallName.takeIf { it.isNotBlank() && it != "Incoming caller" }?.replace("|", "") ?: number
+            val prefs = getSharedPreferences("callerx", Context.MODE_PRIVATE)
+            val existing = (prefs.getStringSet("sip_call_log", emptySet()) ?: emptySet()).toMutableSet()
+            existing.add("${System.currentTimeMillis()}|$number|$type|$duration|$name")
+            val capped = existing.sortedByDescending { it.substringBefore("|").toLongOrNull() ?: 0L }.take(100).toSet()
+            prefs.edit().putStringSet("sip_call_log", capped).apply()
+        } catch (_: Exception) { }
+    }
+
     // Applies the saved Audio & Codec settings to the Linphone core.
     fun applyAudioSettings() {
         val c = core ?: return
@@ -626,7 +667,16 @@ private fun CallerXApp(activity: MainActivity) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
     LaunchedEffect(activity.resumeTick) {
-        contacts = loadContacts(context); recentCalls = loadCallLog(context); messages = loadSms(context)
+        contacts = loadContacts(context)
+        val sipCalls = loadSipCallLog(context).map { p ->
+            val match = contacts.firstOrNull { c ->
+                val d1 = normalizeDigits(c.number); val d2 = normalizeDigits(p.number)
+                d1.isNotBlank() && d1 == d2
+            }
+            if (match != null) p.copy(name = match.name, initials = match.initials) else p
+        }
+        recentCalls = (loadCallLog(context) + sipCalls).sortedByDescending { it.dateMs }
+        messages = loadSms(context)
         sipUsername = prefs.getString("user", "") ?: ""
         sipDomain = prefs.getString("domain", "") ?: ""
         sipDisplayName = prefs.getString("display_name", "") ?: ""
@@ -826,14 +876,17 @@ private fun CallerXApp(activity: MainActivity) {
 
 @Composable private fun MediumBadge(medium: String) {
     val (bg, fg, border) = when (medium) {
-        "SIM 1" -> Triple(Color(0xFFEFF6FF), Color(0xFF1D4ED8), Color(0xFFBFDBFE))
-        "SIM 2" -> Triple(Color(0xFFCCFBF1), Color(0xFF0F766E), Color(0xFF99F6E4))
+        "SIM 1", "SIM 2" -> Triple(Color(0xFFCCFBF1), Color(0xFF0F766E), Color(0xFF99F6E4))
         "SIP", "SIP VoIP" -> Triple(Color(0xFFF5F3FF), Color(0xFF6D28D9), Color(0xFFDDD6FE))
         "WhatsApp" -> Triple(Color(0xFFECFDF5), Color(0xFF047857), Color(0xFFA7F3D0))
         "Telegram" -> Triple(Color(0xFFF0F9FF), Color(0xFF0369A1), Color(0xFFBAE6FD))
         else -> Triple(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.colorScheme.onSurfaceVariant, MaterialTheme.colorScheme.outlineVariant)
     }
-    val label = if (medium == "SIP") "SIP VoIP" else medium
+    val label = when (medium) {
+        "SIM 1", "SIM 2" -> "SIM"
+        "SIP", "SIP VoIP" -> "SIP"
+        else -> medium
+    }
     Surface(shape = RoundedCornerShape(6.dp), color = bg, border = androidx.compose.foundation.BorderStroke(1.dp, border)) {
         Text(label, color = fg, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
     }
@@ -1043,12 +1096,20 @@ private fun CallerXApp(activity: MainActivity) {
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .4f))
         LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 24.dp)) {
-            item { SectionTitle("ACCOUNT") }
+            stickyHeader {
+                Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) {
+                    SectionTitle("ACCOUNT")
+                }
+            }
             item {
                 SettingRow(Icons.Filled.ManageAccounts, Color(0xFFDB2777), iconBg(Color(0xFFFCE7F3), Color(0xFFDB2777)),
                     "My Profile & User Account", "$profileName · Auto backup is ${if (autoBackup) "on" else "off"}", onProfile)
             }
-            item { SectionTitle("VOIP & SIP") }
+            stickyHeader {
+                Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) {
+                    SectionTitle("VOIP & SIP")
+                }
+            }
             item {
                 SettingRow(Icons.Filled.Dns, Color(0xFF2563EB), iconBg(Color(0xFFDBEAFE), Color(0xFF2563EB)),
                     "SIP Account", (if (sipDomain.isBlank()) "No SIP account" else sipDomain) + " · " + if (activity.registered) "Registered" else "Offline", onSip)
@@ -1057,7 +1118,11 @@ private fun CallerXApp(activity: MainActivity) {
                 SettingRow(Icons.Filled.GraphicEq, Color(0xFF7C3AED), iconBg(Color(0xFFEDE9FE), Color(0xFF7C3AED)),
                     "Audio & Codec", audioSub, onAudio)
             }
-            item { SectionTitle("SIM CALLING & RECORDING") }
+            stickyHeader {
+                Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) {
+                    SectionTitle("SIM CALLING & RECORDING")
+                }
+            }
             item {
                 SettingRow(Icons.Filled.Smartphone, Color(0xFF0284C7), iconBg(Color(0xFFE0F2FE), Color(0xFF0284C7)),
                     "SIM 1", if (sim1) "Show SIM 1 as a call option" else "Hidden from call prompt", {}, toggle = true, checked = sim1, onToggle = { setSim(1, it) }, numberBadge = "1")
@@ -1077,7 +1142,11 @@ private fun CallerXApp(activity: MainActivity) {
                     toggle = true, checked = autoRec, onToggle = { autoRec = it; prefs.edit().putBoolean("auto_record", it).apply() },
                     badge = if (recCount > 0) "$recCount files" else null, badgeBg = Color(0xFFFFF1F2), badgeFg = Color(0xFFBE123C))
             }
-            item { SectionTitle("GENERAL & SYSTEM") }
+            stickyHeader {
+                Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) {
+                    SectionTitle("GENERAL & SYSTEM")
+                }
+            }
             item {
                 SettingRow(Icons.Filled.Call, Color(0xFF059669), iconBg(Color(0xFFD1FAE5), Color(0xFF059669)),
                     "Dialer & Default Permission", "Set as Default Dialer · " + if (activity.isDefaultDialer()) "CallerX is default" else "Not default dialer", onPermissions)
