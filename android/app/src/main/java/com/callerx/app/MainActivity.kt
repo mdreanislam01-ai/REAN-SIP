@@ -43,7 +43,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -252,6 +255,16 @@ class MainActivity : ComponentActivity() {
     var dialIntentNumber by mutableStateOf("")
     var callUiRequested by mutableStateOf(false)
     var dialerRoleTick by mutableIntStateOf(0)
+    var profileTick by mutableIntStateOf(0)
+    private val pickPhotoLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                val out = File(filesDir, "profile_photo.jpg")
+                contentResolver.openInputStream(uri)?.use { input -> out.outputStream().use { input.copyTo(it) } }
+                profileTick++
+            } catch (e: Exception) { errorMessage = "Could not load the selected photo: ${e.message ?: "unknown error"}" }
+        }
+    }
     var resumeTick by mutableIntStateOf(0)
     var accountsTick by mutableIntStateOf(0)
     private var pendingCellNumber = ""
@@ -321,6 +334,15 @@ class MainActivity : ComponentActivity() {
             prefs().edit().putString("sip_log", trimmed.toString()).apply()
             scheduleDataRefresh(80)
         } catch (_: Exception) { }
+    }
+
+    fun pickProfilePhoto() {
+        try { pickPhotoLauncher.launch("image/*") } catch (_: Exception) { errorMessage = "No photo picker is available on this device." }
+    }
+
+    fun clearProfilePhoto() {
+        try { File(filesDir, "profile_photo.jpg").delete() } catch (_: Exception) { }
+        profileTick++
     }
 
     fun requestSmsPermission() {
@@ -1123,7 +1145,7 @@ private fun CallerXApp(activity: MainActivity) {
                 onMessage = { activity.openSms(selected!!.number) },
                 onEdit = { activity.openSystemContactEdit(selected!!.number) })
         } else if (screen == "profile") {
-            ProfileScreen(onBack = { screen = "settings" }, onTheme = { screen = "theme" }, onSettings = { screen = "settings" }, onNotifications = { activity.openNotificationSettings() })
+            ProfileScreen(activity, onBack = { screen = "settings" }, onTheme = { screen = "theme" }, onSettings = { screen = "settings" }, onNotifications = { activity.openNotificationSettings() })
         } else if (screen == "theme") {
             ThemeScreen(accent, { accent = it; prefs.edit().putInt("accent", it).apply() }, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, onBack = { screen = "settings" })
         } else if (screen == "blocked") {
@@ -1697,12 +1719,7 @@ private fun AppLinkRow(tint: Color, icon: ImageVector, label: String, onClick: (
 private fun SipAccountsScreen(activity: MainActivity, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (Int) -> Unit, onDelete: (Int) -> Unit, onToggle: (Int, Boolean) -> Unit, onMakeDefault: (Int) -> Unit) {
     val accounts = activity.accountsList()
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-            Box(Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) { Icon(Icons.Filled.Cloud, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp)) }
-            Spacer(Modifier.width(10.dp))
-            Text("SIP Account", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        }
+        TopBar("SIP Account", onBack)
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
             Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp)) {
@@ -1756,10 +1773,7 @@ private fun SipFormScreen(activity: MainActivity, editIndex: Int, onBack: () -> 
     val ready = user.isNotBlank() && pass.isNotBlank() && domain.isNotBlank()
 
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.Close, "Close") }
-            Text(if (editIndex >= 0) "Edit SIP Account" else "Add SIP Account", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        }
+        TopBar(if (editIndex >= 0) "Edit SIP Account" else "Add SIP Account", onBack)
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
             Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1829,15 +1843,12 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
 
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         if (onBack != null) {
-            Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-                Text("Settings", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            }
+            TopBar("Settings", onBack)
         } else {
-            Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(start = 20.dp, end = 12.dp, top = 18.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primary).statusBarsPadding().padding(start = 20.dp, end = 12.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Settings", fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onSurface)
-                    Text("CallerX VoIP & Dual-SIM Preferences", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+                    Text("Settings", fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onPrimary)
+                    Text("CallerX VoIP & Dual-SIM Preferences", fontSize = 11.sp, color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.78f), modifier = Modifier.padding(top = 2.dp))
                 }
                 SipPill(if (activity.registered) "SIP Registered" else "SIP Offline", activity.registered, onSip)
             }
@@ -1884,10 +1895,7 @@ private fun SettingRow(icon: ImageVector, tint: Color, title: String, subtitle: 
 private fun BlockedScreen(activity: MainActivity, onBack: () -> Unit) {
     val blocked = activity.blockedNumbers()
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-            Text("Blocked numbers", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        }
+        TopBar("Blocked numbers", onBack)
         if (blocked.isEmpty()) Text("No blocked numbers. Block a number from its contact details page.", Modifier.padding(20.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
         LazyColumn {
             items(blocked) { n ->
@@ -1905,7 +1913,7 @@ private fun BlockedScreen(activity: MainActivity, onBack: () -> Unit) {
 
 /* ---------- Misc screens ---------- */
 @Composable
-private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).statusBarsPadding().padding(top = 6.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) } }
+private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primary).statusBarsPadding().padding(top = 6.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onPrimary) }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onPrimary) } }
 
 @Composable
 private fun DialerScreen(number: String, onNumber: (String) -> Unit, onBack: () -> Unit, onCall: () -> Unit) {
@@ -1981,20 +1989,53 @@ private fun DialKey(digit: String, letters: String, onTap: () -> Unit, onLongPre
 }
 
 @Composable
-private fun ProfileScreen(onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit, onNotifications: () -> Unit) {
+private fun ProfileScreen(activity: MainActivity, onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit, onNotifications: () -> Unit) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+    var name by remember { mutableStateOf(prefs.getString("profile:name", "") ?: "") }
+    var mobile by remember { mutableStateOf(prefs.getString("profile:number", "") ?: "") }
+    var email by remember { mutableStateOf(prefs.getString("profile:email", "") ?: "") }
+    var status by remember { mutableStateOf(prefs.getString("profile:status", "Available · auto backup on") ?: "") }
+    var photo by remember(activity.profileTick) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(activity.profileTick) {
+        photo = withContext(Dispatchers.IO) {
+            val f = File(context.filesDir, "profile_photo.jpg")
+            if (f.exists()) try { android.graphics.BitmapFactory.decodeFile(f.absolutePath) } catch (_: Exception) { null } else null
+        }
+    }
+    val primary = MaterialTheme.colorScheme.primary
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         TopBar("My Profile", onBack)
-        Column(Modifier.fillMaxWidth().padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Box(Modifier.size(90.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) { Text("R", color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold) }
-            Text("Rakib Hasan", Modifier.padding(top = 10.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-            Text("+880 17XX-XXXXXX", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text("Available · Dhaka · auto backup on", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
-            Spacer(Modifier.height(18.dp))
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(Modifier.size(96.dp).clip(CircleShape).background(primary), contentAlignment = Alignment.Center) {
+                val bmp = photo
+                if (bmp != null) Image(bmp.asImageBitmap(), "Profile photo", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                else Text(name.ifBlank { "C" }.first().uppercaseChar().toString(), color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold)
+            }
+            Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(onClick = { activity.pickProfilePhoto() }) { Icon(Icons.Filled.PhotoCamera, null, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(5.dp)); Text("Change photo", fontSize = 12.sp) }
+                if (photo != null) TextButton(onClick = { activity.clearProfilePhoto() }) { Text("Remove photo", fontSize = 12.sp, color = Color(0xFFD64545)) }
+            }
+            Text(name.ifBlank { "Your name" }, Modifier.padding(top = 2.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+            Text(mobile.ifBlank { "Mobile number not set" }, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(email.ifBlank { "Gmail not set" }, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+            Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+            Spacer(Modifier.height(16.dp))
+            Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Edit profile", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    OutlinedTextField(name, { name = it; prefs.edit().putString("profile:name", it).apply() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Name", fontSize = 13.sp) }, shape = RoundedCornerShape(14.dp))
+                    OutlinedTextField(mobile, { mobile = it; prefs.edit().putString("profile:number", it).apply() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Mobile number", fontSize = 13.sp) }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone), shape = RoundedCornerShape(14.dp))
+                    OutlinedTextField(email, { email = it; prefs.edit().putString("profile:email", it).apply() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Gmail / email", fontSize = 13.sp) }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), shape = RoundedCornerShape(14.dp))
+                    OutlinedTextField(status, { status = it; prefs.edit().putString("profile:status", it).apply() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Status", fontSize = 13.sp) }, shape = RoundedCornerShape(14.dp))
+                    Text("Changes are saved automatically on this device.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            Spacer(Modifier.height(14.dp))
             Column(Modifier.fillMaxWidth()) {
-                SettingRow(Icons.Filled.Edit, MaterialTheme.colorScheme.primary, "Edit Profile", "Name, number and status are stored on this device", onClick = { })
-                SettingRow(Icons.Filled.Settings, MaterialTheme.colorScheme.primary, "Notifications", "Open Android notification settings for CallerX", onClick = onNotifications)
-                SettingRow(Icons.Filled.Palette, MaterialTheme.colorScheme.primary, "Theme", "Change the accent color of the whole app", onClick = onTheme)
-                SettingRow(Icons.Filled.Settings, MaterialTheme.colorScheme.primary, "Settings", "Back to all settings", onClick = onSettings)
+                SettingRow(Icons.Filled.Settings, primary, "Notifications", "Open Android notification settings for CallerX", onClick = onNotifications)
+                SettingRow(Icons.Filled.Palette, primary, "Theme", "Change the accent color of the whole app", onClick = onTheme)
+                SettingRow(Icons.Filled.Settings, primary, "Settings", "Back to all settings", onClick = onSettings)
             }
         }
     }
