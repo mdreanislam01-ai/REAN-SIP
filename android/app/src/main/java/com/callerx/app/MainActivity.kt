@@ -8,6 +8,11 @@ import android.net.Uri
 import android.telecom.TelecomManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.provider.ContactsContract
+import android.provider.CallLog
+import android.provider.Telephony
+import java.text.DateFormat
+import java.util.Date
 import android.os.Bundle
 import android.view.View
 import androidx.activity.ComponentActivity
@@ -47,13 +52,29 @@ private val Palette = listOf(
     Color(0xFFC34F86), Color(0xFF455FC2), Color(0xFF168C8C), Color(0xFFCA4545), Color(0xFF68717D)
 )
 private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "")
-private val people = listOf(
-    Person("Ayesha Rahman", "+880 1712-345678", "A", true, time = "10:42 AM"),
-    Person("Rakib Hasan", "+880 1811-223344", "R", time = "9:18 AM"),
-    Person("Nusrat Jahan", "+880 1912-556677", "N", true, time = "Yesterday"),
-    Person("Spam Likely", "+880 17XX-XXXXXX", "S", spam = true, time = "Yesterday"),
-    Person("bKash", "+880 9612-345678", "b", true, time = "Monday")
-)
+private val people = emptyList<Person>()
+private fun loadContacts(context: Context): List<Person> {
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return emptyList()
+    val result = mutableListOf<Person>()
+    context.contentResolver.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI, arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER), null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " COLLATE NOCASE")?.use { c ->
+        while (c.moveToNext()) { val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?")) }
+    }
+    return result.distinctBy { it.number }
+}
+private fun loadCallLog(context: Context): List<Person> {
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) return emptyList()
+    val result = mutableListOf<Person>()
+    context.contentResolver.query(CallLog.Calls.CONTENT_URI, arrayOf(CallLog.Calls.CACHED_NAME, CallLog.Calls.NUMBER, CallLog.Calls.DATE, CallLog.Calls.TYPE), null, null, CallLog.Calls.DATE + " DESC")?.use { c ->
+        while (c.moveToNext()) { val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); val date = c.getLong(2); val missed = c.getInt(3) == CallLog.Calls.MISSED_TYPE; result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", spam = false, time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(date)))) }
+    }
+    return result
+}
+private fun loadSms(context: Context): List<Pair<String,String>> {
+    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return emptyList()
+    val rows = mutableListOf<Pair<String,String>>()
+    context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI, arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY), null, null, Telephony.Sms.DATE + " DESC")?.use { c -> while (c.moveToNext()) rows.add((c.getString(0).orEmpty()) to c.getString(1).orEmpty()) }
+    return rows
+}
 
 class MainActivity : ComponentActivity() {
     private var core: Core? = null
@@ -67,6 +88,7 @@ class MainActivity : ComponentActivity() {
     var dialIntentNumber by mutableStateOf("")
     var callUiRequested by mutableStateOf(false)
     var dialerRoleTick by mutableIntStateOf(0)
+    var resumeTick by mutableIntStateOf(0)
     private var pendingCellNumber = ""
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startSipCall(activeNumber, activeCallName) else errorMessage = "Microphone permission is needed for SIP audio calls."
@@ -82,7 +104,7 @@ class MainActivity : ComponentActivity() {
 
     fun requestStartupPermissions() {
         val permissions = mutableListOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
-            Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_CONTACTS, Manifest.permission.RECORD_AUDIO)
+            Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_CONTACTS, Manifest.permission.READ_SMS, Manifest.permission.RECORD_AUDIO)
         if (android.os.Build.VERSION.SDK_INT >= 33) permissions += Manifest.permission.POST_NOTIFICATIONS
         val missing = permissions.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) runtimePermissionLauncher.launch(missing.toTypedArray())
@@ -126,6 +148,8 @@ class MainActivity : ComponentActivity() {
         initializeLinphone()
         setContent { CallerXApp(this) }
     }
+
+    override fun onResume() { super.onResume(); resumeTick++ }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -252,6 +276,9 @@ private fun CallerXApp(activity: MainActivity) {
     var query by remember { mutableStateOf("") }
     var searchOpen by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<Person?>(null) }
+    var contacts by remember { mutableStateOf(emptyList<Person>()) }
+    var recentCalls by remember { mutableStateOf(emptyList<Person>()) }
+    var messages by remember { mutableStateOf(emptyList<Pair<String,String>>()) }
     var dark by remember { mutableStateOf(false) }
     var accent by remember { mutableIntStateOf(0) }
     var sipUsername by remember { mutableStateOf("") }
@@ -268,7 +295,8 @@ private fun CallerXApp(activity: MainActivity) {
     var showPermissionWelcome by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(activity.resumeTick) {
+        contacts = loadContacts(context); recentCalls = loadCallLog(context); messages = loadSms(context)
         sipUsername = prefs.getString("user", "") ?: ""
         sipDomain = prefs.getString("domain", "") ?: ""
         sipPort = prefs.getString("port", "5060") ?: "5060"
@@ -334,21 +362,21 @@ private fun CallerXApp(activity: MainActivity) {
                             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 7.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                                 listOf("All", "Missed", "Spam", "Favorites").forEach { label -> FilterChip(selected = filter == label, onClick = { filter = label }, label = { Text(label) }) }
                             }
-                            val filtered = people.filter { person ->
+                            val filtered = recentCalls.filter { person ->
                                 (filter == "All" || (filter == "Spam" && person.spam) || (filter == "Favorites" && person.verified) || (filter == "Missed" && person.name == "Spam Likely")) &&
                                     (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
                             }
-                            LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) { items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
+                            LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
                         } else if (tab == "Contacts") {
                             LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) {
                                 item { SectionTitle("FAVORITES") }
-                                items(people.filter { it.verified }) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
+                                items(contacts.take(5)) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
                                 item { SectionTitle("ALL CONTACTS") }
-                                items(people) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
+                                if (contacts.isEmpty()) item { Text("No contacts found. Grant Contacts permission or add contacts to your device.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(contacts) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
                             }
                         } else {
                             LazyColumn(contentPadding = PaddingValues(bottom = 20.dp)) {
-                                itemsIndexed(listOf("bKash" to "Your transaction was successful. Tk 500.00", "Nusrat Jahan" to "Kalke office e asbi?", "Verification" to "Your CallerX code is 382104")) { i, row ->
+                                if (messages.isEmpty()) item { Text("No SMS messages found. Grant SMS permission to view your inbox.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; itemsIndexed(messages) { i, row ->
                                     Row(Modifier.fillMaxWidth().clickable { }.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Avatar(row.first.take(1), color, 48); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text(row.first, fontWeight = FontWeight.SemiBold); Text(row.second, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp) }; Text(if (i == 0) "10:12" else "Yesterday", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }; HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
@@ -379,7 +407,7 @@ private fun CallerXApp(activity: MainActivity) {
 }
 
 @Composable private fun Header(tab: String, sip: String, searchOpen: Boolean, onSearch: () -> Unit, query: String, onQuery: (String) -> Unit, onProfile: () -> Unit, onSip: () -> Unit) {
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(start = 16.dp, top = 28.dp, end = 16.dp, bottom = 12.dp)) {
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(start = 16.dp, top = 76.dp, end = 16.dp, bottom = 12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onProfile) { Avatar("R", MaterialTheme.colorScheme.primary, 36) }
             if (searchOpen) OutlinedTextField(query, onQuery, Modifier.weight(1f).height(56.dp), placeholder = { Text("Search name or number") }, singleLine = true, shape = RoundedCornerShape(22.dp))
@@ -438,11 +466,8 @@ private fun CallerXApp(activity: MainActivity) {
         if (onBack != null) TopBar("Settings", onBack) else Text("Settings", Modifier.padding(start = 18.dp, top = 36.dp, end = 18.dp, bottom = 18.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
         LazyColumn {
             item { SectionTitle("ACCOUNT") }; item { SettingRow(Icons.Filled.Person, "My Profile", "Manage your account", onProfile) }
-            item { SectionTitle("VOIP & SIP") }; item { SettingRow(Icons.Filled.Cloud, "SIP Account", "Register your VoIP account", onSip) }; item { SettingRow(Icons.Filled.Security, "VoIP Security", "Transport and encryption options", {}) }
-            item { SectionTitle("MORE") }; listOf("Notifications", "Who Viewed My Profile", "Business Profile", "Linked Devices", "Backup & Restore", "Family Protection", "Incognito Mode", "CallerX Premium").forEachIndexed { i, title -> item { SettingRow(listOf(Icons.Filled.Notifications, Icons.Filled.Visibility, Icons.Filled.Business, Icons.Filled.Devices, Icons.Filled.Backup, Icons.Filled.FamilyRestroom, Icons.Filled.VisibilityOff, Icons.Filled.Star)[i], title, "", {}) } }
-            item { SectionTitle("CALLS") }; item { SettingRow(Icons.Filled.VerifiedUser, "Caller ID", "", {}, true) }; item { SettingRow(Icons.Filled.CallMade, "After Call", "", {}, true) }; item { SettingRow(Icons.Filled.Mic, "Auto Record Calls", "", {}, true) }; item { SettingRow(Icons.Filled.MusicNote, "Call Recordings", "", {}) }; item { SettingRow(Icons.Filled.Block, "Block List", "", {}) }
-            item { SectionTitle("SIM MANAGEMENT") }; item { SettingRow(Icons.Filled.SimCard, "SIM 1", "", {}, true) }; item { SettingRow(Icons.Filled.SimCard, "SIM 2", "", {}, true) }; item { SettingRow(Icons.Filled.SwapCalls, "Ask every time before call", "", {}, true) }
-            item { SectionTitle("NOTIFICATIONS") }; listOf("Spam Call Alerts", "Missed Call Alerts", "Only Spam Notifications").forEach { item { SettingRow(Icons.Filled.NotificationsActive, it, "", {}, true) } }
+            item { SectionTitle("VOIP & SIP") }; item { SettingRow(Icons.Filled.Cloud, "SIP Account", "Register your VoIP account", onSip) }
+            item { SectionTitle("SIM CALLING") }; item { SettingRow(Icons.Filled.SimCard, "SIM 1", "Show SIM 1 as a call option", {}, true) }; item { SettingRow(Icons.Filled.SimCard, "SIM 2", "Show SIM 2 as a call option", {}, true) }; item { SettingRow(Icons.Filled.SwapCalls, "Ask before each call", "Choose SIP or an enabled SIM", {}, true, true) }
             item { SectionTitle("GENERAL") }; item { SettingRow(Icons.Filled.PhoneAndroid, "Set as Default Dialer", if (isDefaultDialer) "CallerX is your default dialer" else "Choose CallerX for SIM calls", activity::requestDefaultDialer) }; item { SettingRow(Icons.Filled.Palette, "Theme color", "Choose your accent", onTheme) }; item { SettingRow(Icons.Filled.DarkMode, "Dark Mode", "", { onDark(!dark) }, true, dark) }
         }
     }
