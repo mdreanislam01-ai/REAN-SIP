@@ -46,13 +46,14 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -66,7 +67,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -74,12 +74,9 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -1118,7 +1115,7 @@ private fun CallerXApp(activity: MainActivity) {
                 containerColor = MaterialTheme.colorScheme.background,
                 bottomBar = { NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     listOf("Calls" to Icons.Filled.Call, "Contacts" to Icons.Filled.Contacts, "Messages" to Icons.AutoMirrored.Filled.Message, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
-                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false; query = "" }, icon = { Icon(icon, label, modifier = Modifier.size(22.dp)) }, label = { Text(label, fontSize = 11.sp) }, alwaysShowLabel = true)
+                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false; query = "" }, icon = { Icon(icon, label, modifier = Modifier.size(20.dp)) }, label = { Text(label, fontSize = 9.sp, maxLines = 1) }, alwaysShowLabel = true)
                     }
                 } }
             ) { padding ->
@@ -1209,13 +1206,13 @@ private fun HomeHeader(tab: String, sip: String, sipOnline: Boolean, searchOpen:
         "Calls" -> "SIM 1, SIM 2 & SIP call history"
         "Contacts" -> "Device contacts & favorites"
         "Messages" -> "SMS inbox"
-        else -> "CallerX VoIP & Dual-SIM preferences"
+        else -> "VoIP & Dual-SIM preferences"
     }
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(start = 18.dp, end = 12.dp, top = 14.dp, bottom = 10.dp)) {
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).statusBarsPadding().padding(start = 18.dp, end = 12.dp, top = 10.dp, bottom = 10.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text(tab, fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onSurface)
-                Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+                Text("CallerX", fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onSurface)
+                Text("$tab · $subtitle", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (tab == "Calls" || tab == "Contacts" || tab == "Messages") IconButton(onClick = onSearch) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, "Search", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
             SipPill(sip, sipOnline, onSip)
@@ -1438,7 +1435,7 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
     val netLabel = activity.networkTypeLabel()
     val netTint = if (quality >= 3f || !source.startsWith("SIP")) Color(0xFF22A06B) else if (quality >= 2f) Color(0xFFD47622) else if (quality >= 0f) Color(0xFFD64545) else Color(0xFF5C6873)
     Box(Modifier.fillMaxSize().background(background)) {
-        Column(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(horizontal = 24.dp, vertical = 14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
                 Surface(shape = RoundedCornerShape(50), color = sourceColor.copy(alpha = if (dark) .22f else .09f), border = androidx.compose.foundation.BorderStroke(1.dp, sourceColor.copy(alpha = .25f))) {
                     Row(Modifier.padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1869,91 +1866,61 @@ private fun BlockedScreen(activity: MainActivity, onBack: () -> Unit) {
 
 /* ---------- Misc screens ---------- */
 @Composable
-private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) } }
+private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).statusBarsPadding().padding(top = 6.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) } }
 
 @Composable
 private fun DialerScreen(number: String, onNumber: (String) -> Unit, onBack: () -> Unit, onCall: () -> Unit) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
-    val primary = MaterialTheme.colorScheme.primary
     val secondaryText = MaterialTheme.colorScheme.onSurfaceVariant
-    var field by remember { mutableStateOf(TextFieldValue(number)) }
-    LaunchedEffect(number) { if (field.text != number) field = TextFieldValue(number, selection = TextRange(number.length)) }
-
-    fun setNumber(v: String) { field = TextFieldValue(v, selection = TextRange(v.length)); onNumber(v) }
-    fun insertAtCursor(s2: String) {
-        val text = field.text
-        val start = field.selection.start.coerceIn(0, text.length)
-        val end = field.selection.end.coerceIn(0, text.length)
-        val lo = minOf(start, end); val hi = maxOf(start, end)
-        val merged = text.substring(0, lo) + s2 + text.substring(hi)
-        field = TextFieldValue(merged, selection = TextRange(lo + s2.length))
-        onNumber(merged)
+    // gestures must always read the newest number, so keep it in a stable ref
+    val numberRef = remember { mutableStateOf(number) }
+    numberRef.value = number
+    fun append(s2: String) { onNumber(numberRef.value + s2) }
+    fun deleteLast() { val t = numberRef.value; if (t.isNotEmpty()) onNumber(t.dropLast(1)) }
+    fun clearAll() { onNumber("") }
+    fun pasteNumber() {
+        val raw = try { clipboard.getText()?.text.orEmpty() } catch (_: Exception) { "" }
+        val clean = raw.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+        if (clean.isBlank()) Toast.makeText(context, "No phone number in the clipboard", Toast.LENGTH_SHORT).show()
+        else { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onNumber(numberRef.value + clean); Toast.makeText(context, "Pasted $clean", Toast.LENGTH_SHORT).show() }
     }
-    fun deleteBeforeCursor() {
-        val text = field.text
-        if (text.isEmpty()) return
-        val pos = field.selection.end.coerceIn(0, text.length)
-        if (pos == 0) { setNumber(text.dropLast(1)); return }
-        val merged = text.substring(0, pos - 1) + text.substring(pos)
-        field = TextFieldValue(merged, selection = TextRange(pos - 1))
-        onNumber(merged)
-    }
-    fun tap() { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
-    fun longTap() { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
 
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background), horizontalAlignment = Alignment.CenterHorizontally) {
-        TopBar("Keypad", onBack)
-        Spacer(Modifier.weight(0.6f))
-        BasicTextField(
-            value = field,
-            onValueChange = { tfv -> field = tfv; onNumber(tfv.text.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }) },
-            singleLine = true,
-            textStyle = TextStyle(fontSize = 27.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface, textAlign = TextAlign.Center),
-            cursorBrush = SolidColor(primary),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-            decorationBox = { inner ->
-                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    if (field.text.isEmpty()) Text("Enter or paste a number", fontSize = 21.sp, fontWeight = FontWeight.Medium, color = secondaryText.copy(alpha = 0.55f))
-                    inner()
-                }
-            },
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 22.dp)
-        )
-        Row(Modifier.padding(top = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            DialerAction(Icons.Filled.ContentPaste, "Paste", primary) {
-                val raw = try { clipboard.getText()?.text.orEmpty() } catch (_: Exception) { "" }
-                val clean = raw.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
-                if (clean.isBlank()) Toast.makeText(context, "No phone number in the clipboard", Toast.LENGTH_SHORT).show()
-                else { tap(); insertAtCursor(clean); Toast.makeText(context, "Pasted $clean", Toast.LENGTH_SHORT).show() }
-            }
-            if (number.isNotBlank()) DialerAction(Icons.Filled.ContentCopy, "Copy", secondaryText) { clipboard.setText(AnnotatedString(number)); tap(); Toast.makeText(context, "Number copied", Toast.LENGTH_SHORT).show() }
-            if (number.isNotBlank()) DialerAction(Icons.Filled.Close, "Clear", Color(0xFFD64545)) { longTap(); setNumber("") }
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).statusBarsPadding().navigationBarsPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onSurface) }
+            Spacer(Modifier.weight(1f))
         }
-        Spacer(Modifier.height(18.dp))
+        Spacer(Modifier.weight(0.5f))
+        Box(Modifier.fillMaxWidth().padding(horizontal = 26.dp).pointerInput(Unit) {
+            detectTapGestures(onLongPress = { pasteNumber() }, onTap = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) })
+        }, contentAlignment = Alignment.Center) {
+            Text(if (number.isEmpty()) "Enter a number" else number,
+                fontSize = if (number.length > 14) 23.sp else 30.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.6.sp,
+                color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        }
+        Text("Long-press the number to paste a copied one", Modifier.padding(top = 8.dp), fontSize = 10.sp, color = secondaryText.copy(alpha = 0.7f))
+        Spacer(Modifier.weight(0.7f))
         val keys = listOf("1" to "", "2" to "ABC", "3" to "DEF", "4" to "GHI", "5" to "JKL", "6" to "MNO", "7" to "PQRS", "8" to "TUV", "9" to "WXYZ", "*" to "", "0" to "+", "#" to "")
         keys.chunked(3).forEach { row ->
-            Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                 row.forEach { (digit, letters) ->
-                    val plusKey: () -> Unit = { longTap(); insertAtCursor("+") }
-                    DialKey(digit, letters, { tap(); insertAtCursor(digit) }, if (digit == "0") plusKey else null)
+                    DialKey(digit, letters, { append(digit) }, if (digit == "0") { { append("+") } } else null)
                 }
             }
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(10.dp))
         }
-        Spacer(Modifier.height(14.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(62.dp))
-            Spacer(Modifier.width(18.dp))
-            Button(onClick = { longTap(); onCall() }, shape = CircleShape, modifier = Modifier.size(62.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E9C67))) { Icon(Icons.Filled.Call, "Call", tint = Color.White) }
-            Spacer(Modifier.width(18.dp))
-            Box(Modifier.size(58.dp).pointerInput(Unit) {
-                detectTapGestures(onTap = { tap(); deleteBeforeCursor() }, onLongPress = { longTap(); setNumber("") })
-            }, contentAlignment = Alignment.Center) { Icon(Icons.Filled.Backspace, "Delete", tint = secondaryText) }
+        Spacer(Modifier.height(16.dp))
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(26.dp)) {
+            Box(Modifier.size(64.dp))
+            Button(onClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onCall() }, shape = CircleShape, modifier = Modifier.size(64.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E9C67))) { Icon(Icons.Filled.Call, "Call", tint = Color.White, modifier = Modifier.size(25.dp)) }
+            Box(Modifier.size(50.dp).pointerInput(Unit) {
+                detectTapGestures(onTap = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); deleteLast() }, onLongPress = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); clearAll() })
+            }, contentAlignment = Alignment.Center) { Icon(Icons.Filled.Backspace, "Delete", tint = secondaryText, modifier = Modifier.size(22.dp)) }
         }
-        Text("Hold 0 for +   ·   Hold delete to clear all", Modifier.padding(top = 12.dp), fontSize = 10.sp, color = secondaryText.copy(alpha = 0.85f))
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.weight(0.4f))
     }
 }
 
@@ -1963,26 +1930,17 @@ private fun DialKey(digit: String, letters: String, onTap: () -> Unit, onLongPre
         val lp = onLongPress
         { _: Offset -> lp() }
     } else null
-    Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceVariant,
-        modifier = Modifier.size(80.dp).pointerInput(digit) { detectTapGestures(onTap = { onTap() }, onLongPress = longAction) }) {
+    Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+        modifier = Modifier.size(72.dp).pointerInput(digit) { detectTapGestures(onTap = { onTap() }, onLongPress = longAction) }) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(digit, fontSize = 23.sp, color = MaterialTheme.colorScheme.onSurface)
-                if (letters.isNotBlank()) Text(letters, fontSize = 9.sp, letterSpacing = 1.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(digit, fontSize = 25.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                if (letters.isNotBlank()) Text(letters, fontSize = 9.sp, letterSpacing = 1.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
 }
 
-@Composable
-private fun DialerAction(icon: ImageVector, label: String, tint: Color, onClick: () -> Unit) {
-    Surface(onClick = onClick, shape = RoundedCornerShape(50), color = tint.copy(alpha = 0.12f)) {
-        Row(Modifier.padding(horizontal = 13.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Icon(icon, label, tint = tint, modifier = Modifier.size(15.dp))
-            Text(label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = tint)
-        }
-    }
-}
 @Composable
 private fun ProfileScreen(onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit, onNotifications: () -> Unit) {
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
