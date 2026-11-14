@@ -11,9 +11,12 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.media.AudioAttributes
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.Handler
 import android.os.Looper
 import android.os.VibrationEffect
@@ -222,6 +225,27 @@ class CallNotificationReceiver : BroadcastReceiver() {
     }
 }
 
+class SipKeepAliveService : android.app.Service() {
+    override fun onBind(intent: Intent?) = null
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            if (nm?.getNotificationChannel("callerx_sip") == null) {
+                nm?.createNotificationChannel(NotificationChannel("callerx_sip", "SIP service", NotificationManager.IMPORTANCE_LOW))
+            }
+            val notif = Notification.Builder(this, "callerx_sip")
+                .setSmallIcon(android.R.drawable.stat_sys_phone_call)
+                .setContentTitle("CallerX SIP")
+                .setContentText("Keeping your SIP line online for calls")
+                .setOngoing(true)
+                .build()
+            if (Build.VERSION.SDK_INT >= 34) startForeground(4712, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            else startForeground(4712, notif)
+        } catch (_: Exception) { }
+        return START_STICKY
+    }
+}
+
 class MainActivity : ComponentActivity() {
     private var core: Core? = null
     var registered by mutableStateOf(false)
@@ -251,6 +275,14 @@ class MainActivity : ComponentActivity() {
     }
     private var sipCallIncoming = false
     private var sipCallLogged = true
+    private var regFailCount = 0
+    private var regRetryPending = false
+    private var callWakeLock: PowerManager.WakeLock? = null
+    private var callWifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    private val netCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) { mainHandler.post { try { core?.refreshRegisters() } catch (_: Exception) { } } }
+        override fun onLost(network: Network) { mainHandler.post { try { core?.refreshRegisters() } catch (_: Exception) { } } }
+    }
     private var incomingVibrationOn = false
     var dialIntentNumber by mutableStateOf("")
     var callUiRequested by mutableStateOf(false)
@@ -334,6 +366,55 @@ class MainActivity : ComponentActivity() {
             prefs().edit().putString("sip_log", trimmed.toString()).apply()
             scheduleDataRefresh(80)
         } catch (_: Exception) { }
+    }
+
+    /* ---------- SIP reliability: keep-alive service, locks, auto retry ---------- */
+    fun startKeepAliveService() {
+        try {
+            val i = Intent(this, SipKeepAliveService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        } catch (_: Exception) { }
+    }
+
+    fun stopKeepAliveService() {
+        try { stopService(Intent(this, SipKeepAliveService::class.java)) } catch (_: Exception) { }
+    }
+
+    private fun scheduleRegRetry() {
+        if (regRetryPending) return
+        regRetryPending = true
+        mainHandler.postDelayed({
+            regRetryPending = false
+            if (!registered) { try { core?.refreshRegisters() } catch (_: Exception) { } ; scheduleRegRetry() }
+        }, 20000)
+    }
+
+    private fun acquireCallLocks() {
+        try {
+            if (callWakeLock == null) {
+                val pm = getSystemService(PowerManager::class.java)
+                callWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "callerx:call")
+                callWakeLock?.setReferenceCounted(false)
+                callWakeLock?.acquire(3600000L)
+            }
+        } catch (_: Exception) { }
+        try {
+            if (callWifiLock == null) {
+                val wm = applicationContext.getSystemService(WIFI_SERVICE) as? android.net.wifi.WifiManager
+                @Suppress("DEPRECATION")
+                val wl = wm?.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "callerx:wifi")
+                callWifiLock = wl
+                wl?.setReferenceCounted(false)
+                wl?.acquire()
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun releaseCallLocks() {
+        try { callWakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
+        callWakeLock = null
+        try { callWifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
+        callWifiLock = null
     }
 
     fun pickProfilePhoto() {
@@ -552,7 +633,9 @@ class MainActivity : ComponentActivity() {
             }
             c.defaultAccount = default ?: c.accountList.firstOrNull()
             registered = false
+            regFailCount = 0
             registrationMessage = if (c.accountList.isNotEmpty()) "Registering…" else "SIP Offline"
+            if (c.accountList.isNotEmpty()) startKeepAliveService() else stopKeepAliveService()
         } catch (e: Exception) {
             registered = false
             registrationMessage = "SIP Offline"
@@ -601,10 +684,11 @@ class MainActivity : ComponentActivity() {
         initializeLinphone()
         registerDataObservers()
         refreshData()
+        try { (getSystemService(ConnectivityManager::class.java))?.registerDefaultNetworkCallback(netCallback) } catch (_: Exception) { }
         setContent { CallerXApp(this) }
     }
 
-    override fun onResume() { super.onResume(); resumeTick++; CallBridge.activity = this; scheduleDataRefresh(150) }
+    override fun onResume() { super.onResume(); resumeTick++; CallBridge.activity = this; scheduleDataRefresh(150); try { core?.refreshRegisters() } catch (_: Exception) { } }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -615,6 +699,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         cancelCallNotification()
+        try { (getSystemService(ConnectivityManager::class.java))?.unregisterNetworkCallback(netCallback) } catch (_: Exception) { }
+        releaseCallLocks()
         try { contentResolver.unregisterContentObserver(dataObserver) } catch (_: Exception) { }
         mainHandler.removeCallbacks(refreshRunnable)
         refreshJob?.cancel()
@@ -643,8 +729,13 @@ class MainActivity : ComponentActivity() {
                                 else -> "SIP Offline"
                             }
                         }
+                        if (state == RegistrationState.Ok) regFailCount = 0
                         if (state == RegistrationState.Failed && isDefault) {
-                            errorMessage = "SIP registration failed: $message — check username, password, server domain, port and transport (UDP/TCP/TLS) with your SIP provider."
+                            regFailCount++
+                            scheduleRegRetry()
+                            if (regFailCount >= 3) {
+                                errorMessage = "SIP registration failed: $message — CallerX keeps retrying automatically. If it stays offline, check username, password, server domain, port and transport (UDP/TCP/TLS) with your SIP provider."
+                            }
                         }
                     }
                 }
@@ -668,6 +759,7 @@ class MainActivity : ComponentActivity() {
                             Call.State.StreamsRunning -> {
                                 callConnected = true; stopIncomingVibration()
                                 if (callStartedAt == 0L) callStartedAt = System.currentTimeMillis()
+                                acquireCallLocks()
                                 maybeAutoRecord()
                             }
                             Call.State.End, Call.State.Released, Call.State.Error -> {
@@ -677,7 +769,7 @@ class MainActivity : ComponentActivity() {
                                     logSipCall(activeNumber, activeCallName, sipCallIncoming, callConnected, dur)
                                     sipCallLogged = true
                                 }
-                                callStartedAt = 0L; recording = false; callConnected = false
+                                callStartedAt = 0L; recording = false; callConnected = false; releaseCallLocks()
                             }
                             else -> { }
                         }
@@ -794,6 +886,7 @@ class MainActivity : ComponentActivity() {
                 inc_timeout=60
                 register_only_when_network_is_up=1
                 ping_with_options=1
+                keepalive_period=30000
                 """.trimIndent()
             )
             cfg.absolutePath
