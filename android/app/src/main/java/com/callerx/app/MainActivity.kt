@@ -1228,7 +1228,7 @@ private fun ContactDetailScreen(activity: MainActivity, person: Person, recents:
             Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
                     Column(Modifier.fillMaxWidth()) {
-                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text("Call History", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                                 Text("Duration & call source breakdown", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1238,7 +1238,7 @@ private fun ContactDetailScreen(activity: MainActivity, person: Person, recents:
                             }
                         }
                         val visibleHistory = if (showAllCalls) history else history.take(4)
-                        if (visibleHistory.isEmpty()) Text("No calls with this number yet.", Modifier.padding(horizontal = 16.dp, bottom = 14.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (visibleHistory.isEmpty()) Text("No calls with this number yet.", Modifier.padding(start = 16.dp, end = 16.dp, bottom = 14.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         visibleHistory.forEach { h ->
                             val missed = h.callType == CallLog.Calls.MISSED_TYPE
                             val outgoing = h.callType == CallLog.Calls.OUTGOING_TYPE
@@ -1582,7 +1582,7 @@ private fun ThemeScreen(selected: Int, onSelect: (Int) -> Unit, dark: Boolean, o
                     row.forEachIndexed { colIndex, color ->
                         val index = rowIndex * 3 + colIndex
                         Column(Modifier.clickable { onSelect(index) }.padding(14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Box(Modifier.size(52.dp).clip(CircleShape).background(color), contentAlignment = Alignment.Center) { if (selected == index) Icon(Icons.Filled.Check, tint = Color.White, modifier = Modifier.size(22.dp)) }
+                            Box(Modifier.size(52.dp).clip(CircleShape).background(color), contentAlignment = Alignment.Center) { if (selected == index) Icon(Icons.Filled.Check, null, tint = Color.White, modifier = Modifier.size(22.dp)) }
                             Text(PaletteNames[index], Modifier.padding(top = 6.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
                         }
                     }
