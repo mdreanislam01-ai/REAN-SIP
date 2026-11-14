@@ -74,6 +74,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -1058,6 +1059,15 @@ private fun CallerXApp(activity: MainActivity) {
     val scheme = if (dark) darkColorScheme(primary = color, onPrimary = Color.White, secondary = color, background = Color(0xFF101318), surface = Color(0xFF1B2027), surfaceVariant = Color(0xFF232A33), onSurface = Color(0xFFF2F5F8), onSurfaceVariant = Color(0xFF9AA6B2), outlineVariant = Color(0xFF39424C))
     else lightColorScheme(primary = color, onPrimary = Color.White, secondary = color, background = Color(0xFFF6F8FA), surface = Color.White, surfaceVariant = Color(0xFFEDF1F5), onSurface = Color(0xFF141A21), onSurfaceVariant = Color(0xFF5C6873), outlineVariant = Color(0xFFDDE3E9))
 
+    // on Android 15+ (edge-to-edge) keep the status bar icons readable over the coloured heading
+    val view = LocalView.current
+    SideEffect {
+        if (Build.VERSION.SDK_INT >= 35) {
+            val win = (view.context as? android.app.Activity)?.window
+            if (win != null) androidx.core.view.WindowCompat.getInsetsController(win, view).isAppearanceLightStatusBars = !(dark || screen == "home")
+        }
+    }
+
     fun placeCall(route: String, num: String, name: String) {
         when (route) {
             "SIP" -> {
@@ -1208,13 +1218,16 @@ private fun HomeHeader(tab: String, sip: String, sipOnline: Boolean, searchOpen:
         "Messages" -> "SMS inbox"
         else -> "VoIP & Dual-SIM preferences"
     }
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).statusBarsPadding().padding(start = 18.dp, end = 12.dp, top = 10.dp, bottom = 10.dp)) {
+    // the heading takes the active theme accent across the whole header bar
+    val headerColor = MaterialTheme.colorScheme.primary
+    val headerText = MaterialTheme.colorScheme.onPrimary
+    Column(Modifier.fillMaxWidth().background(headerColor).statusBarsPadding().padding(start = 18.dp, end = 12.dp, top = 10.dp, bottom = 10.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("CallerX", fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onSurface)
-                Text("$tab · $subtitle", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("CallerX", fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = headerText)
+                Text("$tab · $subtitle", fontSize = 10.sp, color = headerText.copy(alpha = 0.78f), modifier = Modifier.padding(top = 2.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            if (tab == "Calls" || tab == "Contacts" || tab == "Messages") IconButton(onClick = onSearch) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, "Search", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+            if (tab == "Calls" || tab == "Contacts" || tab == "Messages") IconButton(onClick = onSearch) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, "Search", tint = headerText) }
             SipPill(sip, sipOnline, onSip)
         }
     }
@@ -1222,10 +1235,11 @@ private fun HomeHeader(tab: String, sip: String, sipOnline: Boolean, searchOpen:
 
 @Composable
 private fun SipPill(sip: String, online: Boolean, onClick: () -> Unit) {
-    Surface(onClick = onClick, shape = RoundedCornerShape(50), color = if (online) Color(0xFF22A06B).copy(alpha = 0.12f) else Color(0xFFD64545).copy(alpha = 0.10f)) {
+    // sits on the coloured heading, so it uses a translucent white chip
+    Surface(onClick = onClick, shape = RoundedCornerShape(50), color = Color.White.copy(alpha = 0.18f)) {
         Row(Modifier.padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Box(Modifier.size(7.dp).clip(CircleShape).background(if (online) Color(0xFF22A06B) else Color(0xFFD64545)))
-            Text(sip, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (online) Color(0xFF1E7E52) else Color(0xFFB33A3A), maxLines = 1)
+            Box(Modifier.size(7.dp).clip(CircleShape).background(if (online) Color(0xFF6EE7A8) else Color(0xFFFF8A8A)))
+            Text(sip, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 1)
         }
     }
 }
