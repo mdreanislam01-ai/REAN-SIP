@@ -178,6 +178,55 @@ private fun contactColor(name: String): Color {
     return contactColors[Math.floorMod(h, contactColors.size)]
 }
 
+// Notification actions + channel for the ongoing-call notification.
+private const val ACTION_CALL_END = "callerx.action.END_CALL"
+private const val ACTION_CALL_SPEAKER = "callerx.action.TOGGLE_SPEAKER"
+private const val ACTION_CALL_MUTE = "callerx.action.TOGGLE_MUTE"
+private const val ACTION_CALL_ANSWER = "callerx.action.ANSWER_CALL"
+private const val CALL_CHANNEL_ID = "callerx_ongoing_call"
+private const val CALL_NOTIFICATION_ID = 1001
+
+// One SIP account in the "My SIP Accounts" list. Stored as JSON in prefs "sip_accounts".
+// The password is kept in the app's private storage so the account can auto-connect
+// on app start (Auto-Boot); it is only ever sent to the user's own SIP server.
+data class SipAccount(
+    val id: String,
+    val name: String,
+    val username: String,
+    val password: String,
+    val domain: String,
+    val port: String,
+    val transport: String,
+    val proxy: String,
+    val displayName: String,
+    val autoBoot: Boolean,
+    val enabled: Boolean,
+    val isDefault: Boolean
+)
+
+fun sipAccountToJson(a: SipAccount): org.json.JSONObject = org.json.JSONObject().apply {
+    put("id", a.id); put("name", a.name); put("username", a.username); put("password", a.password)
+    put("domain", a.domain); put("port", a.port); put("transport", a.transport); put("proxy", a.proxy)
+    put("displayName", a.displayName); put("autoBoot", a.autoBoot); put("enabled", a.enabled); put("isDefault", a.isDefault)
+}
+
+fun sipAccountFromJson(o: org.json.JSONObject): SipAccount? = try {
+    SipAccount(
+        id = o.optString("id", "").ifBlank { java.util.UUID.randomUUID().toString() },
+        name = o.optString("name", ""),
+        username = o.optString("username", ""),
+        password = o.optString("password", ""),
+        domain = o.optString("domain", ""),
+        port = o.optString("port", "5060"),
+        transport = o.optString("transport", "UDP"),
+        proxy = o.optString("proxy", ""),
+        displayName = o.optString("displayName", ""),
+        autoBoot = o.optBoolean("autoBoot", true),
+        enabled = o.optBoolean("enabled", true),
+        isDefault = o.optBoolean("isDefault", false)
+    )
+} catch (_: Exception) { null }
+
 class MainActivity : ComponentActivity() {
     private var core: Core? = null
     var registered by mutableStateOf(false)
@@ -192,6 +241,21 @@ class MainActivity : ComponentActivity() {
     var callUiRequested by mutableStateOf(false)
     var dialerRoleTick by mutableIntStateOf(0)
     var resumeTick by mutableIntStateOf(0)
+    var sipTick by mutableIntStateOf(0)
+    var callEndedTick by mutableIntStateOf(0)
+    var sipStates by mutableStateOf(emptyMap<String, String>())
+    var callMuted by mutableStateOf(false)
+    var callSpeaker by mutableStateOf(false)
+    private val callActionReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                ACTION_CALL_END -> endActiveCall()
+                ACTION_CALL_SPEAKER -> toggleCallSpeaker()
+                ACTION_CALL_MUTE -> toggleCallMute()
+                ACTION_CALL_ANSWER -> answerActiveCall()
+            }
+        }
+    }
     private var pendingCellNumber = ""
     private var pendingCellSlot = 0
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -286,9 +350,15 @@ class MainActivity : ComponentActivity() {
         intent?.data?.schemeSpecificPart?.let { dialIntentNumber = it }
         callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
         initializeLinphone()
+        registerAllSipAccounts(onlyAutoBoot = true)
         try {
             val filter = android.content.IntentFilter().apply { addAction(Intent.ACTION_SCREEN_OFF); addAction(Intent.ACTION_SCREEN_ON) }
             registerReceiver(screenReceiver, filter)
+        } catch (_: Exception) { }
+        try {
+            androidx.core.content.ContextCompat.registerReceiver(this, callActionReceiver, android.content.IntentFilter().apply {
+                addAction(ACTION_CALL_END); addAction(ACTION_CALL_SPEAKER); addAction(ACTION_CALL_MUTE); addAction(ACTION_CALL_ANSWER)
+            }, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED)
         } catch (_: Exception) { }
         setContent { CallerXApp(this) }
     }
@@ -309,12 +379,16 @@ class MainActivity : ComponentActivity() {
             c.addListener(object : CoreListenerStub() {
                 override fun onAccountRegistrationStateChanged(core: Core, account: Account, state: RegistrationState, message: String) {
                     runOnUiThread {
-                        registered = state == RegistrationState.Ok
-                        registrationMessage = when (state) {
-                            RegistrationState.Ok -> "SIP Online"
+                        val id = sipIdForAccount(account)
+                        val label = when (state) {
+                            RegistrationState.Ok -> "Online"
                             RegistrationState.Progress -> "Registering…"
-                            RegistrationState.Failed -> "SIP Registration Failed"
-                            else -> "SIP Offline"
+                            RegistrationState.Failed -> "Failed"
+                            else -> "Offline"
+                        }
+                        if (id != null) {
+                            sipStates = sipStates + (id to label)
+                            refreshSipGlobalState()
                         }
                     }
                 }
@@ -331,6 +405,12 @@ class MainActivity : ComponentActivity() {
                         if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) {
                             if (sipRecordingActive) { try { call.stopRecording() } catch (_: Exception) { }; sipRecordingActive = false }
                             saveSipCall(call)
+                            callEndedTick++
+                            // Surface the real SIP failure reason (e.g. Not Found / Request Timeout)
+                            // so a failed outgoing call can be diagnosed instead of silently ending.
+                            if (state == Call.State.Error && call.dir == Call.Dir.Outgoing) {
+                                errorMessage = "SIP call failed: ${message.ifBlank { "no response from server" }}"
+                            }
                         }
                         activeCall = if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) null else call
                         if (state == Call.State.IncomingReceived) {
@@ -356,25 +436,101 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun registerSip(username: String, password: String, domain: String, port: String, transport: String, displayName: String = "") {
+    // ---- SIP accounts (multi-account) ----
+    fun loadSipAccounts(): List<SipAccount> {
+        val prefs = getSharedPreferences("callerx", Context.MODE_PRIVATE)
+        val raw = prefs.getString("sip_accounts", null)
+        if (!raw.isNullOrBlank()) {
+            try {
+                val arr = org.json.JSONArray(raw)
+                val list = (0 until arr.length()).mapNotNull { i -> try { sipAccountFromJson(arr.getJSONObject(i)) } catch (_: Exception) { null } }
+                if (list.isNotEmpty()) return list
+            } catch (_: Exception) { }
+        }
+        // Migrate the old single account (username/domain/port/transport/display name).
+        // Its password was never saved, so the migrated account needs its password re-entered once.
+        val user = prefs.getString("user", "") ?: ""
+        val domain = prefs.getString("domain", "") ?: ""
+        if (user.isBlank() || domain.isBlank()) return emptyList()
+        val migrated = SipAccount(
+            id = java.util.UUID.randomUUID().toString(),
+            name = (prefs.getString("display_name", "") ?: "").ifBlank { user },
+            username = user, password = "",
+            domain = domain,
+            port = prefs.getString("port", "5060") ?: "5060",
+            transport = prefs.getString("transport", "UDP") ?: "UDP",
+            proxy = "", displayName = prefs.getString("display_name", "") ?: "",
+            autoBoot = true, enabled = true, isDefault = true
+        )
+        saveSipAccounts(listOf(migrated))
+        return listOf(migrated)
+    }
+
+    fun saveSipAccounts(list: List<SipAccount>) {
+        val arr = org.json.JSONArray()
+        list.forEach { arr.put(sipAccountToJson(it)) }
+        val prefs = getSharedPreferences("callerx", Context.MODE_PRIVATE)
+        prefs.edit().putString("sip_accounts", arr.toString()).apply()
+        // Keep the legacy keys in sync with the default account (Settings subtitle / call sheet).
+        val def = list.firstOrNull { it.isDefault } ?: list.firstOrNull()
+        if (def != null) {
+            prefs.edit().putString("user", def.username).putString("domain", def.domain).putString("port", def.port).putString("transport", def.transport).putString("display_name", def.displayName).apply()
+        }
+        sipTick++
+    }
+
+    fun defaultSipAccount(): SipAccount? {
+        val list = loadSipAccounts()
+        return list.firstOrNull { it.isDefault && it.enabled } ?: list.firstOrNull { it.enabled }
+    }
+
+    private fun sipIdForAccount(account: Account): String? {
+        val ident = try { account.params?.identityAddress } catch (_: Exception) { null } ?: return null
+        val u = try { ident.username } catch (_: Exception) { null } ?: return null
+        val d = try { ident.domain } catch (_: Exception) { null } ?: return null
+        return loadSipAccounts().firstOrNull {
+            it.username.trim() == u && it.domain.trim().removePrefix("sip:").substringBefore(':').substringBefore(';') == d
+        }?.id
+    }
+
+    private fun refreshSipGlobalState() {
+        val defState = defaultSipAccount()?.let { sipStates[it.id] }
+        registered = defState == "Online"
+        registrationMessage = when (defState) {
+            "Online" -> "SIP Online"
+            "Registering…" -> "Registering…"
+            "Failed" -> "SIP Registration Failed"
+            else -> "SIP Offline"
+        }
+    }
+
+    // (Re)builds every SIP account from storage and registers the enabled ones.
+    // On app start only Auto-Boot accounts are registered; the list screen registers all enabled ones.
+    fun registerAllSipAccounts(onlyAutoBoot: Boolean = false) {
         val c = core ?: run { initializeLinphone(); core } ?: return
         try {
             c.clearAccounts()
             c.clearAllAuthInfo()
-            val cleanDomain = domain.trim().removePrefix("sip:").substringBefore(';')
-            val auth = Factory.instance().createAuthInfo(username.trim(), null, password, null, null, cleanDomain)
-            val params = c.createAccountParams()
-            val identity = Factory.instance().createAddress("sip:${username.trim()}@$cleanDomain")
-            if (displayName.isNotBlank()) { try { identity?.displayName = displayName.trim() } catch (_: Exception) { } }
-            val server = Factory.instance().createAddress("sip:$cleanDomain:${port.trim()};transport=${transport.lowercase()}")
-            params.setIdentityAddress(identity)
-            params.setServerAddress(server)
-            params.setRegisterEnabled(true)
-            val account = c.createAccount(params)
-            c.addAuthInfo(auth)
-            c.addAccount(account)
-            c.defaultAccount = account
+            val all = loadSipAccounts()
+            val ids = all.map { it.id }.toSet()
+            sipStates = sipStates.filterKeys { it in ids }
+            val accounts = all.filter {
+                it.enabled && it.username.isNotBlank() && it.domain.isNotBlank() && it.password.isNotBlank() && (!onlyAutoBoot || it.autoBoot)
+            }
+            if (accounts.isEmpty()) {
+                c.defaultAccount = null
+                registered = false
+                registrationMessage = "SIP Offline"
+                return
+            }
             registrationMessage = "Registering…"
+            var def: Account? = null
+            accounts.forEach { acct ->
+                val acc = createSipAccount(c, acct) ?: return@forEach
+                c.addAccount(acc)
+                if (acct.isDefault) def = acc
+            }
+            c.defaultAccount = def ?: c.accountList.firstOrNull()
             applyAudioSettings()
         } catch (e: Exception) {
             registered = false
@@ -383,12 +539,41 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun unregisterSip() {
+    private fun createSipAccount(c: Core, acct: SipAccount): Account? {
+        return try {
+            val cleanDomain = acct.domain.trim().removePrefix("sip:").substringBefore(';')
+            val port = acct.port.trim().ifBlank { "5060" }
+            val transport = acct.transport.trim().ifBlank { "UDP" }.lowercase()
+            val auth = Factory.instance().createAuthInfo(acct.username.trim(), null, acct.password, null, null, cleanDomain)
+            val params = c.createAccountParams()
+            val identity = Factory.instance().createAddress("sip:${acct.username.trim()}@$cleanDomain")
+            if (acct.displayName.isNotBlank()) { try { identity?.displayName = acct.displayName.trim() } catch (_: Exception) { } }
+            val server = Factory.instance().createAddress("sip:$cleanDomain:$port;transport=$transport")
+            params.setIdentityAddress(identity)
+            params.setServerAddress(server)
+            params.setRegisterEnabled(true)
+            // Route every outgoing call through this server (the registrar/PBX) so the
+            // INVITE goes to the PBX instead of straight to the dialled domain.
+            val proxy = acct.proxy.trim()
+            if (proxy.isNotBlank()) {
+                val route = try { Factory.instance().createAddress(if (proxy.startsWith("sip:")) proxy else "sip:$proxy") } catch (_: Exception) { null }
+                if (route != null) params.setRoutesAddresses(arrayOf(route)) else params.setOutboundProxyEnabled(true)
+            } else {
+                params.setOutboundProxyEnabled(true)
+            }
+            val account = c.createAccount(params)
+            c.addAuthInfo(auth)
+            account
+        } catch (_: Exception) { null }
+    }
+
+    fun unregisterAllSip() {
         try {
             val c = core ?: return
             c.clearAccounts()
             c.clearAllAuthInfo()
             c.defaultAccount = null
+            sipStates = emptyMap()
             registered = false
             registrationMessage = "SIP Offline"
         } catch (_: Exception) { }
@@ -644,8 +829,91 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) { }
     }
 
+    // ---- Call controls shared by the call screen and the notification actions ----
+    fun toggleCallMute() {
+        callMuted = !callMuted
+        toggleMute(callMuted)
+    }
+
+    fun toggleCallSpeaker() {
+        callSpeaker = !callSpeaker
+        setSpeaker(callSpeaker)
+    }
+
+    fun endActiveCall() {
+        if (TelecomCallBridge.currentCall != null) endCellCall() else endCall()
+        callMuted = false
+        callSpeaker = false
+        callEndedTick++
+        cancelCallNotification()
+    }
+
+    fun answerActiveCall() {
+        if (TelecomCallBridge.currentCall != null) answerCellCall() else answerCall()
+    }
+
+    // ---- Ongoing-call notification (notification bar) ----
+    private fun ensureCallChannel() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
+        try {
+            val mgr = getSystemService(android.app.NotificationManager::class.java)
+            if (mgr?.getNotificationChannel(CALL_CHANNEL_ID) == null) {
+                val channel = android.app.NotificationChannel(CALL_CHANNEL_ID, "Ongoing calls", android.app.NotificationManager.IMPORTANCE_LOW)
+                channel.description = "Shows the ongoing call with speaker, mute and end actions"
+                channel.setShowBadge(false)
+                mgr?.createNotificationChannel(channel)
+            }
+        } catch (_: Exception) { }
+    }
+
+    fun showCallNotification(name: String, number: String, state: String, source: String) {
+        // Never show a notification for a call that already ended.
+        if (state == "Call ended" || state.startsWith("Call failed")) { cancelCallNotification(); return }
+        try {
+            ensureCallChannel()
+            val incoming = state.startsWith("Incoming", ignoreCase = true)
+            val contentIntent = android.app.PendingIntent.getActivity(
+                this, 0,
+                Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP).putExtra("callerx_open_call", true),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            fun actionIntent(action: String): android.app.PendingIntent {
+                return android.app.PendingIntent.getBroadcast(
+                    this, action.hashCode(),
+                    Intent(action).setPackage(packageName),
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+                )
+            }
+            val builder = androidx.core.app.NotificationCompat.Builder(this, CALL_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_menu_call)
+                .setContentTitle(if (name.isNotBlank()) name else number)
+                .setContentText("$source · $state")
+                .setSubText(number)
+                .setContentIntent(contentIntent)
+                .setOngoing(true)
+                .setAutoCancel(false)
+                .setOnlyAlertOnce(true)
+                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_LOW)
+            if (incoming) {
+                builder.addAction(0, "Answer", actionIntent(ACTION_CALL_ANSWER))
+                builder.addAction(0, "Decline", actionIntent(ACTION_CALL_END))
+            } else {
+                builder.addAction(0, if (callMuted) "Unmute" else "Mute", actionIntent(ACTION_CALL_MUTE))
+                builder.addAction(0, if (callSpeaker) "Speaker off" else "Speaker", actionIntent(ACTION_CALL_SPEAKER))
+                builder.addAction(0, "End call", actionIntent(ACTION_CALL_END))
+            }
+            androidx.core.app.NotificationManagerCompat.from(this).notify(CALL_NOTIFICATION_ID, builder.build())
+        } catch (_: Exception) { }
+    }
+
+    fun cancelCallNotification() {
+        try { androidx.core.app.NotificationManagerCompat.from(this).cancel(CALL_NOTIFICATION_ID) } catch (_: Exception) { }
+    }
+
     override fun onDestroy() {
         try { unregisterReceiver(screenReceiver) } catch (_: Exception) { }
+        try { unregisterReceiver(callActionReceiver) } catch (_: Exception) { }
+        try { cancelCallNotification() } catch (_: Exception) { }
         try { core?.stop() } catch (_: Exception) { }
         core = null
         super.onDestroy()
@@ -666,17 +934,10 @@ private fun CallerXApp(activity: MainActivity) {
     var messages by remember { mutableStateOf(emptyList<Pair<String,String>>()) }
     var dark by remember { mutableStateOf(false) }
     var accent by remember { mutableIntStateOf(0) }
-    var sipUsername by remember { mutableStateOf("") }
-    var sipPassword by remember { mutableStateOf("") }
-    var sipDomain by remember { mutableStateOf("") }
-    var sipDisplayName by remember { mutableStateOf("") }
-    var sipPort by remember { mutableStateOf("5060") }
-    var transport by remember { mutableStateOf("UDP") }
     var number by remember { mutableStateOf("") }
     var keypadOpen by remember { mutableStateOf(false) }
-    var muted by remember { mutableStateOf(false) }
-    var speaker by remember { mutableStateOf(false) }
     var showCallSheet by remember { mutableStateOf(false) }
+    var editingSipId by remember { mutableStateOf<String?>(null) }
     var showError by remember { mutableStateOf(false) }
     var showPermissionWelcome by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -692,11 +953,6 @@ private fun CallerXApp(activity: MainActivity) {
         }
         recentCalls = (loadCallLog(context) + sipCalls).sortedByDescending { it.dateMs }
         messages = loadSms(context)
-        sipUsername = prefs.getString("user", "") ?: ""
-        sipDomain = prefs.getString("domain", "") ?: ""
-        sipDisplayName = prefs.getString("display_name", "") ?: ""
-        sipPort = prefs.getString("port", "5060") ?: "5060"
-        transport = prefs.getString("transport", "UDP") ?: "UDP"
         dark = prefs.getBoolean("dark", false)
         accent = prefs.getInt("accent", 0)
         showPermissionWelcome = !prefs.getBoolean("permission-intro-seen", false)
@@ -712,10 +968,36 @@ private fun CallerXApp(activity: MainActivity) {
     }
     // "Ask before each call": when off, call straight away with the default line
     // (registered SIP first, then SIM 1, then SIM 2) instead of showing the sheet.
+    // Calls always go from the global default line (Settings > Default line for calls:
+    // SIP / SIM 1 / SIM 2) when "Ask before each call" is off, so the line never has
+    // to be picked again. A per-contact default still wins while asking is on.
     fun startCallFlow(person: Person) {
         val ask = prefs.getBoolean("setting:Ask before each call", true)
+        val dialed = person.number
         if (!ask) {
-            val dialed = person.number
+            val defaultLine = prefs.getString("default_line", "") ?: ""
+            val usedDefault = when (defaultLine) {
+                "SIP" -> if (activity.registered) {
+                    activity.activeNumber = dialed; activity.activeCallName = person.name
+                    activity.startSipCall(dialed, person.name); screen = "call"; true
+                } else false
+                "SIM 1" -> if (prefs.getBoolean("setting:SIM 1", true)) {
+                    activity.startCellCall(dialed, 0); screen = "home"; true
+                } else false
+                "SIM 2" -> if (prefs.getBoolean("setting:SIM 2", true)) {
+                    activity.startCellCall(dialed, 1); screen = "home"; true
+                } else false
+                else -> false
+            }
+            if (usedDefault) return
+            if (defaultLine.isNotBlank()) {
+                // Default line is set but unavailable right now (e.g. SIP offline):
+                // let the user pick a line just this once.
+                selected = person
+                showCallSheet = true
+                return
+            }
+            // No default line set: first available line (SIP if registered, then SIM 1, then SIM 2).
             if (activity.registered) {
                 activity.activeNumber = dialed; activity.activeCallName = person.name
                 activity.startSipCall(dialed, person.name); screen = "call"
@@ -726,28 +1008,27 @@ private fun CallerXApp(activity: MainActivity) {
             } else {
                 activity.errorMessage = "Enable SIM 1, SIM 2 or register SIP to make calls."
             }
-        } else {
-            val digits = normalizeDigits(person.number)
-            val defaultLine = if (digits.isNotBlank()) prefs.getString("default_line:$digits", null) else null
-            val dialed = person.number
-            when (defaultLine) {
-                "SIP" -> if (activity.registered) {
-                    activity.activeNumber = dialed; activity.activeCallName = person.name
-                    activity.startSipCall(dialed, person.name); screen = "call"
-                    return
-                }
-                "SIM 1" -> if (prefs.getBoolean("setting:SIM 1", true)) {
-                    activity.startCellCall(dialed, 0); screen = "home"
-                    return
-                }
-                "SIM 2" -> if (prefs.getBoolean("setting:SIM 2", true)) {
-                    activity.startCellCall(dialed, 1); screen = "home"
-                    return
-                }
-            }
-            selected = person
-            showCallSheet = true
+            return
         }
+        val digits = normalizeDigits(person.number)
+        val defaultLine = if (digits.isNotBlank()) prefs.getString("default_line:$digits", null) else null
+        when (defaultLine) {
+            "SIP" -> if (activity.registered) {
+                activity.activeNumber = dialed; activity.activeCallName = person.name
+                activity.startSipCall(dialed, person.name); screen = "call"
+                return
+            }
+            "SIM 1" -> if (prefs.getBoolean("setting:SIM 1", true)) {
+                activity.startCellCall(dialed, 0); screen = "home"
+                return
+            }
+            "SIM 2" -> if (prefs.getBoolean("setting:SIM 2", true)) {
+                activity.startCellCall(dialed, 1); screen = "home"
+                return
+            }
+        }
+        selected = person
+        showCallSheet = true
     }
     val color = Palette[accent.coerceIn(Palette.indices)]
     val scheme = if (dark) darkColorScheme(primary = color, secondary = color, background = Color(0xFF101318), surface = Color(0xFF1B2027))
@@ -756,20 +1037,33 @@ private fun CallerXApp(activity: MainActivity) {
     val visibleCallState = if (isCellCall) TelecomCallBridge.state else activity.callState
     val visibleCallName = if (isCellCall) "Phone call" else activity.activeCallName.ifBlank { selected?.name ?: "CallerX contact" }
     val visibleCallNumber = if (isCellCall) TelecomCallBridge.remoteNumber else activity.activeNumber.ifBlank { selected?.number ?: number }
+    // When a call ends (either side hangs up, or End is tapped from the notification),
+    // leave the call screen and show the call log.
+    LaunchedEffect(activity.callEndedTick) {
+        if (activity.callEndedTick > 0 && screen == "call") {
+            screen = "home"; tab = "Calls"
+        }
+    }
+    // Ongoing-call notification in the notification bar while a call is on screen.
+    LaunchedEffect(screen, visibleCallState, visibleCallName, visibleCallNumber, activity.activeCallSource, activity.callMuted, activity.callSpeaker) {
+        if (screen == "call") {
+            activity.showCallNotification(visibleCallName, visibleCallNumber, visibleCallState, activity.activeCallSource)
+        } else {
+            activity.cancelCallNotification()
+        }
+    }
     MaterialTheme(colorScheme = scheme) {
         if (screen == "call") {
-            NativeCallScreen(visibleCallName, visibleCallNumber, visibleCallState, activity.activeCallSource, dark, muted, speaker,
+            NativeCallScreen(visibleCallName, visibleCallNumber, visibleCallState, activity.activeCallSource, dark, activity.callMuted, activity.callSpeaker,
                 onTheme = { dark = it; prefs.edit().putBoolean("dark", it).apply() },
-                onMute = { muted = !muted; activity.toggleMute(muted) }, onSpeaker = { speaker = !speaker; activity.setSpeaker(speaker) },
-                onHold = { held -> activity.toggleHold(held) }, onAnswer = { if (isCellCall) activity.answerCellCall() else activity.answerCall() },
-                onDecline = { if (isCellCall) activity.endCellCall() else activity.endCall(); screen = "home" },
-                onEnd = { if (isCellCall) activity.endCellCall() else activity.endCall(); activity.resumeTick++; screen = "home"; tab = "Calls" })
+                onMute = { activity.toggleCallMute() }, onSpeaker = { activity.toggleCallSpeaker() },
+                onHold = { held -> activity.toggleHold(held) }, onAnswer = { activity.answerActiveCall() },
+                onDecline = { activity.endActiveCall(); screen = "home" },
+                onEnd = { activity.endActiveCall(); activity.resumeTick++; screen = "home"; tab = "Calls" })
         } else if (screen == "sip") {
-            SipScreen(activity.registrationMessage, sipUsername, { sipUsername = it }, sipPassword, { sipPassword = it }, sipDomain, { sipDomain = it }, sipPort, { sipPort = it }, transport, { transport = it }, sipDisplayName, { sipDisplayName = it },
-                onBack = { screen = "settings" }, onRegister = {
-                    prefs.edit().putString("user", sipUsername).putString("domain", sipDomain).putString("port", sipPort).putString("transport", transport).putString("display_name", sipDisplayName).apply()
-                    activity.registerSip(sipUsername, sipPassword, sipDomain, sipPort, transport, sipDisplayName)
-                }, onUnregister = { activity.unregisterSip(); activity.toast("SIP Account Unregistered") })
+            SipAccountsScreen(activity, onBack = { screen = "settings" }, onAdd = { editingSipId = null; screen = "sip_form" }, onEdit = { id -> editingSipId = id; screen = "sip_form" })
+        } else if (screen == "sip_form") {
+            SipAccountFormScreen(activity, editingId = editingSipId, onClose = { screen = "sip" })
         } else if (screen == "dialer") {
             DialerScreen(number, { number = it }, onBack = { screen = "home" }, onCall = { startCallFlow(Person("Dialed number", number, "?")) })
         } else if (screen == "profile") {
@@ -864,7 +1158,7 @@ private fun CallerXApp(activity: MainActivity) {
             val dialedName = dialedPerson.name
             val simLines = remember { loadSimLines(context) }
             var setDefault by remember { mutableStateOf(false) }
-            val sipUser = sipUsername.ifBlank { prefs.getString("user", "") ?: "" }
+            val sipUser = activity.defaultSipAccount()?.username ?: ""
             val isRegistered = activity.registered
             fun dialWith(method: String) {
                 showCallSheet = false
@@ -1097,51 +1391,229 @@ private fun CallerXApp(activity: MainActivity) {
 @Composable private fun SectionTitle(label: String) { Text(label, Modifier.fillMaxWidth().padding(start = 20.dp, top = 16.dp, bottom = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp) }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun SipScreen(status: String, user: String, onUser: (String) -> Unit, password: String, onPassword: (String) -> Unit, domain: String, onDomain: (String) -> Unit, port: String, onPort: (String) -> Unit, transport: String, onTransport: (String) -> Unit, displayName: String, onDisplayName: (String) -> Unit, onBack: () -> Unit, onRegister: () -> Unit, onUnregister: () -> Unit) {
-    val registered = status == "SIP Online"
+@Composable private fun SipAccountsScreen(activity: MainActivity, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit) {
+    val tick = activity.sipTick
+    val accounts = remember(tick) { activity.loadSipAccounts() }
+    val states = activity.sipStates
+    var confirmDelete by remember { mutableStateOf<SipAccount?>(null) }
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-            Text("SIP Account", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            Surface(shape = RoundedCornerShape(50), color = if (registered) Color(0xFFECFDF5) else MaterialTheme.colorScheme.surfaceVariant) {
-                Text(if (registered) "Registered" else "Offline", color = if (registered) Color(0xFF047857) else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+            Box(Modifier.size(40.dp).clip(CircleShape).background(Color(0xFFDBEAFE)), contentAlignment = Alignment.Center) {
+                Icon(Icons.Filled.Dns, null, tint = Color(0xFF2563EB), modifier = Modifier.size(22.dp))
             }
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(10.dp))
+            Text("SIP Account", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
         }
         LazyColumn(Modifier.weight(1f).padding(horizontal = 18.dp), contentPadding = PaddingValues(vertical = 18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-                    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.Cloud, null, tint = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(12.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("Registration status", fontWeight = FontWeight.SemiBold)
-                            Text(status, color = if (registered) Color(0xFF2E9C67) else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+                    Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("My SIP Accounts", fontWeight = FontWeight.Bold, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                            TextButton(onClick = onAdd) {
+                                Text("+ Add", color = Color(0xFF2563EB), fontWeight = FontWeight.SemiBold)
+                            }
                         }
-                        if (registered) Icon(Icons.Filled.CheckCircle, null, tint = Color(0xFF2E9C67))
+                        if (accounts.isEmpty()) {
+                            Text("No SIP account yet. Add your SIP account to make and receive internet calls.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp))
+                        } else {
+                            accounts.forEach { acct ->
+                                val state = states[acct.id] ?: "Offline"
+                                val online = state == "Online"
+                                Spacer(Modifier.height(12.dp))
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    color = if (acct.isDefault) Color(0xFFEAF1FE) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .45f),
+                                    modifier = Modifier.fillMaxWidth().clickable {
+                                        // Tapping an account makes it the one used for outgoing calls.
+                                        val updated = accounts.map { it.copy(isDefault = it.id == acct.id) }
+                                        activity.saveSipAccounts(updated)
+                                        activity.registerAllSipAccounts()
+                                        activity.toast((acct.name.ifBlank { acct.username }) + " will be used for outgoing calls")
+                                    }
+                                ) {
+                                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        if (online) {
+                                            Icon(Icons.Filled.CheckCircle, null, tint = Color(0xFF16A34A), modifier = Modifier.size(26.dp))
+                                        } else {
+                                            Box(Modifier.size(26.dp).clip(CircleShape).border(2.dp, MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .5f), CircleShape))
+                                        }
+                                        Spacer(Modifier.width(12.dp))
+                                        Column(Modifier.weight(1f)) {
+                                            Text(acct.name.ifBlank { acct.username }, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                            Text(
+                                                ("${acct.username}@${acct.domain}").let { if (it.length > 30) it.take(27) + "…" else it },
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp
+                                            )
+                                            Text(
+                                                when {
+                                                    online && acct.isDefault -> "Connected · used for outgoing calls"
+                                                    online -> "Connected"
+                                                    state == "Registering…" -> "Registering…"
+                                                    state == "Failed" -> "Registration failed"
+                                                    !acct.enabled -> "Disabled"
+                                                    acct.password.isBlank() -> "Password missing — tap Edit to add it"
+                                                    else -> "Offline"
+                                                },
+                                                color = if (online) Color(0xFF16A34A) else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                fontSize = 13.sp, fontWeight = if (online) FontWeight.SemiBold else FontWeight.Normal
+                                            )
+                                        }
+                                        Switch(
+                                            checked = acct.enabled,
+                                            onCheckedChange = { on ->
+                                                val updated = accounts.map { if (it.id == acct.id) it.copy(enabled = on) else it }
+                                                activity.saveSipAccounts(updated)
+                                                activity.registerAllSipAccounts()
+                                            }
+                                        )
+                                        IconButton(onClick = { onEdit(acct.id) }) {
+                                            Icon(Icons.Filled.Edit, "Edit", tint = Color(0xFF2563EB))
+                                        }
+                                        IconButton(onClick = { confirmDelete = acct }) {
+                                            Icon(Icons.Filled.Delete, "Delete", tint = Color(0xFFDC2626))
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-            item { OutlinedTextField(domain, onDomain, Modifier.fillMaxWidth(), label = { Text("SIP Server / Domain") }, placeholder = { Text("sip.example.com") }, singleLine = true) }
-            item { OutlinedTextField(user, onUser, Modifier.fillMaxWidth(), label = { Text("SIP Username / Extension") }, singleLine = true) }
-            item { OutlinedTextField(password, onPassword, Modifier.fillMaxWidth(), label = { Text("Password") }, singleLine = true) }
-            item { OutlinedTextField(displayName, onDisplayName, Modifier.fillMaxWidth(), label = { Text("Display Name") }, placeholder = { Text("Your name shown to others") }, singleLine = true) }
-            item { OutlinedTextField(port, onPort, Modifier.fillMaxWidth(), label = { Text("Port") }, singleLine = true) }
             item {
-                Text("Transport Protocol", fontWeight = FontWeight.Medium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
-                    listOf("UDP", "TCP", "TLS").forEach { FilterChip(selected = transport == it, onClick = { onTransport(it) }, label = { Text(if (it == "TLS") "TLS (Secure)" else it) }) }
-                }
+                Text("Tap an account to use it for outgoing calls. Accounts stay connected after the app restarts when Auto-Boot is on.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            item { Text("Use the signaling details supplied by your SIP provider. SIP password is kept in memory for this session and is not saved.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        }
+    }
+    if (confirmDelete != null) {
+        val acct = confirmDelete!!
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { confirmDelete = null },
+            title = { Text("Delete SIP account?") },
+            text = { Text("Remove \"" + acct.name.ifBlank { acct.username } + "\" (" + acct.username + "@" + acct.domain + ")?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val updated = accounts.filter { it.id != acct.id }
+                    // If the default was deleted, make the first remaining account the default.
+                    val fixed = if (updated.none { it.isDefault } && updated.isNotEmpty()) updated.mapIndexed { i, a -> if (i == 0) a.copy(isDefault = true) else a } else updated
+                    activity.saveSipAccounts(fixed)
+                    activity.registerAllSipAccounts()
+                    confirmDelete = null
+                }) { Text("Delete", color = Color(0xFFDC2626)) }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("Cancel") } }
+        )
+    }
+}
+
+@Composable private fun SipAccountFormScreen(activity: MainActivity, editingId: String?, onClose: () -> Unit) {
+    val existing = remember(editingId) { editingId?.let { id -> activity.loadSipAccounts().firstOrNull { it.id == id } } }
+    var name by remember { mutableStateOf(existing?.name ?: "") }
+    var username by remember { mutableStateOf(existing?.username ?: "") }
+    var password by remember { mutableStateOf(existing?.password ?: "") }
+    var passwordVisible by remember { mutableStateOf(false) }
+    var domain by remember { mutableStateOf(existing?.domain ?: "") }
+    var port by remember { mutableStateOf(existing?.port ?: "") }
+    var transport by remember { mutableStateOf(existing?.transport ?: "UDP") }
+    var proxy by remember { mutableStateOf(existing?.proxy ?: "") }
+    var displayName by remember { mutableStateOf(existing?.displayName ?: "") }
+    var autoBoot by remember { mutableStateOf(existing?.autoBoot ?: true) }
+    var proxyOpen by remember { mutableStateOf(existing?.proxy?.isNotBlank() == true || existing?.displayName?.isNotBlank() == true) }
+    val canSave = name.isNotBlank() && username.isNotBlank() && password.isNotBlank() && domain.isNotBlank()
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Close") }
+            Text(if (existing == null) "Add SIP Account" else "Edit SIP Account", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        }
+        LazyColumn(Modifier.weight(1f).padding(horizontal = 18.dp), contentPadding = PaddingValues(vertical = 18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
-                Button(onClick = onRegister, Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(16.dp)) {
-                    Icon(Icons.Filled.CloudDone, null); Spacer(Modifier.width(8.dp)); Text("Register & Save Account")
-                }
-            }
-            item {
-                OutlinedButton(onClick = onUnregister, Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFDC2626))) {
-                    Text("Unregister / Go Offline")
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(44.dp).clip(CircleShape).background(Color(0xFFDBEAFE)), contentAlignment = Alignment.Center) {
+                                Icon(Icons.Filled.Dns, null, tint = Color(0xFF2563EB), modifier = Modifier.size(22.dp))
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(if (existing == null) "New SIP Account" else "Edit SIP Account", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                Text("Extension, Domain & Protocol", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Text("Auto-Boot", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                            Spacer(Modifier.width(8.dp))
+                            Switch(checked = autoBoot, onCheckedChange = { autoBoot = it })
+                        }
+                        OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Account Name *") }, singleLine = true)
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            OutlinedTextField(username, { username = it }, Modifier.weight(1f), label = { Text("Username *") }, singleLine = true)
+                            OutlinedTextField(
+                                password, { password = it }, Modifier.weight(1f), label = { Text("Password *") }, singleLine = true,
+                                visualTransformation = if (passwordVisible) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                trailingIcon = {
+                                    IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                        Icon(if (passwordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility, "Show password")
+                                    }
+                                }
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            OutlinedTextField(domain, { domain = it }, Modifier.weight(1f), label = { Text("SIP Domain / IP *") }, singleLine = true)
+                            OutlinedTextField(port, { port = it }, Modifier.weight(.45f), label = { Text("Port") }, singleLine = true)
+                        }
+                        Text("Port is 5060 when left empty.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            listOf("UDP", "TCP", "TLS").forEach {
+                                FilterChip(selected = transport == it, onClick = { transport = it }, label = { Text(if (it == "TLS") "TLS (Secure)" else it) })
+                            }
+                            Spacer(Modifier.weight(1f))
+                            TextButton(onClick = { proxyOpen = !proxyOpen }) {
+                                Text("Proxy / Name " + if (proxyOpen) "▴" else "▾", color = Color(0xFF2563EB), fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                        if (proxyOpen) {
+                            OutlinedTextField(proxy, { proxy = it }, Modifier.fillMaxWidth(), label = { Text("Proxy (optional)") }, singleLine = true)
+                            OutlinedTextField(displayName, { displayName = it }, Modifier.fillMaxWidth(), label = { Text("Display Name (optional)") }, singleLine = true)
+                            Text("Proxy is only needed when your provider gives a separate outbound proxy. Display Name is the name others see.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Button(
+                            onClick = {
+                                val all = activity.loadSipAccounts().toMutableList()
+                                val portValue = port.trim().ifBlank { "5060" }
+                                if (existing == null) {
+                                    val acct = SipAccount(
+                                        id = java.util.UUID.randomUUID().toString(),
+                                        name = name.trim(), username = username.trim(), password = password,
+                                        domain = domain.trim(), port = portValue, transport = transport,
+                                        proxy = proxy.trim(), displayName = displayName.trim(),
+                                        autoBoot = autoBoot, enabled = true,
+                                        isDefault = all.isEmpty()
+                                    )
+                                    all.add(acct)
+                                } else {
+                                    val idx = all.indexOfFirst { it.id == existing.id }
+                                    if (idx >= 0) {
+                                        all[idx] = existing.copy(
+                                            name = name.trim(), username = username.trim(), password = password,
+                                            domain = domain.trim(), port = portValue, transport = transport,
+                                            proxy = proxy.trim(), displayName = displayName.trim(), autoBoot = autoBoot
+                                        )
+                                    }
+                                }
+                                activity.saveSipAccounts(all)
+                                activity.registerAllSipAccounts()
+                                activity.toast("SIP account saved — connecting…")
+                                onClose()
+                            },
+                            enabled = canSave,
+                            modifier = Modifier.fillMaxWidth().height(52.dp),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Icon(Icons.Filled.CheckCircle, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Save & Connect SIP")
+                        }
+                    }
                 }
             }
         }
@@ -1175,11 +1647,12 @@ private fun CallerXApp(activity: MainActivity) {
     var sim1 by remember { mutableStateOf(prefs.getBoolean("setting:SIM 1", true)) }
     var sim2 by remember { mutableStateOf(prefs.getBoolean("setting:SIM 2", true)) }
     var ask by remember { mutableStateOf(prefs.getBoolean("setting:Ask before each call", true)) }
+    var defaultLine by remember { mutableStateOf(prefs.getString("default_line", "") ?: "") }
     var autoRec by remember { mutableStateOf(prefs.getBoolean("auto_record", true)) }
 
     val profileName = prefs.getString("profile_name", "Md Rean Islam") ?: "Md Rean Islam"
     val autoBackup = prefs.getBoolean("auto_backup", true)
-    val sipDomain = prefs.getString("domain", "") ?: ""
+    val sipDomain = activity.defaultSipAccount()?.domain ?: ""
     val powerMode = prefs.getString("power_mode", "Unrestricted") ?: "Unrestricted"
     val blockedCount = (prefs.getStringSet("blocked_numbers", emptySet()) ?: emptySet()).size
     val recCount = activity.recordingFiles().size
@@ -1258,8 +1731,44 @@ private fun CallerXApp(activity: MainActivity) {
             }
             item {
                 SettingRow(Icons.Filled.SwapCalls, Color(0xFF4F46E5), iconBg(Color(0xFFE0E7FF), Color(0xFF4F46E5)),
-                    "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else "Disabled · Uses default line", {},
+                    "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else if (defaultLine.isBlank()) "Disabled · Uses first available line" else "Disabled · Calls go from $defaultLine", {},
                     toggle = true, checked = ask, onToggle = { ask = it; prefs.edit().putBoolean("setting:Ask before each call", it).apply() })
+            }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(44.dp).clip(CircleShape).background(iconBg(Color(0xFFE0E7FF), Color(0xFF4F46E5))), contentAlignment = Alignment.Center) {
+                                Icon(Icons.Filled.SwapCalls, null, tint = Color(0xFF4F46E5), modifier = Modifier.size(22.dp))
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("Default line for calls", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                                Text(
+                                    if (defaultLine.isBlank()) "Not set · First available line is used"
+                                    else "$defaultLine · All calls go from $defaultLine",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("SIP", "SIM 1", "SIM 2").forEach { line ->
+                                FilterChip(
+                                    selected = defaultLine == line,
+                                    onClick = {
+                                        defaultLine = line
+                                        ask = false
+                                        prefs.edit().putString("default_line", line).putBoolean("setting:Ask before each call", false).apply()
+                                        activity.toast("Default line set to $line — all calls will go from $line")
+                                    },
+                                    label = { Text(line) }
+                                )
+                            }
+                        }
+                        Text("Picking a line turns off 'Ask before each call', so every call goes from this line without asking again.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+                    }
+                }
             }
             item {
                 SettingRow(Icons.Filled.FiberManualRecord, Color(0xFFE11D48), iconBg(Color(0xFFFFE4E6), Color(0xFFE11D48)),
