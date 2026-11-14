@@ -3,6 +3,9 @@ package com.callerx.app
 import android.content.Intent
 import android.telecom.Call
 import android.telecom.InCallService
+import android.telecom.PhoneAccount
+import android.telecom.TelecomManager
+import android.telephony.SubscriptionManager
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -12,6 +15,7 @@ object TelecomCallBridge {
     var currentCall: Call? = null
     var state by mutableStateOf("")
     var remoteNumber by mutableStateOf("")
+    var source by mutableStateOf("SIM 1")
     var launchCallUi by mutableStateOf(false)
 }
 
@@ -51,6 +55,13 @@ class CallerXInCallService : InCallService() {
 
     private fun updateCallUi(call: Call) {
         TelecomCallBridge.remoteNumber = call.details.handle?.schemeSpecificPart.orEmpty()
+        val handle = call.details.accountHandle
+        val telecom = getSystemService(TelecomManager::class.java)
+        val account = try { handle?.let { telecom.getPhoneAccount(it) } } catch (_: Exception) { null }
+        TelecomCallBridge.source = if (account?.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION) == true) {
+            val simSlot = try { getSystemService(SubscriptionManager::class.java).activeSubscriptionInfoList.orEmpty().firstOrNull { it.subscriptionId.toString() == handle?.id }?.simSlotIndex } catch (_: Exception) { null }
+            "SIM ${(simSlot ?: 0) + 1}"
+        } else "SIP VOIP · HD AUDIO"
         TelecomCallBridge.state = when (call.state) {
             Call.STATE_RINGING -> "Incoming cellular call"
             Call.STATE_CONNECTING, Call.STATE_DIALING -> "Calling…"

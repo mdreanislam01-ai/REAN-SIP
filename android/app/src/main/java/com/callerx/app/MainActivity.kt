@@ -21,6 +21,7 @@ import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -38,6 +39,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -93,6 +95,7 @@ class MainActivity : ComponentActivity() {
     var callState by mutableStateOf("")
     var activeNumber by mutableStateOf("")
     var activeCallName by mutableStateOf("")
+    var activeCallSource by mutableStateOf("SIP VOIP · HD AUDIO")
     private var activeCall: Call? = null
     var errorMessage by mutableStateOf("")
     var dialIntentNumber by mutableStateOf("")
@@ -158,6 +161,7 @@ class MainActivity : ComponentActivity() {
     }
 
     fun startCellCall(number: String, simSlot: Int) {
+        activeCallSource = "SIM ${simSlot + 1}"
         val cleaned = number.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
         if (cleaned.isBlank()) { errorMessage = "Enter a phone number first."; return }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
@@ -271,6 +275,7 @@ class MainActivity : ComponentActivity() {
     }
 
     fun startSipCall(number: String, name: String) {
+        activeCallSource = "SIP VOIP · HD AUDIO"
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             activeNumber = number; activeCallName = name
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
@@ -297,6 +302,13 @@ class MainActivity : ComponentActivity() {
         if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setMuted(muted); return }
         core?.currentCall?.microphoneMuted = muted
     }
+    fun toggleHold(held: Boolean) {
+        try {
+            if (TelecomCallBridge.currentCall != null) { if (held) TelecomCallBridge.currentCall?.hold() else TelecomCallBridge.currentCall?.unhold() }
+            else core?.currentCall?.let { if (held) it.pause() else it.resume() }
+        } catch (e: Exception) { errorMessage = "Could not ${if (held) "hold" else "resume"} call: ${e.message}" }
+    }
+
     fun setSpeaker(enabled: Boolean) {
         if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setAudioRoute(if (enabled) android.telecom.CallAudioState.ROUTE_SPEAKER else android.telecom.CallAudioState.ROUTE_EARPIECE); return }
         try {
@@ -357,7 +369,7 @@ private fun CallerXApp(activity: MainActivity) {
     LaunchedEffect(activity.callState, activity.callUiRequested, TelecomCallBridge.state) {
         if (activity.callState == "Incoming SIP call" || activity.callUiRequested || TelecomCallBridge.state == "Incoming cellular call") {
             screen = "call"
-            if (TelecomCallBridge.currentCall != null) { activity.activeNumber = TelecomCallBridge.remoteNumber; activity.activeCallName = "Phone call" }
+            if (TelecomCallBridge.currentCall != null) { activity.activeNumber = TelecomCallBridge.remoteNumber; activity.activeCallName = "Phone call"; activity.activeCallSource = TelecomCallBridge.source }
             activity.callUiRequested = false
         }
     }
@@ -370,8 +382,12 @@ private fun CallerXApp(activity: MainActivity) {
     val visibleCallNumber = if (isCellCall) TelecomCallBridge.remoteNumber else activity.activeNumber.ifBlank { selected?.number ?: number }
     MaterialTheme(colorScheme = scheme) {
         if (screen == "call") {
-            NativeCallScreen(activity, visibleCallName, visibleCallNumber, visibleCallState, muted, speaker,
-                onMute = { muted = !muted; activity.toggleMute(muted) }, onSpeaker = { speaker = !speaker; activity.setSpeaker(speaker) }, onAnswer = { if (isCellCall) activity.answerCellCall() else activity.answerCall() }, onEnd = { if (isCellCall) activity.endCellCall() else activity.endCall(); afterCall = true; screen = "summary" })
+            NativeCallScreen(visibleCallName, visibleCallNumber, visibleCallState, activity.activeCallSource, dark, muted, speaker,
+                onTheme = { dark = it; prefs.edit().putBoolean("dark", it).apply() },
+                onMute = { muted = !muted; activity.toggleMute(muted) }, onSpeaker = { speaker = !speaker; activity.setSpeaker(speaker) },
+                onHold = { held -> activity.toggleHold(held) }, onAnswer = { if (isCellCall) activity.answerCellCall() else activity.answerCall() },
+                onDecline = { if (isCellCall) activity.endCellCall() else activity.endCall(); screen = "home" },
+                onEnd = { if (isCellCall) activity.endCellCall() else activity.endCall(); afterCall = true; screen = "summary" })
         } else if (screen == "summary") {
             SummaryScreen(activity.activeCallName, activity.activeNumber, onDone = { screen = "home"; tab = "Calls" })
         } else if (screen == "sip") {
@@ -598,22 +614,79 @@ private fun CallerXApp(activity: MainActivity) {
     }
 }
 
-@Composable private fun NativeCallScreen(activity: MainActivity, name: String, number: String, state: String, muted: Boolean, speaker: Boolean, onMute: () -> Unit, onSpeaker: () -> Unit, onAnswer: () -> Unit, onEnd: () -> Unit) {
+@Composable private fun NativeCallScreen(
+    name: String, number: String, state: String, source: String, dark: Boolean, muted: Boolean, speaker: Boolean,
+    onTheme: (Boolean) -> Unit, onMute: () -> Unit, onSpeaker: () -> Unit, onHold: (Boolean) -> Unit,
+    onAnswer: () -> Unit, onDecline: () -> Unit, onEnd: () -> Unit
+) {
     var hold by remember { mutableStateOf(false) }
-    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF10284E), Color(0xFF071326), Color(0xFF020811)))).padding(24.dp)) {
-        Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(Modifier.height(28.dp)); AssistChip(onClick = {}, label = { Text("SIP VOIP · HD AUDIO", color = Color(0xFF8EDAFF)) }, leadingIcon = { Icon(Icons.Filled.GraphicEq, null, tint = Color(0xFF63C8FF)) }, colors = AssistChipDefaults.assistChipColors(containerColor = Color.White.copy(alpha = .1f)))
-            Spacer(Modifier.height(34.dp)); Text(name, color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.Bold); Text(number, color = Color.White.copy(alpha = .7f), fontSize = 15.sp); Spacer(Modifier.height(12.dp)); Text(state.ifBlank { "Connecting…" }, color = Color.White.copy(alpha = .8f))
-            Spacer(Modifier.weight(1f)); Box(Modifier.size(210.dp).clip(CircleShape).background(Color(0xFF1681CC).copy(alpha = .10f)), contentAlignment = Alignment.Center) { Box(Modifier.size(160.dp).clip(CircleShape).background(Color(0xFF1681CC).copy(alpha = .18f)), contentAlignment = Alignment.Center) { Box(Modifier.size(112.dp).clip(CircleShape).background(Color(0xFF087DB8)), contentAlignment = Alignment.Center) { Icon(Icons.Filled.Call, null, tint = Color.White, modifier = Modifier.size(44.dp)) } } }
-            Spacer(Modifier.weight(1f)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                CallControl(Icons.Filled.MicOff, "Mute", muted, onMute); CallControl(Icons.Filled.VolumeUp, "Speaker", speaker, onSpeaker); CallControl(Icons.Filled.Pause, "Hold", hold) { hold = !hold }
+    val background = if (dark) Color(0xFF071426) else Color(0xFFF9FAFB)
+    val primaryText = if (dark) Color(0xFFF8FAFC) else Color(0xFF111827)
+    val secondaryText = if (dark) Color(0xFFA6B2C2) else Color(0xFF64748B)
+    val sourceColor = when { source.startsWith("SIM 1") -> Color(0xFF2563EB); source.startsWith("SIM 2") -> Color(0xFF0F9D8A); else -> Color(0xFF5B5BD6) }
+    val incoming = state.startsWith("Incoming", ignoreCase = true)
+    val transition = rememberInfiniteTransition()
+    val pulse by transition.animateFloat(initialValue = 1f, targetValue = 1.08f, animationSpec = infiniteRepeatable(animation = tween(2200, easing = FastOutSlowInEasing), repeatMode = RepeatMode.Reverse))
+    Box(Modifier.fillMaxSize().background(background)) {
+        Column(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+                Surface(shape = RoundedCornerShape(50), color = sourceColor.copy(alpha = if (dark) .22f else .09f), border = androidx.compose.foundation.BorderStroke(1.dp, sourceColor.copy(alpha = .25f))) {
+                    Row(Modifier.padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(if (source.startsWith("SIP")) Icons.Filled.GraphicEq else Icons.Filled.SimCard, null, tint = sourceColor, modifier = Modifier.size(15.dp))
+                        Text(source.uppercase(), color = if (dark) Color(0xFFD7D9FF) else sourceColor, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = .7.sp)
+                    }
+                }
+                IconButton(onClick = { onTheme(!dark) }, modifier = Modifier.align(Alignment.CenterEnd).size(36.dp)) {
+                    Icon(if (dark) Icons.Filled.LightMode else Icons.Filled.DarkMode, "Toggle call screen theme", tint = secondaryText, modifier = Modifier.size(20.dp))
+                }
             }
-            if (state == "Incoming SIP call") { FilledIconButton(onClick = onAnswer, modifier = Modifier.size(66.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFF2E9C67), contentColor = Color.White)) { Icon(Icons.Filled.Call, "Answer", modifier = Modifier.size(30.dp)) }; Text("Answer", color = Color.White, modifier = Modifier.padding(top = 5.dp)); Spacer(Modifier.height(14.dp)) }
-            Spacer(Modifier.height(12.dp)); FilledIconButton(onClick = onEnd, modifier = Modifier.size(76.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFFE34848), contentColor = Color.White)) { Icon(Icons.Filled.CallEnd, "End call", modifier = Modifier.size(34.dp)) }; Text(if (state == "Incoming SIP call") "Decline" else "End", color = Color.White, modifier = Modifier.padding(top = 6.dp)); Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.height(30.dp))
+            Text(name.ifBlank { "Unknown caller" }, color = primaryText, fontSize = 27.sp, lineHeight = 33.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text(number, color = secondaryText, fontSize = 15.sp, fontWeight = FontWeight.Medium, letterSpacing = .4.sp, modifier = Modifier.padding(top = 6.dp))
+            Row(Modifier.padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Box(Modifier.size(7.dp).clip(CircleShape).background(if (incoming) Color(0xFFF59E0B) else Color(0xFF22A06B)))
+                Text(state.ifBlank { "Connecting…" }, color = secondaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            }
+            Spacer(Modifier.weight(1f))
+            Box(Modifier.size(224.dp), contentAlignment = Alignment.Center) {
+                Box(Modifier.size(210.dp).graphicsLayer { scaleX = pulse; scaleY = pulse; alpha = .22f }.clip(CircleShape).background(sourceColor.copy(alpha = .15f)))
+                Box(Modifier.size(166.dp).graphicsLayer { scaleX = 2f - pulse; scaleY = 2f - pulse; alpha = .36f }.clip(CircleShape).background(sourceColor.copy(alpha = .12f)))
+                Box(Modifier.size(106.dp).clip(CircleShape).background(sourceColor), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.Call, "Call", tint = Color.White, modifier = Modifier.size(42.dp).graphicsLayer { rotationZ = if (incoming) -28f else 0f })
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            if (incoming) {
+                Row(Modifier.fillMaxWidth().padding(bottom = 22.dp), horizontalArrangement = Arrangement.spacedBy(22.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                        FilledIconButton(onClick = onDecline, modifier = Modifier.size(68.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFFDC3F45), contentColor = Color.White)) { Icon(Icons.Filled.CallEnd, "Decline", modifier = Modifier.size(29.dp)) }
+                        Text("Decline", color = primaryText, fontSize = 12.sp, modifier = Modifier.padding(top = 7.dp))
+                    }
+                    Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                        FilledIconButton(onClick = onAnswer, modifier = Modifier.size(68.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFF1EAA62), contentColor = Color.White)) { Icon(Icons.Filled.Call, "Answer", modifier = Modifier.size(29.dp)) }
+                        Text("Answer", color = primaryText, fontSize = 12.sp, modifier = Modifier.padding(top = 7.dp))
+                    }
+                }
+            } else {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    CallControl(Icons.Filled.MicOff, "Mute", muted, dark, secondaryText, onMute)
+                    CallControl(Icons.Filled.VolumeUp, "Speaker", speaker, dark, secondaryText, onSpeaker)
+                    CallControl(Icons.Filled.Pause, if (hold) "Resume" else "Hold", hold, dark, secondaryText) { hold = !hold; onHold(hold) }
+                }
+                Spacer(Modifier.height(25.dp))
+                FilledIconButton(onClick = onEnd, modifier = Modifier.size(68.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFFDC3F45), contentColor = Color.White)) { Icon(Icons.Filled.CallEnd, "End call", modifier = Modifier.size(30.dp)) }
+                Text("End call", color = primaryText, fontSize = 12.sp, modifier = Modifier.padding(top = 7.dp, bottom = 18.dp))
+            }
         }
     }
 }
-@Composable private fun CallControl(icon: ImageVector, label: String, selected: Boolean, onClick: () -> Unit) { Column(horizontalAlignment = Alignment.CenterHorizontally) { FilledIconButton(onClick = onClick, colors = IconButtonDefaults.filledIconButtonColors(containerColor = if (selected) Color.White else Color.White.copy(alpha = .13f), contentColor = if (selected) CallerBlue else Color.White)) { Icon(icon, label) }; Text(label, color = Color.White, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp)) } }
+
+@Composable private fun CallControl(icon: ImageVector, label: String, selected: Boolean, dark: Boolean, secondaryText: Color, onClick: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        FilledIconButton(onClick = onClick, colors = IconButtonDefaults.filledIconButtonColors(containerColor = if (selected) Color(0xFF2864DC) else if (dark) Color(0xFF1E2B3D) else Color(0xFFE9EDF3), contentColor = if (selected) Color.White else if (dark) Color.White else Color(0xFF334155))) { Icon(icon, label) }
+        Text(label, color = secondaryText, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp))
+    }
+}
 @Composable private fun SummaryScreen(name: String, number: String, onDone: () -> Unit) {
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Icon(Icons.Filled.CheckCircle, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(56.dp)); Spacer(Modifier.height(14.dp)); Text("Call ended", fontSize = 24.sp, fontWeight = FontWeight.Bold); Text(name, modifier = Modifier.padding(top = 8.dp)); Text(number, color = MaterialTheme.colorScheme.onSurfaceVariant)
