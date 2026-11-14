@@ -23,6 +23,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -51,10 +52,33 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import org.linphone.core.*
 
-private val CallerBlue = Color(0xFF087DB8)
-private val Palette = listOf(
-    Color(0xFF087DB8), Color(0xFF16845B), Color(0xFF7053B5), Color(0xFFD47622),
-    Color(0xFFC34F86), Color(0xFF455FC2), Color(0xFF168C8C), Color(0xFFCA4545), Color(0xFF68717D)
+// Theme presets (from the user's Settings HTML design). Selecting one recolors the
+// whole app because CallerXApp builds its MaterialTheme colorScheme from Palette[accent].
+private data class ThemePreset(val key: String, val name: String, val color: Color)
+private val ThemePresets = listOf(
+    ThemePreset("indigo", "Indigo Accent", Color(0xFF4F46E5)),
+    ThemePreset("blue", "Royal Blue", Color(0xFF2563EB)),
+    ThemePreset("teal", "Emerald Teal", Color(0xFF0D9488)),
+    ThemePreset("rose", "Crimson Rose", Color(0xFFE11D48)),
+    ThemePreset("amber", "Warm Amber", Color(0xFFD97706))
+)
+private val Palette = ThemePresets.map { it.color }
+
+// Audio codec presets for the Audio & Codec screen (mime type used by Linphone).
+private data class CodecPreset(val mime: String, val label: String, val desc: String)
+private val CodecPresets = listOf(
+    CodecPreset("opus", "Opus (48kHz HD)", "Best voice clarity & adaptive bitrate"),
+    CodecPreset("G722", "G.722 Wideband", "HD voice for VoIP networks"),
+    CodecPreset("PCMU", "PCMU (G.711 u-law)", "Standard telephony compatibility"),
+    CodecPreset("PCMA", "PCMA (G.711 a-law)", "International GSM/SIP fallback"),
+    CodecPreset("G729", "G.729", "Ultra-low bandwidth mobile data mode")
+)
+
+// Power modes for the Power Mode screen.
+private val PowerModes = listOf(
+    Triple("Unrestricted", "Unrestricted (Recommended)", "Keeps SIP VoIP online in background for instant incoming calls."),
+    Triple("Optimized", "Optimized", "Balances background SIP push notifications and battery life."),
+    Triple("Battery Saver", "Battery Saver", "Pauses background SIP registration when screen is locked.")
 )
 private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "")
 private val people = emptyList<Person>()
@@ -196,6 +220,10 @@ class MainActivity : ComponentActivity() {
         intent?.data?.schemeSpecificPart?.let { dialIntentNumber = it }
         callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
         initializeLinphone()
+        try {
+            val filter = android.content.IntentFilter().apply { addAction(Intent.ACTION_SCREEN_OFF); addAction(Intent.ACTION_SCREEN_ON) }
+            registerReceiver(screenReceiver, filter)
+        } catch (_: Exception) { }
         setContent { CallerXApp(this) }
     }
 
@@ -226,6 +254,17 @@ class MainActivity : ComponentActivity() {
                 }
                 override fun onCallStateChanged(core: Core, call: Call, state: Call.State, message: String) {
                     runOnUiThread {
+                        if (state == Call.State.IncomingReceived) {
+                            val remote = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
+                            if (isBlockedNumber(remote)) { try { call.terminate() } catch (_: Exception) { }; return@runOnUiThread }
+                        }
+                        if (state == Call.State.StreamsRunning) {
+                            val autoRec = getSharedPreferences("callerx", Context.MODE_PRIVATE).getBoolean("auto_record", true)
+                            if (autoRec && !sipRecordingActive) { try { call.startRecording(); sipRecordingActive = true } catch (_: Exception) { } }
+                        }
+                        if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) {
+                            if (sipRecordingActive) { try { call.stopRecording() } catch (_: Exception) { }; sipRecordingActive = false }
+                        }
                         activeCall = if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) null else call
                         if (state == Call.State.IncomingReceived) {
                             activeCallName = call.remoteAddress?.displayName?.takeIf { it.isNotBlank() } ?: "Incoming caller"
@@ -244,12 +283,13 @@ class MainActivity : ComponentActivity() {
                 }
             })
             c.start()
+            applyAudioSettings()
         } catch (e: Exception) {
             errorMessage = "VoIP engine couldn't start: ${e.message ?: "unknown error"}"
         }
     }
 
-    fun registerSip(username: String, password: String, domain: String, port: String, transport: String) {
+    fun registerSip(username: String, password: String, domain: String, port: String, transport: String, displayName: String = "") {
         val c = core ?: run { initializeLinphone(); core } ?: return
         try {
             c.clearAccounts()
@@ -258,6 +298,7 @@ class MainActivity : ComponentActivity() {
             val auth = Factory.instance().createAuthInfo(username.trim(), null, password, null, null, cleanDomain)
             val params = c.createAccountParams()
             val identity = Factory.instance().createAddress("sip:${username.trim()}@$cleanDomain")
+            if (displayName.isNotBlank()) { try { identity.displayName = displayName.trim() } catch (_: Exception) { } }
             val server = Factory.instance().createAddress("sip:$cleanDomain:${port.trim()};transport=${transport.lowercase()}")
             params.setIdentityAddress(identity)
             params.setServerAddress(server)
@@ -267,10 +308,97 @@ class MainActivity : ComponentActivity() {
             c.addAccount(account)
             c.defaultAccount = account
             registrationMessage = "Registering…"
+            applyAudioSettings()
         } catch (e: Exception) {
             registered = false
             registrationMessage = "SIP Offline"
             errorMessage = "SIP setup failed: ${e.message ?: "check the account details"}"
+        }
+    }
+
+    fun unregisterSip() {
+        try {
+            val c = core ?: return
+            c.clearAccounts()
+            c.clearAllAuthInfo()
+            c.defaultAccount = null
+            registered = false
+            registrationMessage = "SIP Offline"
+        } catch (_: Exception) { }
+    }
+
+    fun toast(msg: String) {
+        try { android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show() } catch (_: Exception) { }
+    }
+
+    fun requestPermission(vararg perms: String) {
+        try { runtimePermissionLauncher.launch(arrayOf(*perms)) } catch (_: Exception) { }
+    }
+
+    fun openOverlaySettings() {
+        try {
+            val intent = Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } catch (_: Exception) { errorMessage = "Could not open the overlay permission settings." }
+    }
+
+    fun isBlockedNumber(number: String): Boolean {
+        val digits = number.filter { it.isDigit() }.takeLast(11)
+        if (digits.isEmpty()) return false
+        val blocked = getSharedPreferences("callerx", Context.MODE_PRIVATE).getStringSet("blocked_numbers", emptySet()) ?: emptySet()
+        return blocked.any { entry ->
+            val b = entry.substringBefore("|").filter { it.isDigit() }.takeLast(11)
+            b.isNotEmpty() && (b == digits || (b.length >= 10 && digits.length >= 10 && b.takeLast(10) == digits.takeLast(10)))
+        }
+    }
+
+    fun recordingFiles(): List<java.io.File> {
+        return try {
+            val dir = java.io.File(filesDir, "recordings")
+            if (!dir.exists()) emptyList()
+            else dir.listFiles()?.filter { it.isFile && (it.name.endsWith(".wav", true) || it.name.endsWith(".mka", true)) }?.sortedByDescending { it.lastModified() } ?: emptyList()
+        } catch (_: Exception) { emptyList() }
+    }
+
+    private var sipRecordingActive = false
+
+    private fun recordFileForCall(): String? {
+        return try {
+            val dir = java.io.File(filesDir, "recordings").apply { mkdirs() }
+            java.io.File(dir, "CallerX-${System.currentTimeMillis()}.wav").absolutePath
+        } catch (_: Exception) { null }
+    }
+
+    // Applies the saved Audio & Codec settings to the Linphone core.
+    fun applyAudioSettings() {
+        val c = core ?: return
+        val prefs = getSharedPreferences("callerx", Context.MODE_PRIVATE)
+        try {
+            val enabled = prefs.getStringSet("audio_codecs", setOf("opus", "G722", "PCMU")) ?: setOf("opus", "G722", "PCMU")
+            val enabledLower = enabled.map { it.lowercase() }.toSet()
+            try {
+                c.audioPayloadTypes.forEach { pt ->
+                    pt.enabled = enabledLower.contains(pt.mimeType.lowercase())
+                }
+            } catch (_: Exception) { }
+            try { c.enableEchoCancellation(prefs.getBoolean("audio_echo", true)) } catch (_: Exception) { }
+            try { c.enableNoiseSuppression(prefs.getBoolean("audio_noise", true)) } catch (_: Exception) { }
+            try { c.micGainDb = prefs.getFloat("audio_mic_gain", 2f) } catch (_: Exception) { }
+        } catch (_: Exception) { }
+    }
+
+    // Battery Saver: pause the SIP core while the screen is off, resume when it turns on.
+    private val screenReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val mode = getSharedPreferences("callerx", Context.MODE_PRIVATE).getString("power_mode", "Unrestricted") ?: "Unrestricted"
+            if (mode != "Battery Saver") return
+            try {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> core?.stop()
+                    Intent.ACTION_SCREEN_ON -> { core?.start(); applyAudioSettings() }
+                }
+            } catch (_: Exception) { }
         }
     }
 
@@ -289,12 +417,30 @@ class MainActivity : ComponentActivity() {
             val address = c.interpretUrl(target)
             if (address == null) { errorMessage = "Enter a valid SIP address or register a SIP account first."; return }
             activeCallName = name
-            activeCall = c.inviteAddress(address)
+            try {
+                val params = c.createCallParams(null)
+                params?.setVideoEnabled(false)
+                recordFileForCall()?.let { params?.setRecordFile(it) }
+                activeCall = if (params != null) c.inviteAddressWithParams(address, params) else c.inviteAddress(address)
+            } catch (_: Exception) {
+                activeCall = c.inviteAddress(address)
+            }
             callState = "Calling…"
         } catch (e: Exception) { errorMessage = "Call could not start: ${e.message ?: "network unavailable"}" }
     }
 
-    fun answerCall() { try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
+    fun answerCall() {
+        try {
+            core?.currentCall?.let { call ->
+                try {
+                    val params = core?.createCallParams(call)
+                    params?.setVideoEnabled(false)
+                    recordFileForCall()?.let { params?.setRecordFile(it) }
+                    if (params != null) call.acceptWithParams(params) else call.accept()
+                } catch (_: Exception) { call.accept() }
+            }
+        } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" }
+    }
     fun answerCellCall() { try { TelecomCallBridge.currentCall?.answer(0) } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
     fun endCellCall() { try { TelecomCallBridge.currentCall?.disconnect() } catch (e: Exception) { errorMessage = "Could not end call: ${e.message}" } }
     fun endCall() { try { core?.currentCall?.terminate() ?: core?.terminateAllCalls() } catch (_: Exception) { core?.terminateAllCalls() } }
@@ -319,6 +465,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        try { unregisterReceiver(screenReceiver) } catch (_: Exception) { }
         try { core?.stop() } catch (_: Exception) { }
         core = null
         super.onDestroy()
@@ -342,6 +489,7 @@ private fun CallerXApp(activity: MainActivity) {
     var sipUsername by remember { mutableStateOf("") }
     var sipPassword by remember { mutableStateOf("") }
     var sipDomain by remember { mutableStateOf("") }
+    var sipDisplayName by remember { mutableStateOf("") }
     var sipPort by remember { mutableStateOf("5060") }
     var transport by remember { mutableStateOf("UDP") }
     var number by remember { mutableStateOf("") }
@@ -358,6 +506,7 @@ private fun CallerXApp(activity: MainActivity) {
         contacts = loadContacts(context); recentCalls = loadCallLog(context); messages = loadSms(context)
         sipUsername = prefs.getString("user", "") ?: ""
         sipDomain = prefs.getString("domain", "") ?: ""
+        sipDisplayName = prefs.getString("display_name", "") ?: ""
         sipPort = prefs.getString("port", "5060") ?: "5060"
         transport = prefs.getString("transport", "UDP") ?: "UDP"
         dark = prefs.getBoolean("dark", false)
@@ -371,6 +520,27 @@ private fun CallerXApp(activity: MainActivity) {
             screen = "call"
             if (TelecomCallBridge.currentCall != null) { activity.activeNumber = TelecomCallBridge.remoteNumber; activity.activeCallName = "Phone call"; activity.activeCallSource = TelecomCallBridge.source }
             activity.callUiRequested = false
+        }
+    }
+    // "Ask before each call": when off, call straight away with the default line
+    // (registered SIP first, then SIM 1, then SIM 2) instead of showing the sheet.
+    fun startCallFlow(person: Person) {
+        val ask = prefs.getBoolean("setting:Ask before each call", true)
+        if (!ask) {
+            val dialed = person.number
+            if (activity.registered) {
+                activity.activeNumber = dialed; activity.activeCallName = person.name
+                activity.startSipCall(dialed, person.name); screen = "call"
+            } else if (prefs.getBoolean("setting:SIM 1", true)) {
+                activity.startCellCall(dialed, 0); screen = "home"
+            } else if (prefs.getBoolean("setting:SIM 2", true)) {
+                activity.startCellCall(dialed, 1); screen = "home"
+            } else {
+                activity.errorMessage = "Enable SIM 1, SIM 2 or register SIP to make calls."
+            }
+        } else {
+            selected = person
+            showCallSheet = true
         }
     }
     val color = Palette[accent.coerceIn(Palette.indices)]
@@ -391,21 +561,33 @@ private fun CallerXApp(activity: MainActivity) {
         } else if (screen == "summary") {
             SummaryScreen(activity.activeCallName, activity.activeNumber, onDone = { screen = "home"; tab = "Calls" })
         } else if (screen == "sip") {
-            SipScreen(activity.registrationMessage, sipUsername, { sipUsername = it }, sipPassword, { sipPassword = it }, sipDomain, { sipDomain = it }, sipPort, { sipPort = it }, transport, { transport = it },
+            SipScreen(activity.registrationMessage, sipUsername, { sipUsername = it }, sipPassword, { sipPassword = it }, sipDomain, { sipDomain = it }, sipPort, { sipPort = it }, transport, { transport = it }, sipDisplayName, { sipDisplayName = it },
                 onBack = { screen = "settings" }, onRegister = {
-                    prefs.edit().putString("user", sipUsername).putString("domain", sipDomain).putString("port", sipPort).putString("transport", transport).apply()
-                    activity.registerSip(sipUsername, sipPassword, sipDomain, sipPort, transport)
-                })
+                    prefs.edit().putString("user", sipUsername).putString("domain", sipDomain).putString("port", sipPort).putString("transport", transport).putString("display_name", sipDisplayName).apply()
+                    activity.registerSip(sipUsername, sipPassword, sipDomain, sipPort, transport, sipDisplayName)
+                }, onUnregister = { activity.unregisterSip(); activity.toast("SIP Account Unregistered") })
         } else if (screen == "dialer") {
-            DialerScreen(number, { number = it }, onBack = { screen = "home" }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true })
+            DialerScreen(number, { number = it }, onBack = { screen = "home" }, onCall = { startCallFlow(Person("Dialed number", number, "?")) })
         } else if (screen == "profile") {
             ProfileScreen(onBack = { screen = "home" }, onTheme = { screen = "theme" }, onSettings = { screen = "settings" })
+        } else if (screen == "audio") {
+            AudioScreen(activity, onBack = { screen = "settings" })
+        } else if (screen == "recordings") {
+            RecordingsScreen(activity, onBack = { screen = "settings" })
+        } else if (screen == "permissions") {
+            PermissionsScreen(activity, onBack = { screen = "settings" })
+        } else if (screen == "blocked") {
+            BlockedScreen(activity, onBack = { screen = "settings" })
+        } else if (screen == "power") {
+            PowerScreen(activity, onBack = { screen = "settings" })
+        } else if (screen == "update") {
+            UpdateScreen(activity, onBack = { screen = "settings" })
         } else if (screen == "theme") {
             ThemeScreen(accent, { accent = it; prefs.edit().putInt("accent", it).apply() }, onBack = { screen = "settings" })
         } else if (screen == "settings") {
-            SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" }, onBack = { screen = "home" })
+            SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, accent, onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" }, onAudio = { screen = "audio" }, onRecordings = { screen = "recordings" }, onPermissions = { screen = "permissions" }, onBlocked = { screen = "blocked" }, onPower = { screen = "power" }, onUpdate = { screen = "update" }, onBack = { screen = "home" })
         } else if (selected != null) {
-            ContactDetailScreen(selected!!, onBack = { selected = null }, onCall = { showCallSheet = true })
+            ContactDetailScreen(selected!!, onBack = { selected = null }, onCall = { startCallFlow(selected!!) })
         } else {
             Scaffold(
                 containerColor = MaterialTheme.colorScheme.background,
@@ -418,7 +600,7 @@ private fun CallerXApp(activity: MainActivity) {
             ) { padding ->
                 Column(Modifier.fillMaxSize().padding(padding)) {
                     if (tab == "Settings") {
-                        SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" }, onBack = null)
+                        SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, accent, onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" }, onAudio = { screen = "audio" }, onRecordings = { screen = "recordings" }, onPermissions = { screen = "permissions" }, onBlocked = { screen = "blocked" }, onPower = { screen = "power" }, onUpdate = { screen = "update" }, onBack = null)
                     } else {
                         Header(tab, activity.registrationMessage, searchOpen, { searchOpen = !searchOpen }, query, { query = it }, { screen = "profile" }, { screen = "sip" })
                         if (tab == "Calls") {
@@ -437,8 +619,8 @@ private fun CallerXApp(activity: MainActivity) {
                                 val categoryMatches = when (filter) { "Outgoing" -> person.callType == CallLog.Calls.OUTGOING_TYPE; "Received" -> person.callType == CallLog.Calls.INCOMING_TYPE; "Missed" -> person.callType == CallLog.Calls.MISSED_TYPE; else -> true }
                                 categoryMatches && (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
                             }
-                            LazyColumn(Modifier.weight(if (keypadOpen) .55f else 1f), contentPadding = PaddingValues(bottom = 4.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
-                            if (keypadOpen) KeypadPanel(number, onNumber = { number = it }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true }, onHide = { keypadOpen = false })
+                            LazyColumn(Modifier.weight(if (keypadOpen) .55f else 1f), contentPadding = PaddingValues(bottom = 4.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { startCallFlow(person) }) } }
+                            if (keypadOpen) KeypadPanel(number, onNumber = { number = it }, onCall = { startCallFlow(Person("Dialed number", number, "?")) }, onHide = { keypadOpen = false })
                                 }
                                 if (!keypadOpen) FloatingActionButton(onClick = { keypadOpen = true }, modifier = Modifier.align(Alignment.BottomEnd).padding(end = 18.dp, bottom = 14.dp), shape = RoundedCornerShape(16.dp), containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White, elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 5.dp)) { Icon(Icons.Filled.Dialpad, "Open keypad", modifier = Modifier.size(23.dp)) }
                             }
@@ -451,9 +633,9 @@ private fun CallerXApp(activity: MainActivity) {
                             val visibleContacts = contacts.filter { query.isBlank() || it.name.contains(query, true) || it.number.contains(query, true) }
                             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 16.dp)) {
                                 item { SectionTitle("FAVORITES") }
-                                items(visibleContacts.take(5)) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
+                                items(visibleContacts.take(5)) { CallRow(it, color, onAvatar = { selected = it }, onCall = { startCallFlow(it) }) }
                                 item { SectionTitle(if (query.isBlank()) "ALL CONTACTS" else "SEARCH RESULTS") }
-                                if (visibleContacts.isEmpty()) item { Text("No matching contacts. Grant Contacts permission or add contacts to your device.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(visibleContacts) { CallRow(it, color, onAvatar = { selected = it }, onCall = { selected = it; showCallSheet = true }) }
+                                if (visibleContacts.isEmpty()) item { Text("No matching contacts. Grant Contacts permission or add contacts to your device.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(visibleContacts) { CallRow(it, color, onAvatar = { selected = it }, onCall = { startCallFlow(it) }) }
                             }
                         } else {
                             Row(Modifier.fillMaxWidth().padding(start = 18.dp, end = 12.dp, top = 12.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -473,7 +655,7 @@ private fun CallerXApp(activity: MainActivity) {
             }
         }
         if (showCallSheet && (screen == "home" || selected != null)) {
-            AlertDialog(onDismissRequest = { showCallSheet = false }, title = { Text("Call with…") }, text = { Column { Text(selected?.number ?: number, color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(14.dp)); (listOf("SIP / VoIP") + listOf("SIM 1", "SIM 2").filter { prefs.getBoolean("setting:$it", false) }).forEach { method -> TextButton(onClick = {
+            AlertDialog(onDismissRequest = { showCallSheet = false }, title = { Text("Call with…") }, text = { Column { Text(selected?.number ?: number, color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(14.dp)); (listOf("SIP / VoIP") + listOf("SIM 1", "SIM 2").filter { prefs.getBoolean("setting:$it", true) }).forEach { method -> TextButton(onClick = {
                 showCallSheet = false
                 val dialedNumber = selected?.number ?: number
                 if (method == "SIP / VoIP") { activity.activeNumber = dialedNumber; activity.activeCallName = selected?.name ?: "Dialed number"; activity.startSipCall(activity.activeNumber, activity.activeCallName); screen = "call" }
@@ -538,52 +720,244 @@ private fun CallerXApp(activity: MainActivity) {
 @Composable private fun Avatar(text: String, color: Color, size: Int, modifier: Modifier = Modifier) {
     Box(modifier.size(size.dp).clip(CircleShape).background(Brush.linearGradient(listOf(color, color.copy(alpha = .72f)))), contentAlignment = Alignment.Center) { Text(text.take(1).uppercase(), color = Color.White, fontWeight = FontWeight.Bold, fontSize = (size / 2.5f).sp) }
 }
-@Composable private fun SectionTitle(label: String) { Text(label, Modifier.fillMaxWidth().padding(start = 18.dp, top = 18.dp, bottom = 5.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+@Composable private fun SectionTitle(label: String) { Text(label, Modifier.fillMaxWidth().padding(start = 20.dp, top = 16.dp, bottom = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp) }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun SipScreen(status: String, user: String, onUser: (String) -> Unit, password: String, onPassword: (String) -> Unit, domain: String, onDomain: (String) -> Unit, port: String, onPort: (String) -> Unit, transport: String, onTransport: (String) -> Unit, onBack: () -> Unit, onRegister: () -> Unit) {
+@Composable private fun SipScreen(status: String, user: String, onUser: (String) -> Unit, password: String, onPassword: (String) -> Unit, domain: String, onDomain: (String) -> Unit, port: String, onPort: (String) -> Unit, transport: String, onTransport: (String) -> Unit, displayName: String, onDisplayName: (String) -> Unit, onBack: () -> Unit, onRegister: () -> Unit, onUnregister: () -> Unit) {
+    val registered = status == "SIP Online"
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        TopBar("SIP Account", onBack)
-        Column(Modifier.fillMaxSize().padding(18.dp).imePadding(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) { Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Filled.Cloud, null, tint = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text("Registration status", fontWeight = FontWeight.SemiBold); Text("${status}", color = if (status == "SIP Online") Color(0xFF2E9C67) else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp) }; if (status == "SIP Online") Icon(Icons.Filled.CheckCircle, null, tint = Color(0xFF2E9C67)) } }
-            OutlinedTextField(user, onUser, Modifier.fillMaxWidth(), label = { Text("SIP username") }, singleLine = true)
-            OutlinedTextField(password, onPassword, Modifier.fillMaxWidth(), label = { Text("Password") }, singleLine = true)
-            OutlinedTextField(domain, onDomain, Modifier.fillMaxWidth(), label = { Text("SIP server / domain") }, placeholder = { Text("sip.example.com") }, singleLine = true)
-            OutlinedTextField(port, onPort, Modifier.fillMaxWidth(), label = { Text("Port") }, singleLine = true)
-            Text("Transport", fontWeight = FontWeight.Medium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("UDP", "TCP", "TLS").forEach { FilterChip(selected = transport == it, onClick = { onTransport(it) }, label = { Text(it) }) } }
-            Text("Use the signaling details supplied by your SIP provider. SIP password is kept in memory for this session and is not saved.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Button(onClick = onRegister, Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(16.dp)) { Icon(Icons.Filled.CloudDone, null); Spacer(Modifier.width(8.dp)); Text("Save & Register") }
-            OutlinedButton(onClick = { }, Modifier.fillMaxWidth()) { Icon(Icons.Filled.MenuBook, null); Spacer(Modifier.width(8.dp)); Text("SIP setup guide") }
+        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+            Text("SIP Account", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+            Surface(shape = RoundedCornerShape(50), color = if (registered) Color(0xFFECFDF5) else MaterialTheme.colorScheme.surfaceVariant) {
+                Text(if (registered) "Registered" else "Offline", color = if (registered) Color(0xFF047857) else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+            }
+            Spacer(Modifier.width(8.dp))
+        }
+        LazyColumn(Modifier.weight(1f).padding(horizontal = 18.dp), contentPadding = PaddingValues(vertical = 18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.Cloud, null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("Registration status", fontWeight = FontWeight.SemiBold)
+                            Text(status, color = if (registered) Color(0xFF2E9C67) else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+                        }
+                        if (registered) Icon(Icons.Filled.CheckCircle, null, tint = Color(0xFF2E9C67))
+                    }
+                }
+            }
+            item { OutlinedTextField(domain, onDomain, Modifier.fillMaxWidth(), label = { Text("SIP Server / Domain") }, placeholder = { Text("sip.example.com") }, singleLine = true) }
+            item { OutlinedTextField(user, onUser, Modifier.fillMaxWidth(), label = { Text("SIP Username / Extension") }, singleLine = true) }
+            item { OutlinedTextField(password, onPassword, Modifier.fillMaxWidth(), label = { Text("Password") }, singleLine = true) }
+            item { OutlinedTextField(displayName, onDisplayName, Modifier.fillMaxWidth(), label = { Text("Display Name") }, placeholder = { Text("Your name shown to others") }, singleLine = true) }
+            item { OutlinedTextField(port, onPort, Modifier.fillMaxWidth(), label = { Text("Port") }, singleLine = true) }
+            item {
+                Text("Transport Protocol", fontWeight = FontWeight.Medium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+                    listOf("UDP", "TCP", "TLS").forEach { FilterChip(selected = transport == it, onClick = { onTransport(it) }, label = { Text(if (it == "TLS") "TLS (Secure)" else it) }) }
+                }
+            }
+            item { Text("Use the signaling details supplied by your SIP provider. SIP password is kept in memory for this session and is not saved.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            item {
+                Button(onClick = onRegister, Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(16.dp)) {
+                    Icon(Icons.Filled.CloudDone, null); Spacer(Modifier.width(8.dp)); Text("Register & Save Account")
+                }
+            }
+            item {
+                OutlinedButton(onClick = onUnregister, Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFDC2626))) {
+                    Text("Unregister / Go Offline")
+                }
+            }
         }
     }
 }
 
 @Composable private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) } }
 
-@Composable private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boolean) -> Unit, onSip: () -> Unit, onTheme: () -> Unit, onProfile: () -> Unit, onBack: (() -> Unit)?) {
-    val isDefaultDialer = activity.dialerRoleTick >= 0 && activity.isDefaultDialer()
+@Composable private fun SettingsScreen(
+    activity: MainActivity,
+    dark: Boolean,
+    onDark: (Boolean) -> Unit,
+    accent: Int,
+    onSip: () -> Unit,
+    onTheme: () -> Unit,
+    onProfile: () -> Unit,
+    onAudio: () -> Unit,
+    onRecordings: () -> Unit,
+    onPermissions: () -> Unit,
+    onBlocked: () -> Unit,
+    onPower: () -> Unit,
+    onUpdate: () -> Unit,
+    onBack: (() -> Unit)?
+) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+    val accentColor = Palette[accent.coerceIn(Palette.indices)]
+    fun iconBg(light: Color, tint: Color) = if (dark) tint.copy(alpha = 0.16f) else light
+
+    var sim1 by remember { mutableStateOf(prefs.getBoolean("setting:SIM 1", true)) }
+    var sim2 by remember { mutableStateOf(prefs.getBoolean("setting:SIM 2", true)) }
+    var ask by remember { mutableStateOf(prefs.getBoolean("setting:Ask before each call", true)) }
+    var autoRec by remember { mutableStateOf(prefs.getBoolean("auto_record", true)) }
+
+    val profileName = prefs.getString("profile_name", "Md Rean Islam") ?: "Md Rean Islam"
+    val autoBackup = prefs.getBoolean("auto_backup", true)
+    val sipDomain = prefs.getString("domain", "") ?: ""
+    val powerMode = prefs.getString("power_mode", "Unrestricted") ?: "Unrestricted"
+    val blockedCount = (prefs.getStringSet("blocked_numbers", emptySet()) ?: emptySet()).size
+    val recCount = activity.recordingFiles().size
+    val codecs = prefs.getStringSet("audio_codecs", setOf("opus", "G722", "PCMU")) ?: setOf("opus", "G722", "PCMU")
+    val noiseOn = prefs.getBoolean("audio_noise", true)
+    val codecNames = CodecPresets.filter { codecs.contains(it.mime) }.joinToString(", ") { it.label.substringBefore(" (").substringBefore(" ") }
+    val audioSub = (if (codecNames.isBlank()) "PCMU" else codecNames) + " · " + if (noiseOn) "Noise suppression on" else "Standard audio"
+    val themeName = ThemePresets[accent.coerceIn(ThemePresets.indices)].name
+
+    fun setSim(which: Int, value: Boolean) {
+        if (which == 1) { sim1 = value; prefs.edit().putBoolean("setting:SIM 1", value).apply() }
+        else { sim2 = value; prefs.edit().putBoolean("setting:SIM 2", value).apply() }
+        val s1 = if (which == 1) value else sim1
+        val s2 = if (which == 2) value else sim2
+        if (!s1 && !s2 && ask) {
+            ask = false
+            prefs.edit().putBoolean("setting:Ask before each call", false).apply()
+            activity.toast("Both SIMs disabled · SIP will be used by default")
+        }
+    }
+
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        if (onBack != null) TopBar("Settings", onBack) else Text("Settings", Modifier.padding(start = 18.dp, top = 36.dp, end = 18.dp, bottom = 18.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
-        LazyColumn {
-            item { SectionTitle("ACCOUNT") }; item { SettingRow(Icons.Filled.Person, "My Profile", "Manage your account", onProfile) }
-            item { SectionTitle("VOIP & SIP") }; item { SettingRow(Icons.Filled.Cloud, "SIP Account", "Register your VoIP account", onSip) }
-            item { SectionTitle("SIM CALLING") }; item { SettingRow(Icons.Filled.SimCard, "SIM 1", "Show SIM 1 as a call option", {}, true) }; item { SettingRow(Icons.Filled.SimCard, "SIM 2", "Show SIM 2 as a call option", {}, true) }; item { SettingRow(Icons.Filled.SwapCalls, "Ask before each call", "Choose SIP or an enabled SIM", {}, true, true) }
-            item { SectionTitle("GENERAL") }; item { SettingRow(Icons.Filled.PhoneAndroid, "Set as Default Dialer", if (isDefaultDialer) "CallerX is your default dialer" else "Choose CallerX for SIM calls", activity::requestDefaultDialer) }; item { SettingRow(Icons.Filled.Palette, "Theme color", "Choose your accent", onTheme) }; item { SettingRow(Icons.Filled.DarkMode, "Dark Mode", "", { onDark(!dark) }, true, dark) }
+        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(start = if (onBack != null) 4.dp else 20.dp, end = 20.dp, top = 20.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (onBack != null) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
+            Column(Modifier.weight(1f)) {
+                Text("Settings", fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp)
+                Text("CallerX VoIP & Dual-SIM Preferences", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 4.dp))
+            }
+            val registered = activity.registered
+            val pillBg = if (registered) Color(0xFFECFDF5) else MaterialTheme.colorScheme.surfaceVariant
+            val pillFg = if (registered) Color(0xFF047857) else MaterialTheme.colorScheme.onSurfaceVariant
+            Surface(shape = RoundedCornerShape(50), color = pillBg, border = androidx.compose.foundation.BorderStroke(1.dp, if (registered) Color(0xFFA7F3D0) else MaterialTheme.colorScheme.outlineVariant), modifier = Modifier.clickable(onClick = onSip)) {
+                Row(Modifier.padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(8.dp).clip(CircleShape).background(if (registered) Color(0xFF10B981) else Color(0xFF94A3B8)))
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (registered) "SIP Registered" else "SIP Offline", color = pillFg, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .4f))
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 24.dp)) {
+            item { SectionTitle("ACCOUNT") }
+            item {
+                SettingRow(Icons.Filled.ManageAccounts, Color(0xFFDB2777), iconBg(Color(0xFFFCE7F3), Color(0xFFDB2777)),
+                    "My Profile & User Account", "$profileName · Auto backup is ${if (autoBackup) "on" else "off"}", onProfile)
+            }
+            item { SectionTitle("VOIP & SIP") }
+            item {
+                SettingRow(Icons.Filled.Dns, Color(0xFF2563EB), iconBg(Color(0xFFDBEAFE), Color(0xFF2563EB)),
+                    "SIP Account", (if (sipDomain.isBlank()) "No SIP account" else sipDomain) + " · " + if (activity.registered) "Registered" else "Offline", onSip)
+            }
+            item {
+                SettingRow(Icons.Filled.GraphicEq, Color(0xFF7C3AED), iconBg(Color(0xFFEDE9FE), Color(0xFF7C3AED)),
+                    "Audio & Codec", audioSub, onAudio)
+            }
+            item { SectionTitle("SIM CALLING & RECORDING") }
+            item {
+                SettingRow(Icons.Filled.Smartphone, Color(0xFF0284C7), iconBg(Color(0xFFE0F2FE), Color(0xFF0284C7)),
+                    "SIM 1", if (sim1) "Show SIM 1 as a call option" else "Hidden from call prompt", {}, toggle = true, checked = sim1, onToggle = { setSim(1, it) }, numberBadge = "1")
+            }
+            item {
+                SettingRow(Icons.Filled.Smartphone, Color(0xFF0D9488), iconBg(Color(0xFFCCFBF1), Color(0xFF0D9488)),
+                    "SIM 2", if (sim2) "Show SIM 2 as a call option" else "Hidden from call prompt", {}, toggle = true, checked = sim2, onToggle = { setSim(2, it) }, numberBadge = "2")
+            }
+            item {
+                SettingRow(Icons.Filled.SwapCalls, Color(0xFF4F46E5), iconBg(Color(0xFFE0E7FF), Color(0xFF4F46E5)),
+                    "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else "Disabled · Uses default line", {},
+                    toggle = true, checked = ask, onToggle = { ask = it; prefs.edit().putBoolean("setting:Ask before each call", it).apply() })
+            }
+            item {
+                SettingRow(Icons.Filled.FiberManualRecord, Color(0xFFE11D48), iconBg(Color(0xFFFFE4E6), Color(0xFFE11D48)),
+                    "Auto Call Recording", if (autoRec) "On: every call is recorded" else "Off: manual recording only", onRecordings,
+                    toggle = true, checked = autoRec, onToggle = { autoRec = it; prefs.edit().putBoolean("auto_record", it).apply() },
+                    badge = if (recCount > 0) "$recCount files" else null, badgeBg = Color(0xFFFFF1F2), badgeFg = Color(0xFFBE123C))
+            }
+            item { SectionTitle("GENERAL & SYSTEM") }
+            item {
+                SettingRow(Icons.Filled.Call, Color(0xFF059669), iconBg(Color(0xFFD1FAE5), Color(0xFF059669)),
+                    "Dialer & Default Permission", "Set as Default Dialer · " + if (activity.isDefaultDialer()) "CallerX is default" else "Not default dialer", onPermissions)
+            }
+            item {
+                SettingRow(Icons.Filled.Block, Color(0xFFDC2626), iconBg(Color(0xFFFEE2E2), Color(0xFFDC2626)),
+                    "Blocked numbers", "Calls are rejected, messages arrive silently", onBlocked,
+                    badge = if (blockedCount > 0) "$blockedCount" else null)
+            }
+            item {
+                SettingRow(Icons.Filled.BatteryCharging, Color(0xFFD97706), iconBg(Color(0xFFFEF3C7), Color(0xFFD97706)),
+                    "Power Mode", "$powerMode · " + if (powerMode == "Unrestricted") "Best for background SIP" else "Battery conscious", onPower)
+            }
+            item {
+                SettingRow(Icons.Filled.Palette, Color(0xFF7C3AED), iconBg(Color(0xFFEDE9FE), Color(0xFF7C3AED)),
+                    "Theme color", themeName, onTheme, swatch = accentColor)
+            }
+            item {
+                SettingRow(Icons.Filled.DarkMode, Color(0xFF475569), iconBg(Color(0xFFE2E8F0), Color(0xFF475569)),
+                    "Dark Mode", if (dark) "On · Dark theme active" else "Off · Clean Light theme active", {},
+                    toggle = true, checked = dark, onToggle = { onDark(it) })
+            }
+            item {
+                SettingRow(Icons.Filled.Download, Color(0xFF0891B2), iconBg(Color(0xFFCFFAFE), Color(0xFF0891B2)),
+                    "App Update", "Check for a new version", onUpdate)
+            }
         }
     }
 }
-@Composable private fun SettingRow(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit, toggle: Boolean = false, checked: Boolean = false) {
-    val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
-    var value by remember(title, checked) { mutableStateOf(prefs.getBoolean("setting:$title", checked)) }
-    val activate = { if (toggle) { value = !value; prefs.edit().putBoolean("setting:$title", value).apply() }; onClick() }
-    Row(Modifier.fillMaxWidth().clickable { activate() }.padding(horizontal = 17.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(38.dp).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.primary.copy(alpha = .11f)), contentAlignment = Alignment.Center) { Icon(icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp)) }
-        Spacer(Modifier.width(13.dp)); Column(Modifier.weight(1f)) { Text(title, fontWeight = FontWeight.Medium, fontSize = 14.sp); if (subtitle.isNotBlank()) Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp) }
-        if (toggle) Switch(value, onCheckedChange = { checkedValue -> value = checkedValue; prefs.edit().putBoolean("setting:$title", value).apply(); onClick() }) else Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+@Composable private fun SettingRow(
+    icon: ImageVector,
+    iconColor: Color,
+    iconBg: Color,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+    toggle: Boolean = false,
+    checked: Boolean = false,
+    onToggle: ((Boolean) -> Unit)? = null,
+    badge: String? = null,
+    badgeBg: Color = Color(0xFFF1F5F9),
+    badgeFg: Color = Color(0xFF475569),
+    swatch: Color? = null,
+    numberBadge: String? = null
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable { if (toggle) onToggle?.invoke(!checked) else onClick() }.padding(horizontal = 20.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(44.dp).clip(CircleShape).background(iconBg), contentAlignment = Alignment.Center) {
+            Icon(icon, null, tint = iconColor, modifier = Modifier.size(20.dp))
+            if (numberBadge != null) {
+                Box(Modifier.size(14.dp).clip(CircleShape).background(iconColor).align(Alignment.BottomEnd), contentAlignment = Alignment.Center) {
+                    Text(numberBadge, color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (badge != null) {
+                    Spacer(Modifier.width(8.dp))
+                    Surface(shape = RoundedCornerShape(6.dp), color = badgeBg) {
+                        Text(badge, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = badgeFg, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+                    }
+                }
+            }
+            if (subtitle.isNotBlank()) Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
+        }
+        if (swatch != null) {
+            Box(Modifier.size(16.dp).clip(CircleShape).background(swatch).border(1.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape))
+            Spacer(Modifier.width(8.dp))
+        }
+        if (toggle) Switch(checked = checked, onCheckedChange = { onToggle?.invoke(it) })
+        else Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-    HorizontalDivider(Modifier.padding(start = 68.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .38f))
 }
 
 @Composable private fun ContactDetailScreen(person: Person, onBack: () -> Unit, onCall: () -> Unit) {
@@ -689,8 +1063,518 @@ private fun CallerXApp(activity: MainActivity) {
     }
 }
 @Composable private fun ProfileScreen(onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit) {
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) { TopBar("My Profile", onBack); Column(Modifier.fillMaxWidth().padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) { Avatar("R", MaterialTheme.colorScheme.primary, 90); Text("Rakib Hasan", Modifier.padding(top = 10.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold); Text("+880 17XX-XXXXXX", color = MaterialTheme.colorScheme.onSurfaceVariant); Text("Available · Dhaka", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp) }; SettingRow(Icons.Filled.Edit, "Edit Profile", "Update your details", {}) ; SettingRow(Icons.Filled.Notifications, "Notifications", "", {}) ; SettingRow(Icons.Filled.Settings, "Settings", "", onSettings); SettingRow(Icons.Filled.Palette, "Theme", "Change app colors", onTheme) }
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+    var name by remember { mutableStateOf(prefs.getString("profile_name", "Md Rean Islam") ?: "Md Rean Islam") }
+    var org by remember { mutableStateOf(prefs.getString("profile_org", "RMF Micro Finance") ?: "RMF Micro Finance") }
+    var email by remember { mutableStateOf(prefs.getString("profile_email", "rean.islam@rmfmicrofinance.com") ?: "rean.islam@rmfmicrofinance.com") }
+    var phone by remember { mutableStateOf(prefs.getString("profile_phone", "+8809649997742") ?: "+8809649997742") }
+    var autoBackup by remember { mutableStateOf(prefs.getBoolean("auto_backup", true)) }
+    var lastSync by remember { mutableStateOf(prefs.getString("last_sync", "Not backed up yet") ?: "Not backed up yet") }
+    var backingUp by remember { mutableStateOf(false) }
+    val initials = name.trim().split(" ").filter { it.isNotEmpty() }.take(2).joinToString("") { it.first().uppercase() }.ifBlank { "C" }
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("My Profile & Account", onBack)
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(56.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) {
+                            Text(initials, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        }
+                        Spacer(Modifier.width(16.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(name.ifBlank { "Md Rean Islam" }, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                            Text(org, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                            Text(phone, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+                        }
+                    }
+                }
+            }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(name, { name = it }, Modifier.fillMaxWidth(), label = { Text("Full Name") }, singleLine = true)
+                    OutlinedTextField(org, { org = it }, Modifier.fillMaxWidth(), label = { Text("Organization / Caller ID") }, singleLine = true)
+                    OutlinedTextField(email, { email = it }, Modifier.fillMaxWidth(), label = { Text("Email Address") }, singleLine = true)
+                    OutlinedTextField(phone, { phone = it }, Modifier.fillMaxWidth(), label = { Text("Phone Number") }, singleLine = true)
+                    Button(onClick = {
+                        prefs.edit().putString("profile_name", name.trim()).putString("profile_org", org.trim()).putString("profile_email", email.trim()).putString("profile_phone", phone.trim()).apply()
+                        android.widget.Toast.makeText(context, "Profile updated", android.widget.Toast.LENGTH_SHORT).show()
+                        onBack()
+                    }, Modifier.fillMaxWidth().height(50.dp), shape = RoundedCornerShape(12.dp)) { Text("Save Profile Details") }
+                }
+            }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Auto Backup & Restore", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                Text("Last synced: $lastSync", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                            }
+                            Switch(checked = autoBackup, onCheckedChange = { autoBackup = it; prefs.edit().putBoolean("auto_backup", it).apply() })
+                        }
+                        OutlinedButton(onClick = {
+                            backingUp = true
+                            Thread {
+                                val ok = backupNow(context)
+                                (context as? MainActivity)?.runOnUiThread {
+                                    backingUp = false
+                                    if (ok) {
+                                        lastSync = "Just now"
+                                        prefs.edit().putString("last_sync", "Just now").apply()
+                                        android.widget.Toast.makeText(context, "Call logs & contacts backed up", android.widget.Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        android.widget.Toast.makeText(context, "Backup failed", android.widget.Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }.start()
+                        }, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), enabled = !backingUp) {
+                            Text(if (backingUp) "Backing up..." else "Backup Call Logs & Contacts Now")
+                        }
+                    }
+                }
+            }
+            item {
+                SettingRow(Icons.Filled.Palette, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.primary.copy(alpha = .11f), "Theme", "Change app colors", onTheme)
+                SettingRow(Icons.Filled.Settings, MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.primary.copy(alpha = .11f), "Settings", "", onSettings)
+            }
+        }
+    }
 }
 @Composable private fun ThemeScreen(selected: Int, onSelect: (Int) -> Unit, onBack: () -> Unit) {
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) { TopBar("Theme color", onBack); Text("Choose an accent", Modifier.padding(18.dp), fontWeight = FontWeight.SemiBold); Column(Modifier.padding(horizontal = 16.dp)) { Palette.chunked(3).forEachIndexed { rowIndex, row -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) { row.forEachIndexed { colIndex, color -> val index = rowIndex * 3 + colIndex; Column(Modifier.clickable { onSelect(index) }.padding(14.dp), horizontalAlignment = Alignment.CenterHorizontally) { Box(Modifier.size(52.dp).clip(CircleShape).background(color), contentAlignment = Alignment.Center) { if (selected == index) Icon(Icons.Filled.Check, null, tint = Color.White) }; Text(listOf("Blue", "Green", "Purple", "Orange", "Pink", "Indigo", "Teal", "Red", "Gray")[index], Modifier.padding(top = 6.dp), fontSize = 12.sp) } } } } } }
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("Theme color", onBack)
+        Text("Choose an accent color for active toggles, buttons, and navigation highlights.", Modifier.padding(horizontal = 18.dp, vertical = 12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+        LazyColumn(Modifier.weight(1f).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
+            items(ThemePresets.size) { index ->
+                val preset = ThemePresets[index]
+                val isSelected = selected == index
+                Card(
+                    onClick = { onSelect(index) },
+                    colors = CardDefaults.cardColors(containerColor = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = .08f) else MaterialTheme.colorScheme.surface),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f)),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(28.dp).clip(CircleShape).background(preset.color))
+                        Spacer(Modifier.width(12.dp))
+                        Text(preset.name, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                        if (isSelected) Icon(Icons.Filled.Check, null, tint = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New Settings sub-screens (from the user's HTML design)
+// ---------------------------------------------------------------------------
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun AudioScreen(activity: MainActivity, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+    var codecs by remember { mutableStateOf(prefs.getStringSet("audio_codecs", setOf("opus", "G722", "PCMU")) ?: setOf("opus", "G722", "PCMU")) }
+    var echo by remember { mutableStateOf(prefs.getBoolean("audio_echo", true)) }
+    var noise by remember { mutableStateOf(prefs.getBoolean("audio_noise", true)) }
+    var micGain by remember { mutableStateOf(prefs.getFloat("audio_mic_gain", 2f)) }
+
+    fun saveCodecs(next: Set<String>) {
+        codecs = next
+        prefs.edit().putStringSet("audio_codecs", next).apply()
+        activity.applyAudioSettings()
+    }
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("Audio & Codec", onBack)
+        LazyColumn(Modifier.weight(1f).padding(horizontal = 18.dp), contentPadding = PaddingValues(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            item { Text("ENABLED VOIP CODECS (TAP TO TOGGLE)", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp) }
+            items(CodecPresets.size) { idx ->
+                val c = CodecPresets[idx]
+                val enabled = codecs.contains(c.mime)
+                Card(
+                    onClick = {
+                        val next = codecs.toMutableSet()
+                        if (enabled) next.remove(c.mime) else next.add(c.mime)
+                        if (next.isEmpty()) { activity.toast("At least one codec must stay enabled"); return@Card }
+                        saveCodecs(next)
+                    },
+                    colors = CardDefaults.cardColors(containerColor = if (enabled) MaterialTheme.colorScheme.primary.copy(alpha = .08f) else MaterialTheme.colorScheme.surface),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f)),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(c.label, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Text(c.desc, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                        }
+                        Surface(shape = RoundedCornerShape(50), color = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant) {
+                            Text(if (enabled) "Enabled" else "Off", color = if (enabled) Color.White else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+                        }
+                    }
+                }
+            }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Acoustic Echo Cancellation", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                Text("Prevents voice feedback on speakerphone", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                            }
+                            Switch(checked = echo, onCheckedChange = { echo = it; prefs.edit().putBoolean("audio_echo", it).apply(); activity.applyAudioSettings() })
+                        }
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("AI Noise Suppression", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                Text("Reduces background traffic & fan noise", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                            }
+                            Switch(checked = noise, onCheckedChange = { noise = it; prefs.edit().putBoolean("audio_noise", it).apply(); activity.applyAudioSettings() })
+                        }
+                        Column {
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("Microphone Gain Boost", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                Text((if (micGain > 0) "+" else "") + micGain.toInt().toString() + " dB", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                            }
+                            Slider(value = micGain, onValueChange = { micGain = it }, onValueChangeFinished = { prefs.edit().putFloat("audio_mic_gain", micGain).apply(); activity.applyAudioSettings() }, valueRange = -5f..10f, steps = 14, modifier = Modifier.fillMaxWidth())
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun RecordingsScreen(activity: MainActivity, onBack: () -> Unit) {
+    var files by remember { mutableStateOf(activity.recordingFiles()) }
+    var playingPath by remember { mutableStateOf<String?>(null) }
+    var player by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
+    DisposableEffect(Unit) {
+        onDispose { try { player?.release() } catch (_: Exception) { } }
+    }
+    fun playFile(file: java.io.File) {
+        try {
+            if (playingPath == file.absolutePath) {
+                try { player?.stop(); player?.release() } catch (_: Exception) { }
+                player = null; playingPath = null; return
+            }
+            try { player?.release() } catch (_: Exception) { }
+            val mp = android.media.MediaPlayer()
+            mp.setDataSource(file.absolutePath)
+            mp.prepare()
+            mp.start()
+            mp.setOnCompletionListener { playingPath = null; try { mp.release() } catch (_: Exception) { }; player = null }
+            player = mp
+            playingPath = file.absolutePath
+        } catch (_: Exception) {
+            playingPath = null
+            activity.toast("Could not play this recording")
+        }
+    }
+    fun fmtDuration(ms: Long): String {
+        val s = (ms / 1000).toInt()
+        return String.format("%02d:%02d", s / 60, s % 60)
+    }
+    fun fmtDate(ts: Long): String {
+        return java.text.SimpleDateFormat("MMM d, h:mm a", java.util.Locale.getDefault()).format(java.util.Date(ts))
+    }
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("Call Recordings", onBack)
+        if (files.isEmpty()) {
+            Column(Modifier.weight(1f).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                Icon(Icons.Filled.FiberManualRecord, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(48.dp))
+                Text("No recordings yet", fontWeight = FontWeight.SemiBold, fontSize = 16.sp, modifier = Modifier.padding(top = 12.dp))
+                Text("Turn on Auto Call Recording and your SIP calls will be saved here.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
+            }
+        } else {
+            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(files) { file ->
+                    val duration = recordingDurationMs(file)
+                    val isPlaying = playingPath == file.absolutePath
+                    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp)) {
+                        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("SIP Call Recording", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                Text(fmtDate(file.lastModified()) + " · " + fmtDuration(duration), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                            }
+                            FilledIconButton(onClick = { playFile(file) }, colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White)) {
+                                Icon(if (isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow, if (isPlaying) "Stop" else "Play")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun PermissionRow(name: String, desc: String, granted: Boolean, onRequest: () -> Unit) {
+    Card(onClick = onRequest, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp)) {
+        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(name, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(desc, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+            }
+            Text(if (granted) "Allowed" else "Denied", color = if (granted) Color(0xFF059669) else Color(0xFFDC2626), fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable private fun PermissionsScreen(activity: MainActivity, onBack: () -> Unit) {
+    val context = LocalContext.current
+    @Suppress("UNUSED_VARIABLE")
+    val resumeTick = activity.resumeTick
+    val isDefault = activity.isDefaultDialer()
+    val contactsOk = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+    val phoneOk = ContextCompat.checkSelfPermission(context, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED &&
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED
+    val micOk = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    val notifOk = if (android.os.Build.VERSION.SDK_INT >= 33) ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED else true
+    val overlayOk = android.provider.Settings.canDrawOverlays(context)
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("Dialer & Permissions", onBack)
+        LazyColumn(Modifier.weight(1f).padding(horizontal = 18.dp), contentPadding = PaddingValues(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = if (isDefault) Color(0xFFECFDF5) else MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(40.dp).clip(CircleShape).background(if (isDefault) Color(0xFF059669) else MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) {
+                                Icon(Icons.Filled.Check, null, tint = Color.White)
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(if (isDefault) "CallerX is Default Dialer" else "CallerX is not the default dialer", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                Text("Handles SIM 1, SIM 2 & SIP calls seamlessly", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                            }
+                        }
+                        Button(onClick = { activity.requestDefaultDialer() }, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))) {
+                            Text("Verify / Set as Default Phone App")
+                        }
+                    }
+                }
+            }
+            item { Text("SYSTEM PERMISSIONS", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp) }
+            item { PermissionRow("Contacts", "Match caller names & numbers", contactsOk) { activity.requestPermission(Manifest.permission.READ_CONTACTS) } }
+            item { PermissionRow("Phone & Call Logs", "Manage SIM 1, SIM 2 & history", phoneOk) { activity.requestPermission(Manifest.permission.CALL_PHONE, Manifest.permission.READ_CALL_LOG) } }
+            item { PermissionRow("Microphone", "Required for VoIP & call audio", micOk) { activity.requestPermission(Manifest.permission.RECORD_AUDIO) } }
+            item {
+                PermissionRow("Notifications", "Incoming call alerts & missed calls", notifOk) {
+                    if (android.os.Build.VERSION.SDK_INT >= 33) activity.requestPermission(Manifest.permission.POST_NOTIFICATIONS)
+                    else activity.toast("Notifications are always allowed on this Android version")
+                }
+            }
+            item { PermissionRow("Display Over Other Apps", "Show incoming call banner on lockscreen", overlayOk) { activity.openOverlaySettings() } }
+        }
+    }
+}
+
+@Composable private fun BlockedScreen(activity: MainActivity, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+    var input by remember { mutableStateOf("") }
+    var blocked by remember { mutableStateOf(loadBlocked(prefs)) }
+    fun saveBlocked(next: List<Pair<String, String>>) {
+        blocked = next
+        prefs.edit().putStringSet("blocked_numbers", next.map { "${it.first}|${it.second}" }.toSet()).apply()
+    }
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("Blocked Numbers", onBack)
+        Column(Modifier.weight(1f).padding(18.dp)) {
+            Text("Blocked callers cannot ring your SIM or SIP lines, and their SMS messages arrive silently.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(input, { input = it }, Modifier.weight(1f), placeholder = { Text("+8801XXXXXXXXX") }, singleLine = true)
+                Button(onClick = {
+                    val num = input.trim()
+                    if (num.isEmpty()) { activity.toast("Enter a phone number to block"); return@Button }
+                    if (blocked.any { it.first == num }) { activity.toast("Already blocked"); return@Button }
+                    saveBlocked(listOf(num to "Manually Blocked") + blocked)
+                    input = ""
+                    activity.toast("Blocked $num")
+                }, shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE11D48))) { Text("Block") }
+            }
+            Spacer(Modifier.height(16.dp))
+            if (blocked.isEmpty()) {
+                Text("No blocked numbers yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp))
+            } else {
+                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(blocked) { entry ->
+                        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp)) {
+                            Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(entry.first, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                    Text(entry.second, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                                }
+                                TextButton(onClick = {
+                                    saveBlocked(blocked.filter { it != entry })
+                                    activity.toast("Unblocked ${entry.first}")
+                                }) { Text("Unblock") }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun PowerScreen(activity: MainActivity, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+    var mode by remember { mutableStateOf(prefs.getString("power_mode", "Unrestricted") ?: "Unrestricted") }
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("Power Mode", onBack)
+        LazyColumn(Modifier.weight(1f).padding(horizontal = 18.dp), contentPadding = PaddingValues(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(PowerModes.size) { idx ->
+                val m = PowerModes[idx]
+                val isSelected = mode == m.first
+                Card(
+                    onClick = {
+                        mode = m.first
+                        prefs.edit().putString("power_mode", m.first).apply()
+                        activity.toast("Power Mode: ${m.first}")
+                    },
+                    colors = CardDefaults.cardColors(containerColor = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = .08f) else MaterialTheme.colorScheme.surface),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f)),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.Top) {
+                        Column(Modifier.weight(1f)) {
+                            Text(m.second, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text(m.third, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+                        }
+                        RadioButton(selected = isSelected, onClick = {
+                            mode = m.first
+                            prefs.edit().putString("power_mode", m.first).apply()
+                            activity.toast("Power Mode: ${m.first}")
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun UpdateScreen(activity: MainActivity, onBack: () -> Unit) {
+    val context = LocalContext.current
+    var checking by remember { mutableStateOf(false) }
+    var statusText by remember { mutableStateOf<String?>(null) }
+    var latestTag by remember { mutableStateOf<String?>(null) }
+    var latestUrl by remember { mutableStateOf<String?>(null) }
+    var latestNotes by remember { mutableStateOf("") }
+    val pkg = try { context.packageManager.getPackageInfo(context.packageName, 0) } catch (_: Exception) { null }
+    val versionName = pkg?.versionName ?: "?"
+    val versionCode = if (pkg != null && android.os.Build.VERSION.SDK_INT >= 28) pkg.longVersionCode else pkg?.versionCode?.toLong() ?: 0L
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("App Update", onBack)
+        Column(Modifier.weight(1f).padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(Modifier.size(64.dp).clip(RoundedCornerShape(20.dp)).background(MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) {
+                Text("C", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+            }
+            Text("CallerX VoIP & Dialer", fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.padding(top = 12.dp))
+            Text("Installed Version: v$versionName (Build $versionCode)", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 4.dp))
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth().padding(top = 24.dp)) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(statusText ?: "You are up to date!", color = if (latestTag != null && isNewerVersion(latestTag!!, versionName)) MaterialTheme.colorScheme.primary else Color(0xFF059669), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text(if (latestNotes.isNotBlank()) latestNotes.take(600) else "• Enhanced Dual-SIM & SIP call badges
+• Low-latency Opus HD audio codec support
+• Automatic call recording & cloud backup", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                }
+            }
+            if (latestTag != null && isNewerVersion(latestTag!!, versionName) && latestUrl != null) {
+                Button(onClick = {
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(latestUrl))
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(intent)
+                    } catch (_: Exception) { activity.toast("Could not open the download page") }
+                }, Modifier.fillMaxWidth().padding(top = 16.dp).height(52.dp), shape = RoundedCornerShape(16.dp)) { Text("Download ${latestTag}") }
+            }
+            Button(onClick = {
+                checking = true
+                statusText = null
+                Thread {
+                    val result = fetchLatestRelease()
+                    activity.runOnUiThread {
+                        checking = false
+                        if (result == null) {
+                            statusText = "Could not check for updates. Check your connection and try again."
+                            activity.toast("Update check failed")
+                        } else {
+                            latestTag = result.first
+                            latestUrl = result.second
+                            latestNotes = result.third
+                            val newer = isNewerVersion(result.first, versionName)
+                            statusText = if (newer) "Update available: ${result.first}" else "Latest version ${result.first} is installed!"
+                            activity.toast(if (newer) "Update available: ${result.first}" else "CallerX $versionName is the latest version")
+                        }
+                    }
+                }.start()
+            }, Modifier.fillMaxWidth().padding(top = 20.dp).height(52.dp), shape = RoundedCornerShape(16.dp), enabled = !checking) {
+                Text(if (checking) "Checking server..." else "Check for Updates")
+            }
+        }
+    }
+}
+
+// --- helpers for the new screens ---
+
+private fun backupNow(context: Context): Boolean {
+    return try {
+        val contacts = loadContacts(context)
+        val calls = loadCallLog(context)
+        val arr = org.json.JSONArray()
+        contacts.forEach { p -> arr.put(org.json.JSONObject().put("type", "contact").put("name", p.name).put("number", p.number)) }
+        calls.forEach { p -> arr.put(org.json.JSONObject().put("type", "call").put("name", p.name).put("number", p.number).put("time", p.time).put("source", p.source)) }
+        val dir = java.io.File(context.filesDir, "backup").apply { mkdirs() }
+        val file = java.io.File(dir, "callerx-backup-${System.currentTimeMillis()}.json")
+        file.writeText(arr.toString(2))
+        true
+    } catch (_: Exception) { false }
+}
+
+private fun loadBlocked(prefs: android.content.SharedPreferences): List<Pair<String, String>> {
+    val set = prefs.getStringSet("blocked_numbers", emptySet()) ?: emptySet()
+    return set.map { entry ->
+        val parts = entry.split("|", limit = 2)
+        (parts.getOrNull(0) ?: "") to (parts.getOrNull(1) ?: "Manually Blocked")
+    }.filter { it.first.isNotBlank() }.sortedBy { it.first }
+}
+
+private fun recordingDurationMs(file: java.io.File): Long {
+    return try {
+        val mmr = android.media.MediaMetadataRetriever()
+        mmr.setDataSource(file.absolutePath)
+        val d = mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        mmr.release()
+        d
+    } catch (_: Exception) { 0L }
+}
+
+private fun fetchLatestRelease(): Triple<String, String, String>? {
+    return try {
+        val url = java.net.URL("https://api.github.com/repos/mdreanislam01-ai/REAN-SIP/releases/latest")
+        val conn = url.openConnection() as java.net.HttpURLConnection
+        conn.connectTimeout = 8000
+        conn.readTimeout = 8000
+        conn.setRequestProperty("Accept", "application/vnd.github+json")
+        conn.setRequestProperty("User-Agent", "CallerX")
+        val text = conn.inputStream.bufferedReader().readText()
+        conn.disconnect()
+        val obj = org.json.JSONObject(text)
+        Triple(obj.optString("tag_name", ""), obj.optString("html_url", ""), obj.optString("body", ""))
+    } catch (_: Exception) { null }
+}
+
+private fun isNewerVersion(latest: String, current: String): Boolean {
+    fun parts(v: String) = v.trim().removePrefix("callerx-v").removePrefix("callerx-").removePrefix("v").split(".").mapNotNull { it.filter { ch -> ch.isDigit() }.toIntOrNull() }
+    val l = parts(latest)
+    val c = parts(current)
+    for (i in 0 until maxOf(l.size, c.size)) {
+        val lv = l.getOrNull(i) ?: 0
+        val cv = c.getOrNull(i) ?: 0
+        if (lv != cv) return lv > cv
+    }
+    return false
 }
