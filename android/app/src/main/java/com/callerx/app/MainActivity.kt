@@ -93,7 +93,7 @@ private val Palette = listOf(
     Color(0xFFC34F86), Color(0xFF455FC2), Color(0xFF168C8C), Color(0xFFCA4545), Color(0xFF68717D)
 )
 private val PaletteNames = listOf("Blue", "Green", "Purple", "Orange", "Pink", "Indigo", "Teal", "Red", "Gray")
-private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "", val dur: Long = 0, val ts: Long = 0L)
+data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "", val dur: Long = 0, val ts: Long = 0L)
 data class SipAccount(val name: String, val user: String, val pass: String, val domain: String, val port: String, val transport: String, val proxy: String, val displayName: String, val autoBoot: Boolean, val enabled: Boolean, val isDefault: Boolean)
 
 private fun loadContacts(context: Context): List<Person> {
@@ -168,7 +168,7 @@ private val T9_MAP = mapOf(
     't' to '8', 'u' to '8', 'v' to '8', 'w' to '9', 'x' to '9', 'y' to '9', 'z' to '9'
 )
 private fun digitsOnly(s: String) = s.filter { it.isDigit() }
-private fun toT9(s: String) = buildString { for (ch in s.lowercase()) { T9_MAP[ch]?.let { append(it) } ?: if (ch.isDigit()) append(ch) } }
+private fun toT9(s: String) = buildString { for (ch in s.lowercase()) { val d = T9_MAP[ch]; if (d != null) append(d) else if (ch.isDigit()) append(ch) } }
 
 private fun matchesQuery(name: String, number: String, rawQuery: String): Boolean {
     val q = rawQuery.trim()
