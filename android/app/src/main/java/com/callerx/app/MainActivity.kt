@@ -835,31 +835,17 @@ private fun CallerXApp(activity: MainActivity) {
     }
     val label = if (medium == "SIP") "SIP VoIP" else medium
     Surface(shape = RoundedCornerShape(6.dp), color = bg, border = androidx.compose.foundation.BorderStroke(1.dp, border)) {
-        Row(Modifier.padding(horizontal = 6.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
-            when (medium) {
-                "SIM 1" -> Box(Modifier.size(12.dp).clip(RoundedCornerShape(3.dp)).background(Color(0xFF2563EB)), contentAlignment = Alignment.Center) { Text("1", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold) }
-                "SIM 2" -> Box(Modifier.size(12.dp).clip(RoundedCornerShape(3.dp)).background(Color(0xFF0D9488)), contentAlignment = Alignment.Center) { Text("2", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold) }
-                "SIP", "SIP VoIP" -> Icon(Icons.Filled.Public, null, tint = fg, modifier = Modifier.size(10.dp))
-                "WhatsApp" -> Icon(Icons.Filled.Message, null, tint = fg, modifier = Modifier.size(10.dp))
-                "Telegram" -> Icon(Icons.Filled.Send, null, tint = fg, modifier = Modifier.size(10.dp))
-            }
-            Spacer(Modifier.width(3.dp))
-            Text(label, color = fg, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
-        }
+        Text(label, color = fg, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
     }
 }
 
 @Composable private fun CallRow(person: Person, color: Color, onOpen: () -> Unit, onCall: () -> Unit) {
     val isMissed = person.callType == CallLog.Calls.MISSED_TYPE
     val isOutgoing = person.callType == CallLog.Calls.OUTGOING_TYPE
-    val dirIcon = if (isMissed) Icons.Filled.PhoneMissed else if (isOutgoing) Icons.Filled.CallMade else Icons.Filled.CallReceived
-    val dirColor = if (isMissed) Color(0xFFE11D48) else if (isOutgoing) Color(0xFF2563EB) else Color(0xFF059669)
     val dirLabel = if (isMissed) "Missed call" else if (isOutgoing) "Outgoing call" else "Incoming call"
     Column(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth().clickable(onClick = onOpen).padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(40.dp).clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .6f)), contentAlignment = Alignment.Center) {
-                Icon(dirIcon, dirLabel, tint = dirColor, modifier = Modifier.size(20.dp))
-            }
+            Avatar(person.initials, contactColor(person.name), 48, Modifier.clickable(onClick = onOpen))
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -879,7 +865,7 @@ private fun CallerXApp(activity: MainActivity) {
                 IconButton(onClick = onCall, modifier = Modifier.size(36.dp)) { Icon(Icons.Filled.Call, "Call", tint = color, modifier = Modifier.size(20.dp)) }
             }
         }
-        HorizontalDivider(Modifier.padding(start = 68.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .42f))
+        HorizontalDivider(Modifier.padding(start = 76.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .42f))
     }
 }
 
