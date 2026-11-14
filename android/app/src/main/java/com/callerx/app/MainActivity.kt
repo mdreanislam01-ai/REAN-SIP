@@ -546,6 +546,7 @@ class MainActivity : ComponentActivity() {
             existing.add("${System.currentTimeMillis()}|$number|$type|$duration|$name")
             val capped = existing.sortedByDescending { it.substringBefore("|").toLongOrNull() ?: 0L }.take(100).toSet()
             prefs.edit().putStringSet("sip_call_log", capped).apply()
+            resumeTick++
         } catch (_: Exception) { }
     }
 
@@ -676,7 +677,6 @@ private fun CallerXApp(activity: MainActivity) {
     var muted by remember { mutableStateOf(false) }
     var speaker by remember { mutableStateOf(false) }
     var showCallSheet by remember { mutableStateOf(false) }
-    var afterCall by remember { mutableStateOf(false) }
     var showError by remember { mutableStateOf(false) }
     var showPermissionWelcome by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -763,9 +763,7 @@ private fun CallerXApp(activity: MainActivity) {
                 onMute = { muted = !muted; activity.toggleMute(muted) }, onSpeaker = { speaker = !speaker; activity.setSpeaker(speaker) },
                 onHold = { held -> activity.toggleHold(held) }, onAnswer = { if (isCellCall) activity.answerCellCall() else activity.answerCall() },
                 onDecline = { if (isCellCall) activity.endCellCall() else activity.endCall(); screen = "home" },
-                onEnd = { if (isCellCall) activity.endCellCall() else activity.endCall(); afterCall = true; screen = "summary" })
-        } else if (screen == "summary") {
-            SummaryScreen(activity.activeCallName, activity.activeNumber, onDone = { screen = "home"; tab = "Calls" })
+                onEnd = { if (isCellCall) activity.endCellCall() else activity.endCall(); activity.resumeTick++; screen = "home"; tab = "Calls" })
         } else if (screen == "sip") {
             SipScreen(activity.registrationMessage, sipUsername, { sipUsername = it }, sipPassword, { sipPassword = it }, sipDomain, { sipDomain = it }, sipPort, { sipPort = it }, transport, { transport = it }, sipDisplayName, { sipDisplayName = it },
                 onBack = { screen = "settings" }, onRegister = {
@@ -1749,12 +1747,6 @@ private fun CallerXApp(activity: MainActivity) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         FilledIconButton(onClick = onClick, colors = IconButtonDefaults.filledIconButtonColors(containerColor = if (selected) Color(0xFF2864DC) else if (dark) Color(0xFF1E2B3D) else Color(0xFFE9EDF3), contentColor = if (selected) Color.White else if (dark) Color.White else Color(0xFF334155))) { Icon(icon, label) }
         Text(label, color = secondaryText, fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp))
-    }
-}
-@Composable private fun SummaryScreen(name: String, number: String, onDone: () -> Unit) {
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Icon(Icons.Filled.CheckCircle, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(56.dp)); Spacer(Modifier.height(14.dp)); Text("Call ended", fontSize = 24.sp, fontWeight = FontWeight.Bold); Text(name, modifier = Modifier.padding(top = 8.dp)); Text(number, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(22.dp)); Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) { Column(Modifier.padding(18.dp)) { Text("Call notes", fontWeight = FontWeight.Bold); Text("Add a note about this call", modifier = Modifier.padding(top = 7.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) } }; Spacer(Modifier.height(20.dp)); Button(onClick = onDone) { Text("Done") }
     }
 }
 @Composable private fun ProfileScreen(onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit) {
