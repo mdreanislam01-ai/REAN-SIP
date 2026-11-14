@@ -2,6 +2,10 @@ package com.callerx.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.role.RoleManager
+import android.content.Intent
+import android.net.Uri
+import android.telecom.TelecomManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -60,15 +64,74 @@ class MainActivity : ComponentActivity() {
     var activeCallName by mutableStateOf("")
     private var activeCall: Call? = null
     var errorMessage by mutableStateOf("")
+    var dialIntentNumber by mutableStateOf("")
+    var callUiRequested by mutableStateOf(false)
+    var dialerRoleTick by mutableIntStateOf(0)
+    private var pendingCellNumber = ""
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startSipCall(activeNumber, activeCallName) else errorMessage = "Microphone permission is needed for SIP audio calls."
+    }
+    private val cellPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) placeCellCall(pendingCellNumber) else errorMessage = "Phone permission is needed to start a cellular call."
+    }
+    private val runtimePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+        val denied = results.filterValues { !it }.keys
+        if (denied.isNotEmpty()) errorMessage = "Some permissions were declined. You can enable them later in Android Settings."
+    }
+    private val defaultDialerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { dialerRoleTick++ }
+
+    fun requestStartupPermissions() {
+        val permissions = mutableListOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_CONTACTS, Manifest.permission.RECORD_AUDIO)
+        if (android.os.Build.VERSION.SDK_INT >= 33) permissions += Manifest.permission.POST_NOTIFICATIONS
+        val missing = permissions.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) runtimePermissionLauncher.launch(missing.toTypedArray())
+    }
+
+    fun isDefaultDialer(): Boolean {
+        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) getSystemService(RoleManager::class.java).isRoleHeld(RoleManager.ROLE_DIALER)
+        else (getSystemService(TELECOM_SERVICE) as TelecomManager).defaultDialerPackage == packageName
+    }
+
+    fun requestDefaultDialer() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val roles = getSystemService(RoleManager::class.java)
+            if (roles.isRoleHeld(RoleManager.ROLE_DIALER)) return
+            defaultDialerLauncher.launch(roles.createRequestRoleIntent(RoleManager.ROLE_DIALER))
+        } else {
+            @Suppress("DEPRECATION")
+            defaultDialerLauncher.launch(Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER).putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, packageName))
+        }
+    }
+
+    fun startCellCall(number: String) {
+        val cleaned = number.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+        if (cleaned.isBlank()) { errorMessage = "Enter a phone number first."; return }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            pendingCellNumber = cleaned
+            cellPermission.launch(Manifest.permission.CALL_PHONE)
+        } else placeCellCall(cleaned)
+    }
+
+    private fun placeCellCall(number: String) {
+        try { startActivity(Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number, null))) }
+        catch (e: Exception) { errorMessage = "Could not start cellular call: ${e.message ?: "check phone permission"}" }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        intent?.data?.schemeSpecificPart?.let { dialIntentNumber = it }
+        callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
         initializeLinphone()
         setContent { CallerXApp(this) }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.data?.schemeSpecificPart?.let { dialIntentNumber = it }
+        callUiRequested = intent.getBooleanExtra("callerx_open_call", false)
     }
 
     private fun initializeLinphone() {
@@ -146,7 +209,7 @@ class MainActivity : ComponentActivity() {
         val c = core ?: return
         try {
             val clean = number.trim().replace(" ", "").replace("-", "")
-            val domain = c.defaultProxyConfig?.identityAddress?.domain.orEmpty()
+            val domain = c.defaultAccount?.params?.identityAddress?.domain.orEmpty()
             val target = if (clean.startsWith("sip:") || clean.contains("@")) clean else "sip:$clean@$domain"
             val address = c.interpretUrl(target)
             if (address == null) { errorMessage = "Enter a valid SIP address or register a SIP account first."; return }
@@ -157,9 +220,15 @@ class MainActivity : ComponentActivity() {
     }
 
     fun answerCall() { try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
+    fun answerCellCall() { try { TelecomCallBridge.currentCall?.answer(0) } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
+    fun endCellCall() { try { TelecomCallBridge.currentCall?.disconnect() } catch (e: Exception) { errorMessage = "Could not end call: ${e.message}" } }
     fun endCall() { try { core?.currentCall?.terminate() ?: core?.terminateAllCalls() } catch (_: Exception) { core?.terminateAllCalls() } }
-    fun toggleMute(muted: Boolean) { core?.currentCall?.microphoneMuted = muted }
+    fun toggleMute(muted: Boolean) {
+        if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setMuted(muted); return }
+        core?.currentCall?.microphoneMuted = muted
+    }
     fun setSpeaker(enabled: Boolean) {
+        if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setAudioRoute(if (enabled) android.telecom.CallAudioState.ROUTE_SPEAKER else android.telecom.CallAudioState.ROUTE_EARPIECE); return }
         try {
             val c = core ?: return
             val speaker = c.audioDevices.firstOrNull { if (enabled) it.type == AudioDevice.Type.Speaker else it.type == AudioDevice.Type.Earpiece }
@@ -196,6 +265,7 @@ private fun CallerXApp(activity: MainActivity) {
     var showCallSheet by remember { mutableStateOf(false) }
     var afterCall by remember { mutableStateOf(false) }
     var showError by remember { mutableStateOf(false) }
+    var showPermissionWelcome by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
     LaunchedEffect(Unit) {
@@ -205,16 +275,28 @@ private fun CallerXApp(activity: MainActivity) {
         transport = prefs.getString("transport", "UDP") ?: "UDP"
         dark = prefs.getBoolean("dark", false)
         accent = prefs.getInt("accent", 0)
+        showPermissionWelcome = !prefs.getBoolean("permission-intro-seen", false)
     }
+    LaunchedEffect(activity.dialIntentNumber) { if (activity.dialIntentNumber.isNotBlank()) { number = activity.dialIntentNumber; screen = "dialer"; activity.dialIntentNumber = "" } }
     LaunchedEffect(activity.errorMessage) { if (activity.errorMessage.isNotBlank()) showError = true }
-    LaunchedEffect(activity.callState) { if (activity.callState == "Incoming SIP call") screen = "call" }
+    LaunchedEffect(activity.callState, activity.callUiRequested, TelecomCallBridge.state) {
+        if (activity.callState == "Incoming SIP call" || activity.callUiRequested || TelecomCallBridge.state == "Incoming cellular call") {
+            screen = "call"
+            if (TelecomCallBridge.currentCall != null) { activity.activeNumber = TelecomCallBridge.remoteNumber; activity.activeCallName = "Phone call" }
+            activity.callUiRequested = false
+        }
+    }
     val color = Palette[accent.coerceIn(Palette.indices)]
     val scheme = if (dark) darkColorScheme(primary = color, secondary = color, background = Color(0xFF101318), surface = Color(0xFF1B2027))
         else lightColorScheme(primary = color, secondary = color, background = Color(0xFFF6F8FA), surface = Color.White)
+    val isCellCall = TelecomCallBridge.currentCall != null
+    val visibleCallState = if (isCellCall) TelecomCallBridge.state else activity.callState
+    val visibleCallName = if (isCellCall) "Phone call" else activity.activeCallName.ifBlank { selected?.name ?: "CallerX contact" }
+    val visibleCallNumber = if (isCellCall) TelecomCallBridge.remoteNumber else activity.activeNumber.ifBlank { selected?.number ?: number }
     MaterialTheme(colorScheme = scheme) {
         if (screen == "call") {
-            NativeCallScreen(activity, activity.activeCallName.ifBlank { selected?.name ?: "CallerX contact" }, activity.activeNumber.ifBlank { selected?.number ?: number }, activity.callState, muted, speaker,
-                onMute = { muted = !muted; activity.toggleMute(muted) }, onSpeaker = { speaker = !speaker; activity.setSpeaker(speaker) }, onAnswer = { activity.answerCall() }, onEnd = { activity.endCall(); afterCall = true; screen = "summary" })
+            NativeCallScreen(activity, visibleCallName, visibleCallNumber, visibleCallState, muted, speaker,
+                onMute = { muted = !muted; activity.toggleMute(muted) }, onSpeaker = { speaker = !speaker; activity.setSpeaker(speaker) }, onAnswer = { if (isCellCall) activity.answerCellCall() else activity.answerCall() }, onEnd = { if (isCellCall) activity.endCellCall() else activity.endCall(); afterCall = true; screen = "summary" })
         } else if (screen == "summary") {
             SummaryScreen(activity.activeCallName, activity.activeNumber, onDone = { screen = "home"; tab = "Calls" })
         } else if (screen == "sip") {
@@ -230,7 +312,7 @@ private fun CallerXApp(activity: MainActivity) {
         } else if (screen == "theme") {
             ThemeScreen(accent, { accent = it; prefs.edit().putInt("accent", it).apply() }, onBack = { screen = "settings" })
         } else if (screen == "settings") {
-            SettingsScreen(dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" }, onBack = { screen = "home" })
+            SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" }, onBack = { screen = "home" })
         } else if (selected != null) {
             ContactDetailScreen(selected!!, onBack = { selected = null }, onCall = { showCallSheet = true })
         } else {
@@ -245,7 +327,7 @@ private fun CallerXApp(activity: MainActivity) {
             ) { padding ->
                 Column(Modifier.fillMaxSize().padding(padding)) {
                     if (tab == "Settings") {
-                        SettingsScreen(dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" }, onBack = null)
+                        SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() }, onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" }, onBack = null)
                     } else {
                         Header(tab, activity.registrationMessage, searchOpen, { searchOpen = !searchOpen }, query, { query = it }, { screen = "profile" }, { screen = "sip" })
                         if (tab == "Calls") {
@@ -278,18 +360,26 @@ private fun CallerXApp(activity: MainActivity) {
             }
         }
         if (showCallSheet && (screen == "home" || selected != null)) {
-            AlertDialog(onDismissRequest = { showCallSheet = false }, title = { Text("Call with…") }, text = { Column { Text(selected?.number ?: number, color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(14.dp)); listOf("SIP / VoIP", "SIM 1", "SIM 2").forEach { method -> TextButton(onClick = {
+            AlertDialog(onDismissRequest = { showCallSheet = false }, title = { Text("Call with…") }, text = { Column { Text(selected?.number ?: number, color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(14.dp)); (listOf("SIP / VoIP") + listOf("SIM 1", "SIM 2").filter { prefs.getBoolean("setting:$it", false) }).forEach { method -> TextButton(onClick = {
                 showCallSheet = false
-                if (method == "SIP / VoIP") { activity.activeNumber = selected?.number ?: number; activity.activeCallName = selected?.name ?: "Dialed number"; activity.startSipCall(activity.activeNumber, activity.activeCallName); screen = "call" }
-                else { activity.errorMessage = "Cellular SIM calling needs Android default-dialer integration; this build is configured for SIP calls."; showError = true }
+                val dialedNumber = selected?.number ?: number
+                if (method == "SIP / VoIP") { activity.activeNumber = dialedNumber; activity.activeCallName = selected?.name ?: "Dialed number"; activity.startSipCall(activity.activeNumber, activity.activeCallName); screen = "call" }
+                else { activity.startCellCall(dialedNumber); screen = "home" }
             }) { Icon(Icons.Filled.Call, null, tint = color); Spacer(Modifier.width(10.dp)); Text(method) } } } }, confirmButton = { TextButton(onClick = { showCallSheet = false }) { Text("Cancel") } })
         }
         if (showError && activity.errorMessage.isNotBlank()) AlertDialog(onDismissRequest = { showError = false; activity.errorMessage = "" }, title = { Text("CallerX") }, text = { Text(activity.errorMessage) }, confirmButton = { TextButton(onClick = { showError = false; activity.errorMessage = "" }) { Text("OK") } })
+        if (showPermissionWelcome) AlertDialog(
+            onDismissRequest = { showPermissionWelcome = false; prefs.edit().putBoolean("permission-intro-seen", true).apply() },
+            title = { Text("Allow CallerX permissions") },
+            text = { Text("Phone access lets CallerX start SIM calls, call-log and contacts access enables device data, and microphone access enables SIP audio. Android will ask you separately for each permission.") },
+            confirmButton = { TextButton(onClick = { showPermissionWelcome = false; prefs.edit().putBoolean("permission-intro-seen", true).apply(); activity.requestStartupPermissions() }) { Text("Continue") } },
+            dismissButton = { TextButton(onClick = { showPermissionWelcome = false; prefs.edit().putBoolean("permission-intro-seen", true).apply() }) { Text("Not now") } }
+        )
     }
 }
 
 @Composable private fun Header(tab: String, sip: String, searchOpen: Boolean, onSearch: () -> Unit, query: String, onQuery: (String) -> Unit, onProfile: () -> Unit, onSip: () -> Unit) {
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 16.dp, vertical = 12.dp)) {
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(start = 16.dp, top = 28.dp, end = 16.dp, bottom = 12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onProfile) { Avatar("R", MaterialTheme.colorScheme.primary, 36) }
             if (searchOpen) OutlinedTextField(query, onQuery, Modifier.weight(1f).height(56.dp), placeholder = { Text("Search name or number") }, singleLine = true, shape = RoundedCornerShape(22.dp))
@@ -340,11 +430,12 @@ private fun CallerXApp(activity: MainActivity) {
     }
 }
 
-@Composable private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) } }
+@Composable private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) } }
 
-@Composable private fun SettingsScreen(dark: Boolean, onDark: (Boolean) -> Unit, onSip: () -> Unit, onTheme: () -> Unit, onProfile: () -> Unit, onBack: (() -> Unit)?) {
+@Composable private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boolean) -> Unit, onSip: () -> Unit, onTheme: () -> Unit, onProfile: () -> Unit, onBack: (() -> Unit)?) {
+    val isDefaultDialer = activity.dialerRoleTick >= 0 && activity.isDefaultDialer()
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        if (onBack != null) TopBar("Settings", onBack) else Text("Settings", Modifier.padding(18.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        if (onBack != null) TopBar("Settings", onBack) else Text("Settings", Modifier.padding(start = 18.dp, top = 36.dp, end = 18.dp, bottom = 18.dp), fontSize = 22.sp, fontWeight = FontWeight.Bold)
         LazyColumn {
             item { SectionTitle("ACCOUNT") }; item { SettingRow(Icons.Filled.Person, "My Profile", "Manage your account", onProfile) }
             item { SectionTitle("VOIP & SIP") }; item { SettingRow(Icons.Filled.Cloud, "SIP Account", "Register your VoIP account", onSip) }; item { SettingRow(Icons.Filled.Security, "VoIP Security", "Transport and encryption options", {}) }
@@ -352,15 +443,19 @@ private fun CallerXApp(activity: MainActivity) {
             item { SectionTitle("CALLS") }; item { SettingRow(Icons.Filled.VerifiedUser, "Caller ID", "", {}, true) }; item { SettingRow(Icons.Filled.CallMade, "After Call", "", {}, true) }; item { SettingRow(Icons.Filled.Mic, "Auto Record Calls", "", {}, true) }; item { SettingRow(Icons.Filled.MusicNote, "Call Recordings", "", {}) }; item { SettingRow(Icons.Filled.Block, "Block List", "", {}) }
             item { SectionTitle("SIM MANAGEMENT") }; item { SettingRow(Icons.Filled.SimCard, "SIM 1", "", {}, true) }; item { SettingRow(Icons.Filled.SimCard, "SIM 2", "", {}, true) }; item { SettingRow(Icons.Filled.SwapCalls, "Ask every time before call", "", {}, true) }
             item { SectionTitle("NOTIFICATIONS") }; listOf("Spam Call Alerts", "Missed Call Alerts", "Only Spam Notifications").forEach { item { SettingRow(Icons.Filled.NotificationsActive, it, "", {}, true) } }
-            item { SectionTitle("GENERAL") }; item { SettingRow(Icons.Filled.Palette, "Theme color", "Choose your accent", onTheme) }; item { SettingRow(Icons.Filled.DarkMode, "Dark Mode", "", { onDark(!dark) }, true, dark) }
+            item { SectionTitle("GENERAL") }; item { SettingRow(Icons.Filled.PhoneAndroid, "Set as Default Dialer", if (isDefaultDialer) "CallerX is your default dialer" else "Choose CallerX for SIM calls", activity::requestDefaultDialer) }; item { SettingRow(Icons.Filled.Palette, "Theme color", "Choose your accent", onTheme) }; item { SettingRow(Icons.Filled.DarkMode, "Dark Mode", "", { onDark(!dark) }, true, dark) }
         }
     }
 }
 @Composable private fun SettingRow(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit, toggle: Boolean = false, checked: Boolean = false) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 17.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+    var value by remember(title, checked) { mutableStateOf(prefs.getBoolean("setting:$title", checked)) }
+    val activate = { if (toggle) { value = !value; prefs.edit().putBoolean("setting:$title", value).apply() }; onClick() }
+    Row(Modifier.fillMaxWidth().clickable { activate() }.padding(horizontal = 17.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(38.dp).clip(RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.primary.copy(alpha = .11f)), contentAlignment = Alignment.Center) { Icon(icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp)) }
         Spacer(Modifier.width(13.dp)); Column(Modifier.weight(1f)) { Text(title, fontWeight = FontWeight.Medium, fontSize = 14.sp); if (subtitle.isNotBlank()) Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp) }
-        if (toggle) Switch(checked, onCheckedChange = { onClick() }) else Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (toggle) Switch(value, onCheckedChange = { checkedValue -> value = checkedValue; prefs.edit().putBoolean("setting:$title", value).apply(); onClick() }) else Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
     HorizontalDivider(Modifier.padding(start = 68.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .38f))
 }
