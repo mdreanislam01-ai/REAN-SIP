@@ -6,6 +6,9 @@ import android.app.role.RoleManager
 import android.content.Intent
 import android.net.Uri
 import android.telecom.TelecomManager
+import android.telecom.PhoneAccount
+import android.telecom.PhoneAccountHandle
+import android.telephony.SubscriptionManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.provider.ContactsContract
@@ -92,11 +95,12 @@ class MainActivity : ComponentActivity() {
     var dialerRoleTick by mutableIntStateOf(0)
     var resumeTick by mutableIntStateOf(0)
     private var pendingCellNumber = ""
+    private var pendingCellSlot = 0
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startSipCall(activeNumber, activeCallName) else errorMessage = "Microphone permission is needed for SIP audio calls."
     }
     private val cellPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) placeCellCall(pendingCellNumber) else errorMessage = "Phone permission is needed to start a cellular call."
+        if (granted) placeCellCall(pendingCellNumber, pendingCellSlot) else errorMessage = "Phone permission is needed to start a cellular call."
     }
     private val runtimePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
         val denied = results.filterValues { !it }.keys
@@ -138,18 +142,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun startCellCall(number: String) {
+    fun startCellCall(number: String, simSlot: Int) {
         val cleaned = number.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
         if (cleaned.isBlank()) { errorMessage = "Enter a phone number first."; return }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
-            pendingCellNumber = cleaned
+            pendingCellNumber = cleaned; pendingCellSlot = simSlot
             cellPermission.launch(Manifest.permission.CALL_PHONE)
-        } else placeCellCall(cleaned)
+        } else placeCellCall(cleaned, simSlot)
     }
 
-    private fun placeCellCall(number: String) {
-        try { startActivity(Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number, null))) }
-        catch (e: Exception) { errorMessage = "Could not start cellular call: ${e.message ?: "check phone permission"}" }
+    private fun placeCellCall(number: String, simSlot: Int) {
+        try {
+            val telecom = getSystemService(TelecomManager::class.java)
+            val simAccounts = telecom.callCapablePhoneAccounts.filter { handle ->
+                telecom.getPhoneAccount(handle)?.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION) == true
+            }
+            if (simAccounts.isEmpty()) { errorMessage = "No active SIM calling account was found. Check that the SIM is enabled and CallerX has Phone permission."; return }
+            val subscriptions = try { getSystemService(SubscriptionManager::class.java).activeSubscriptionInfoList.orEmpty() } catch (_: SecurityException) { emptyList() }
+            val orderedAccounts = simAccounts.sortedBy { handle -> subscriptions.firstOrNull { it.subscriptionId == handle.id.toIntOrNull() }?.simSlotIndex ?: Int.MAX_VALUE }
+            val subId = subscriptions.firstOrNull { it.simSlotIndex == simSlot }?.subscriptionId
+            val account = if (subId != null) simAccounts.firstOrNull { it.id.toIntOrNull() == subId }
+                ?: orderedAccounts.getOrNull(simSlot) else orderedAccounts.getOrNull(simSlot)
+            if (account == null) { errorMessage = "SIM ${simSlot + 1} is not available. Check the SIM is inserted and enabled."; return }
+            val extras = Bundle().apply { putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account) }
+            telecom.placeCall(Uri.fromParts("tel", number, null), extras)
+        } catch (e: Exception) { errorMessage = "Could not start SIM ${simSlot + 1} call: ${e.message ?: "check SIM and Phone permission"}" }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -424,7 +441,7 @@ private fun CallerXApp(activity: MainActivity) {
                 showCallSheet = false
                 val dialedNumber = selected?.number ?: number
                 if (method == "SIP / VoIP") { activity.activeNumber = dialedNumber; activity.activeCallName = selected?.name ?: "Dialed number"; activity.startSipCall(activity.activeNumber, activity.activeCallName); screen = "call" }
-                else { activity.startCellCall(dialedNumber); screen = "home" }
+                else { activity.startCellCall(dialedNumber, if (method == "SIM 2") 1 else 0); screen = "home" }
             }) { Icon(Icons.Filled.Call, null, tint = color); Spacer(Modifier.width(10.dp)); Text(method) } } } }, confirmButton = { TextButton(onClick = { showCallSheet = false }) { Text("Cancel") } })
         }
         if (showError && activity.errorMessage.isNotBlank()) AlertDialog(onDismissRequest = { showError = false; activity.errorMessage = "" }, title = { Text("CallerX") }, text = { Text(activity.errorMessage) }, confirmButton = { TextButton(onClick = { showError = false; activity.errorMessage = "" }) { Text("OK") } })
