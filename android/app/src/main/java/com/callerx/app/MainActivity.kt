@@ -29,7 +29,9 @@ import java.util.Date
 import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
@@ -833,6 +835,43 @@ private fun CallerXApp(activity: MainActivity) {
     var accountToDelete by remember { mutableIntStateOf(-1) }
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+
+    /* ---------- Back button: never leave the app, always step back one level ---------- */
+    var lastBackPress by remember { mutableStateOf(0L) }
+    fun goHome(to: String = "Calls") { screen = "home"; tab = to; searchOpen = false; query = "" }
+    BackHandler(enabled = true) {
+        when {
+            // close any open sheet first
+            showCallSheet -> showCallSheet = false
+            showRouteDialog -> showRouteDialog = false
+            showDialerDialog -> showDialerDialog = false
+            showError -> { showError = false; activity.errorMessage = "" }
+            showWelcome -> { showWelcome = false; prefs.edit().putBoolean("permission-intro-seen", true).apply() }
+
+            // ongoing / ringing call: back keeps the call alive and shows the call log
+            screen == "call" -> goHome("Calls")
+
+            // one step back inside each section
+            screen == "sipform" -> screen = "sip"
+            screen == "sip" || screen == "blocked" || screen == "theme" || screen == "profile" -> screen = "settings"
+            screen == "settings" -> goHome("Calls")
+            screen == "contact" -> { selected = null; goHome(tab) }
+            screen == "dialer" -> goHome("Calls")
+
+            // home: close search, then jump to Calls tab, then minimise (do not exit)
+            screen == "home" && searchOpen -> { searchOpen = false; query = "" }
+            screen == "home" && tab != "Calls" -> { tab = "Calls"; query = "" }
+            else -> {
+                val now = System.currentTimeMillis()
+                if (now - lastBackPress < 2000) {
+                    activity.moveTaskToBack(true)   // minimise; app stays alive in recents
+                } else {
+                    lastBackPress = now
+                    Toast.makeText(context, "Press back again to minimise CallerX", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 
     LaunchedEffect(activity.resumeTick) {
         contacts = loadContacts(context); recentCalls = loadCallLog(context); messages = loadSms(context)
