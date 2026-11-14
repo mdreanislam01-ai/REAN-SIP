@@ -82,6 +82,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import org.linphone.core.*
@@ -1381,50 +1382,50 @@ private fun MessagesTab(activity: MainActivity, messages: List<Pair<String,Strin
 @Composable
 private fun CallSheetDialog(activity: MainActivity, number: String, name: String, setDefault: Boolean, onSetDefault: (Boolean) -> Unit, onDismiss: () -> Unit, onChoose: (String) -> Unit) {
     val sims = activity.simSlots()
-    AlertDialog(onDismissRequest = onDismiss,
-        title = { Column { Text("Call “${name.ifBlank { "number" }}” from", fontSize = 19.sp, fontWeight = FontWeight.Bold); Text(number, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp)) } },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                SheetCard(icon = Icons.Filled.Language, tint = Color(0xFF5B5BD6), title = "SIP",
-                    badge = if (activity.registered) "Online · HD Audio" else "Offline", badgeOk = activity.registered,
-                    subtitle = number, onClick = { onChoose("SIP") })
-                sims.forEach { (slot, carrier, line) ->
-                    val route = "SIM ${slot + 1}"
-                    val shown = activity.simShown(slot)
-                    if (shown) {
-                        SheetCard(icon = Icons.Filled.Call, tint = if (slot == 0) Color(0xFF2563EB) else Color(0xFF0F9D8A),
-                            title = route, badge = carrier, badgeOk = true, subtitle = line.ifBlank { carrier }, slotBadge = slot + 1,
-                            onClick = { onChoose(route) })
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.background, tonalElevation = 6.dp) {
+            Column(Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 18.dp, bottom = 16.dp)) {
+                Text(name.ifBlank { "Dialed number" }, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                Text(number, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp, bottom = 14.dp))
+                RouteCard(icon = Icons.Filled.Language, tint = MaterialTheme.colorScheme.primary, title = "SIP",
+                    pill = if (activity.registered) "Online" else "Offline", pillOk = activity.registered, onClick = { onChoose("SIP") })
+                sims.forEach { (slot, carrier, _) ->
+                    if (activity.simShown(slot)) {
+                        Spacer(Modifier.height(12.dp))
+                        RouteCard(icon = Icons.Filled.Call, tint = if (slot == 0) Color(0xFF1E88E5) else Color(0xFF10B981),
+                            title = "SIM ${slot + 1}", pill = carrier.ifBlank { "SIM ${slot + 1}" }, pillOk = true, onClick = { onChoose("SIM ${slot + 1}") })
                     }
                 }
-                Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = setDefault, onCheckedChange = onSetDefault, colors = CheckboxDefaults.colors(checkedColor = MaterialTheme.colorScheme.primary))
-                    Text("Set default for this contact", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.clickable { onSetDefault(!setDefault) })
+                    Text("Set default for this contact", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.clickable { onSetDefault(!setDefault) })
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.End) {
+                    Surface(onClick = onDismiss, shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)) {
+                        Text("Cancel", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(horizontal = 26.dp, vertical = 11.dp))
+                    }
                 }
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })
+        }
+    }
 }
 
 @Composable
-private fun SheetCard(icon: ImageVector, tint: Color, title: String, badge: String, badgeOk: Boolean, subtitle: String, slotBadge: Int = 0, onClick: () -> Unit) {
-    Surface(onClick = onClick, shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f), modifier = Modifier.fillMaxWidth()) {
-        Row(Modifier.padding(horizontal = 14.dp, vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(44.dp).clip(RoundedCornerShape(14.dp)).background(tint), contentAlignment = Alignment.Center) {
-                Icon(icon, null, tint = Color.White, modifier = Modifier.size(20.dp))
-                if (slotBadge > 0) Box(Modifier.align(Alignment.TopEnd).offset(x = 5.dp, y = (-5).dp).size(16.dp).clip(CircleShape).background(tint.copy(alpha = 0.85f)), contentAlignment = Alignment.Center) { Text("$slotBadge", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+private fun RouteCard(icon: ImageVector, tint: Color, title: String, pill: String, pillOk: Boolean, onClick: () -> Unit) {
+    Surface(onClick = onClick, shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surface,
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)), modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(horizontal = 14.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(54.dp).clip(RoundedCornerShape(18.dp)).background(tint), contentAlignment = Alignment.Center) {
+                Icon(icon, null, tint = Color.White, modifier = Modifier.size(26.dp))
             }
+            Spacer(Modifier.width(14.dp))
+            Text(title, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
             Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(title, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurface)
-                    Surface(shape = RoundedCornerShape(50), color = if (badgeOk) Color(0xFF22A06B).copy(alpha = 0.13f) else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.15f)) {
-                        Text(badge, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = if (badgeOk) Color(0xFF1E7E52) else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
-                    }
-                }
-                Text(subtitle, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Surface(shape = RoundedCornerShape(50), color = if (pillOk) Color(0xFF10B981).copy(alpha = 0.14f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.14f), modifier = Modifier.weight(1f, fill = false)) {
+                Text(pill, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = if (pillOk) Color(0xFF0E9F6E) else MaterialTheme.colorScheme.primary, modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(10.dp))
+            Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(22.dp))
         }
     }
 }

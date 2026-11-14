@@ -52,20 +52,19 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.7
-          name: CallerX Android APK v1.5.7
+          tag_name: callerx-v1.5.8
+          name: CallerX Android APK v1.5.8
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.7 — theme everywhere + NoXsip-style contact details:
-            - Every settings option icon, the call screen accent (badge, rings, avatar) and all
-              option rows now follow the selected theme accent color (all 9 accents + dark mode)
-            - Contact details redesigned like the NoXsip reference: centred themed avatar + name,
-              number card with round call/message buttons, WhatsApp / Telegram / Gmail message rows
-              (real intents, Gmail pre-fills the contact email when available), "Call logs" card with
-              Today/Yesterday dates, source and duration per call
-            - "+" in the top-right saves the number to device contacts
-            - Favorite / Edit / Block options and tags & notes are kept in a compact card below
+            v1.5.8 — call-route sheet redesigned like the reference image:
+            - Big rounded route cards: square themed icon (globe for SIP, phone for SIMs), large
+              SIP / SIM 1 / SIM 2 label, status pill (Online / Offline for SIP, carrier name such as
+              Banglalink / Robi for SIMs) and a right chevron
+            - "Set default for this contact" checkbox below the cards
+            - Pill-shaped Cancel button at the bottom right
+            - All behaviour unchanged: tapping a card calls via that route, the checkbox stores the
+              per-contact default, SIM visibility settings still apply
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true
