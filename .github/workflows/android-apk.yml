@@ -52,17 +52,23 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.2
-          name: CallerX Android APK v1.5.2
+          tag_name: callerx-v1.5.3
+          name: CallerX Android APK v1.5.3
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.2 — back button no longer closes the app:
-            - Back always steps one level up (contact details / settings / SIP / theme / dialer -> previous page)
-            - Back on any screen returns to the main page (call log) instead of exiting
-            - Back during an ongoing or ringing call keeps the call alive and shows the call log
-            - On the main page: back closes search first, then goes to the Calls tab, then minimises
-              the app to the background (press twice) so CallerX is never killed directly
+            v1.5.3 — keypad, contacts cache and search fixes:
+            - Keypad input no longer lags: contacts / call log / SMS are now loaded on a background
+              thread instead of the UI thread, with haptic feedback on every key
+            - Keypad number is a real editable field: tap to place the cursor, Paste (clipboard),
+              Copy and Clear buttons, hold 0 for "+", hold delete to clear everything
+            - The keypad clears itself automatically as soon as a call is placed
+            - SIP calls are stored in the app call history, so a cleared keypad never loses the call
+            - Contact cache stays fresh: ContentObservers on contacts / call log / SMS refresh the
+              lists automatically whenever the phone data changes
+            - Smoother, smarter search: debounced, memoized filtering with stable list keys, works on
+              Calls / Contacts / Messages, matches names, numbers, number endings, T9 keypad letters
+              and initials, with a live result count and a clear button
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true

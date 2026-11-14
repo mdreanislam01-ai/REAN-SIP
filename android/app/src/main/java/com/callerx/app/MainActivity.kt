@@ -9,10 +9,13 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.ContentObserver
 import android.media.AudioAttributes
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.CallLog
@@ -26,7 +29,11 @@ import android.view.View
 import java.io.File
 import java.text.DateFormat
 import java.util.Date
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import android.widget.Toast
@@ -37,12 +44,16 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -53,15 +64,28 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import org.linphone.core.*
 
 private val Palette = listOf(
@@ -69,7 +93,7 @@ private val Palette = listOf(
     Color(0xFFC34F86), Color(0xFF455FC2), Color(0xFF168C8C), Color(0xFFCA4545), Color(0xFF68717D)
 )
 private val PaletteNames = listOf("Blue", "Green", "Purple", "Orange", "Pink", "Indigo", "Teal", "Red", "Gray")
-private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "", val dur: Long = 0)
+data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "", val dur: Long = 0, val ts: Long = 0L)
 data class SipAccount(val name: String, val user: String, val pass: String, val domain: String, val port: String, val transport: String, val proxy: String, val displayName: String, val autoBoot: Boolean, val enabled: Boolean, val isDefault: Boolean)
 
 private fun loadContacts(context: Context): List<Person> {
@@ -88,7 +112,7 @@ private fun loadCallLog(context: Context): List<Person> {
         while (c.moveToNext()) {
             val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); val date = c.getLong(2); val accountId = c.getString(4).orEmpty(); val dur = c.getLong(5)
             val source = subSlots[accountId]?.let { "SIM $it" } ?: if (accountId.isNotBlank() && accountId.toIntOrNull() == null) "SIP" else "SIM 1"
-            result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(date)), callType = c.getInt(3), source = source, dur = dur))
+            result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(date)), callType = c.getInt(3), source = source, dur = dur, ts = date))
         }
     }
     return result
@@ -105,6 +129,63 @@ private fun fmtDur(sec: Long): String {
     if (sec <= 0) return ""
     val m = sec / 60; val s = sec % 60
     return if (m > 0) "${m}m ${s}s" else "${s}s"
+}
+
+/* ---------- SIP calls are kept in our own history so they survive a cleared keypad ---------- */
+private fun loadSipLog(context: Context): List<Person> {
+    return try {
+        val arr = JSONArray(context.getSharedPreferences("callerx", Context.MODE_PRIVATE).getString("sip_log", "[]") ?: "[]")
+        val rows = mutableListOf<Person>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val number = o.optString("number"); if (number.isBlank()) continue
+            val name = o.optString("name").ifBlank { number }
+            val ts = o.optLong("ts", 0L)
+            rows.add(Person(name, number, name.firstOrNull()?.toString() ?: "?",
+                time = if (ts > 0) DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(ts)) else "",
+                callType = o.optInt("type", CallLog.Calls.OUTGOING_TYPE), source = "SIP", dur = o.optLong("dur", 0L), ts = ts))
+        }
+        rows
+    } catch (_: Exception) { emptyList() }
+}
+
+/* Merge the system call log with our SIP history, newest first, without duplicate rows. */
+private fun mergeCallLogs(system: List<Person>, sip: List<Person>): List<Person> {
+    val combined = mutableListOf<Person>()
+    combined.addAll(system)
+    sip.forEach { s ->
+        val dup = system.any { digitsOnly(it.number) == digitsOnly(s.number) && it.ts > 0 && s.ts > 0 && kotlin.math.abs(it.ts - s.ts) < 8000L }
+        if (!dup) combined.add(s)
+    }
+    return combined.sortedByDescending { it.ts }
+}
+
+/* ---------- Smooth, forgiving search matching ---------- */
+private val T9_MAP = mapOf(
+    'a' to '2', 'b' to '2', 'c' to '2', 'd' to '3', 'e' to '3', 'f' to '3',
+    'g' to '4', 'h' to '4', 'i' to '4', 'j' to '5', 'k' to '5', 'l' to '5',
+    'm' to '6', 'n' to '6', 'o' to '6', 'p' to '7', 'q' to '7', 'r' to '7', 's' to '7',
+    't' to '8', 'u' to '8', 'v' to '8', 'w' to '9', 'x' to '9', 'y' to '9', 'z' to '9'
+)
+private fun digitsOnly(s: String) = s.filter { it.isDigit() }
+private fun toT9(s: String) = buildString { for (ch in s.lowercase()) { val d = T9_MAP[ch]; if (d != null) append(d) else if (ch.isDigit()) append(ch) } }
+
+private fun matchesQuery(name: String, number: String, rawQuery: String): Boolean {
+    val q = rawQuery.trim()
+    if (q.isEmpty()) return true
+    if (name.contains(q, true)) return true
+    val digits = digitsOnly(number)
+    val qDigits = digitsOnly(q)
+    if (qDigits.isNotEmpty() && digits.contains(qDigits)) return true
+    if (qDigits.length >= 4 && digits.endsWith(qDigits)) return true      // 01717… finds +8801717…
+    if (q.any { it.isLetter() }) {
+        val t9 = toT9(q)
+        if (t9.isNotEmpty() && digits.contains(t9)) return true           // type "rahi" -> numbers
+        val initials = name.split(" ").filter { it.isNotBlank() }.mapNotNull { it.firstOrNull()?.lowercaseChar() }.joinToString("")
+        val lq = q.lowercase().filter { it.isLetter() }
+        if (lq.length > 1 && initials.contains(lq)) return true           // "rh" -> Rakib Hasan
+    }
+    return false
 }
 
 object CallBridge { var activity: MainActivity? = null }
@@ -142,6 +223,20 @@ class MainActivity : ComponentActivity() {
     var speaker by mutableStateOf(false)
     var callStartedAt by mutableStateOf(0L)
     var recording by mutableStateOf(false)
+
+    /* ---------- Cached lists: always loaded on a background thread, never on the UI thread ---------- */
+    var contactsCache by mutableStateOf(emptyList<Person>())
+    var callsCache by mutableStateOf(emptyList<Person>())
+    var smsCache by mutableStateOf(emptyList<Pair<String, String>>())
+    var dataLoading by mutableStateOf(false)
+    private var refreshJob: Job? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val refreshRunnable = Runnable { refreshData() }
+    private val dataObserver = object : ContentObserver(mainHandler) {
+        override fun onChange(selfChange: Boolean) { scheduleDataRefresh(350) }
+    }
+    private var sipCallIncoming = false
+    private var sipCallLogged = true
     private var incomingVibrationOn = false
     var dialIntentNumber by mutableStateOf("")
     var callUiRequested by mutableStateOf(false)
@@ -159,6 +254,7 @@ class MainActivity : ComponentActivity() {
     private val runtimePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
         val denied = results.filterValues { !it }.keys
         if (denied.isNotEmpty()) errorMessage = "Some permissions were declined. You can enable them later in Android Settings."
+        refreshData()
     }
     private val defaultDialerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         dialerRoleTick++
@@ -166,6 +262,55 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun prefs() = getSharedPreferences("callerx", MODE_PRIVATE)
+
+    /* ---------- Background data loading + live refresh ---------- */
+    fun scheduleDataRefresh(delayMs: Long = 0) {
+        mainHandler.removeCallbacks(refreshRunnable)
+        mainHandler.postDelayed(refreshRunnable, delayMs)
+    }
+
+    fun refreshData() {
+        if (refreshJob?.isActive == true) { scheduleDataRefresh(500); return }
+        refreshJob = lifecycleScope.launch {
+            dataLoading = true
+            val data = withContext(Dispatchers.IO) {
+                val ctx = this@MainActivity
+                Triple(loadContacts(ctx), mergeCallLogs(loadCallLog(ctx), loadSipLog(ctx)), loadSms(ctx))
+            }
+            contactsCache = data.first
+            callsCache = data.second
+            smsCache = data.third
+            dataLoading = false
+        }
+    }
+
+    private fun registerDataObservers() {
+        try {
+            contentResolver.registerContentObserver(ContactsContract.Contacts.CONTENT_URI, true, dataObserver)
+            contentResolver.registerContentObserver(CallLog.Calls.CONTENT_URI, true, dataObserver)
+            contentResolver.registerContentObserver(Telephony.Sms.CONTENT_URI, true, dataObserver)
+        } catch (_: Exception) { }
+    }
+
+    /* SIP calls are stored in our own history, so a cleared keypad never loses the call. */
+    fun logSipCall(number: String, name: String, incoming: Boolean, answered: Boolean, durationSec: Long) {
+        val clean = number.filter { it.isDigit() || it == '+' }
+        if (clean.isBlank()) return
+        try {
+            val arr = JSONArray(prefs().getString("sip_log", "[]") ?: "[]")
+            val o = JSONObject()
+            o.put("number", clean)
+            o.put("name", name.ifBlank { clean })
+            o.put("ts", System.currentTimeMillis())
+            o.put("type", if (!incoming) CallLog.Calls.OUTGOING_TYPE else if (answered) CallLog.Calls.INCOMING_TYPE else CallLog.Calls.MISSED_TYPE)
+            o.put("dur", durationSec.coerceAtLeast(0L))
+            arr.put(o)
+            val trimmed = JSONArray()
+            for (i in maxOf(0, arr.length() - 300) until arr.length()) trimmed.put(arr.get(i))
+            prefs().edit().putString("sip_log", trimmed.toString()).apply()
+            scheduleDataRefresh(80)
+        } catch (_: Exception) { }
+    }
 
     fun requestSmsPermission() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
@@ -421,10 +566,12 @@ class MainActivity : ComponentActivity() {
         callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
         CallBridge.activity = this
         initializeLinphone()
+        registerDataObservers()
+        refreshData()
         setContent { CallerXApp(this) }
     }
 
-    override fun onResume() { super.onResume(); resumeTick++; CallBridge.activity = this }
+    override fun onResume() { super.onResume(); resumeTick++; CallBridge.activity = this; scheduleDataRefresh(150) }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -435,6 +582,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         cancelCallNotification()
+        try { contentResolver.unregisterContentObserver(dataObserver) } catch (_: Exception) { }
+        mainHandler.removeCallbacks(refreshRunnable)
+        refreshJob?.cancel()
         CallBridge.activity = null
         try { core?.stop() } catch (_: Exception) { }
         core = null
@@ -474,18 +624,28 @@ class MainActivity : ComponentActivity() {
                                 activeNumber = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
                                 callConnected = false
                                 muted = false; speaker = false
+                                callStartedAt = 0L; recording = false
+                                sipCallIncoming = true; sipCallLogged = false
                                 if (isBlockedNumber(activeNumber)) {
                                     try { call.decline(Reason.Busy) } catch (_: Exception) { }
                                 } else startIncomingVibration()
                             }
-                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> { callConnected = false; muted = false; speaker = false; callStartedAt = 0L; recording = false }
+                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> { callConnected = false; muted = false; speaker = false; callStartedAt = 0L; recording = false; sipCallIncoming = false; sipCallLogged = false }
                             Call.State.Connected -> { callConnected = true; stopIncomingVibration(); if (callStartedAt == 0L) callStartedAt = System.currentTimeMillis() }
                             Call.State.StreamsRunning -> {
                                 callConnected = true; stopIncomingVibration()
                                 if (callStartedAt == 0L) callStartedAt = System.currentTimeMillis()
                                 maybeAutoRecord()
                             }
-                            Call.State.End, Call.State.Released, Call.State.Error -> { stopIncomingVibration(); callStartedAt = 0L; recording = false }
+                            Call.State.End, Call.State.Released, Call.State.Error -> {
+                                stopIncomingVibration()
+                                if (!sipCallLogged) {
+                                    val dur = if (callStartedAt > 0L) ((System.currentTimeMillis() - callStartedAt) / 1000L).coerceAtLeast(0L) else 0L
+                                    logSipCall(activeNumber, activeCallName, sipCallIncoming, callConnected, dur)
+                                    sipCallLogged = true
+                                }
+                                callStartedAt = 0L; recording = false; callConnected = false
+                            }
                             else -> { }
                         }
                         callState = when (state) {
@@ -817,9 +977,10 @@ private fun CallerXApp(activity: MainActivity) {
     var query by remember { mutableStateOf("") }
     var searchOpen by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<Person?>(null) }
-    var contacts by remember { mutableStateOf(emptyList<Person>()) }
-    var recentCalls by remember { mutableStateOf(emptyList<Person>()) }
-    var messages by remember { mutableStateOf(emptyList<Pair<String,String>>()) }
+    // lists come from the activity cache: loaded on a background thread, kept fresh by ContentObservers
+    val contacts = activity.contactsCache
+    val recentCalls = activity.callsCache
+    val messages = activity.smsCache
     var dark by remember { mutableStateOf(false) }
     var accent by remember { mutableIntStateOf(0) }
     var number by remember { mutableStateOf("") }
@@ -873,8 +1034,11 @@ private fun CallerXApp(activity: MainActivity) {
         }
     }
 
+    // search is debounced so typing never drops frames
+    var debouncedQuery by remember { mutableStateOf("") }
+    LaunchedEffect(query) { if (query.isBlank()) debouncedQuery = "" else { delay(120); debouncedQuery = query } }
+
     LaunchedEffect(activity.resumeTick) {
-        contacts = loadContacts(context); recentCalls = loadCallLog(context); messages = loadSms(context)
         dark = prefs.getBoolean("dark", false)
         accent = prefs.getInt("accent", 0)
         showWelcome = !prefs.getBoolean("permission-intro-seen", false)
@@ -899,9 +1063,12 @@ private fun CallerXApp(activity: MainActivity) {
 
     fun placeCall(route: String, num: String, name: String) {
         when (route) {
-            "SIP" -> { activity.activeNumber = num; activity.activeCallName = name; if (activity.startSipCall(num, name)) screen = "call" }
-            "SIM 1" -> activity.startCellCall(num, 0)
-            "SIM 2" -> activity.startCellCall(num, 1)
+            "SIP" -> {
+                activity.activeNumber = num; activity.activeCallName = name
+                if (activity.startSipCall(num, name)) { screen = "call"; number = "" }   // keypad is cleared once the call starts
+            }
+            "SIM 1" -> { activity.startCellCall(num, 0); number = "" }
+            "SIM 2" -> { activity.startCellCall(num, 1); number = "" }
         }
     }
     fun requestCall(num: String, name: String) {
@@ -958,12 +1125,20 @@ private fun CallerXApp(activity: MainActivity) {
                 Column(Modifier.fillMaxSize().padding(padding)) {
                     if (tab != "Settings") {
                         HomeHeader(tab, activity.registrationMessage, activity.registered, searchOpen, { searchOpen = !searchOpen; if (!searchOpen) query = "" }, query, { query = it }, onSip = { screen = "sip" })
-                        if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), singleLine = true, placeholder = { Text("Search " + tab.lowercase()) }, leadingIcon = { Icon(Icons.Filled.Search, null) }, shape = RoundedCornerShape(14.dp))
+                        if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), singleLine = true,
+                            placeholder = { Text("Search by name, number or keypad letters") }, leadingIcon = { Icon(Icons.Filled.Search, null) },
+                            trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Filled.Close, "Clear search", modifier = Modifier.size(18.dp)) } },
+                            keyboardOptions = KeyboardOptions(keyboardType = if (tab == "Contacts") KeyboardType.Text else KeyboardType.Phone),
+                            shape = RoundedCornerShape(14.dp))
+                        if (searchOpen && debouncedQuery.isNotBlank()) {
+                            val hits = when (tab) { "Contacts" -> contacts.count { matchesQuery(it.name, it.number, debouncedQuery) }; "Messages" -> messages.count { matchesQuery(it.first, it.first, debouncedQuery) || it.second.contains(debouncedQuery, true) }; else -> recentCalls.count { matchesQuery(it.name, it.number, debouncedQuery) } }
+                            Text("$hits result${if (hits == 1) "" else "s"}", Modifier.padding(start = 18.dp, bottom = 2.dp), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                     when (tab) {
-                        "Calls" -> CallsTab(recentCalls, filter, { filter = it }, query, onAvatar = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) }, onKeypad = { screen = "dialer" })
-                        "Contacts" -> ContactsTab(contacts, query, onOpen = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) })
-                        "Messages" -> MessagesTab(activity, messages)
+                        "Calls" -> CallsTab(recentCalls, filter, { filter = it }, debouncedQuery, onAvatar = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) }, onKeypad = { screen = "dialer" })
+                        "Contacts" -> ContactsTab(contacts, debouncedQuery, onOpen = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) })
+                        "Messages" -> MessagesTab(activity, messages, debouncedQuery)
                         else -> SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() },
                             onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" },
                             onBlocked = { screen = "blocked" }, onRoute = { showRouteDialog = true }, onDialer = { showDialerDialog = true },
@@ -1042,7 +1217,7 @@ private fun HomeHeader(tab: String, sip: String, sipOnline: Boolean, searchOpen:
                 Text(tab, fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onSurface)
                 Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
             }
-            if (tab == "Calls" || tab == "Contacts") IconButton(onClick = onSearch) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, "Search", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+            if (tab == "Calls" || tab == "Contacts" || tab == "Messages") IconButton(onClick = onSearch) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, "Search", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
             SipPill(sip, sipOnline, onSip)
         }
     }
@@ -1067,13 +1242,15 @@ private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -
                     FilterChip(selected = filter == label, onClick = { onFilter(label) }, label = { Text(label, maxLines = 1, fontSize = 12.sp) }, shape = RoundedCornerShape(18.dp))
                 }
             }
-            val filtered = recents.filter { p ->
-                val ok = when (filter) { "Outgoing" -> p.callType == CallLog.Calls.OUTGOING_TYPE; "Received" -> p.callType == CallLog.Calls.INCOMING_TYPE || p.callType == CallLog.Calls.ANSWERED_EXTERNALLY_TYPE; "Missed" -> p.callType == CallLog.Calls.MISSED_TYPE; else -> true }
-                ok && (query.isBlank() || p.name.contains(query, true) || p.number.contains(query, true))
+            val filtered = remember(recents, filter, query) {
+                recents.filter { p ->
+                    val ok = when (filter) { "Outgoing" -> p.callType == CallLog.Calls.OUTGOING_TYPE; "Received" -> p.callType == CallLog.Calls.INCOMING_TYPE || p.callType == CallLog.Calls.ANSWERED_EXTERNALLY_TYPE; "Missed" -> p.callType == CallLog.Calls.MISSED_TYPE; else -> true }
+                    ok && matchesQuery(p.name, p.number, query)
+                }
             }
             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 90.dp)) {
-                if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                items(filtered) { p -> CallRow(p, onAvatar = { onAvatar(p) }, onCall = { onCall(p) }) }
+                if (filtered.isEmpty()) item { Text(if (query.isBlank()) "No recent calls found on this device." else "No calls match “$query”.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                itemsIndexed(filtered, key = { i, p -> "call-$i-${p.number}-${p.ts}" }) { _, p -> CallRow(p, onAvatar = { onAvatar(p) }, onCall = { onCall(p) }) }
             }
         }
         FloatingActionButton(onClick = onKeypad, modifier = Modifier.align(Alignment.BottomEnd).padding(end = 18.dp, bottom = 14.dp), shape = RoundedCornerShape(16.dp), containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White) { Icon(Icons.Filled.Dialpad, "Open keypad", modifier = Modifier.size(23.dp)) }
@@ -1115,15 +1292,15 @@ private fun CallRow(person: Person, onAvatar: () -> Unit, onCall: () -> Unit) {
 
 @Composable
 private fun ContactsTab(contacts: List<Person>, query: String, onOpen: (Person) -> Unit, onCall: (Person) -> Unit) {
-    val visible = contacts.filter { query.isBlank() || it.name.contains(query, true) || it.number.contains(query, true) }
+    val visible = remember(contacts, query) { contacts.filter { matchesQuery(it.name, it.number, query) } }
+    val favs = remember(visible) { visible.take(5) }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 90.dp)) {
         item { SectionTitle("FAVORITES") }
-        val favs = visible.take(5)
         if (favs.isEmpty()) item { Text("No favorites yet.", Modifier.padding(horizontal = 16.dp, vertical = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp) }
-        items(favs) { p -> ContactRow(p, { onOpen(p) }, { onCall(p) }) }
-        item { SectionTitle(if (query.isBlank()) "ALL CONTACTS" else "SEARCH RESULTS") }
-        if (visible.isEmpty()) item { Text("No matching contacts. Grant Contacts permission or add contacts to your device.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        items(visible) { p -> ContactRow(p, { onOpen(p) }, { onCall(p) }) }
+        itemsIndexed(favs, key = { i, p -> "fav-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }) }
+        item { SectionTitle(if (query.isBlank()) "ALL CONTACTS · ${contacts.size}" else "SEARCH RESULTS · ${visible.size}") }
+        if (visible.isEmpty()) item { Text(if (query.isBlank()) "No matching contacts. Grant Contacts permission or add contacts to your device." else "No contact matches “$query”.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        itemsIndexed(visible, key = { i, p -> "con-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }) }
     }
 }
 
@@ -1144,11 +1321,15 @@ private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit) {
 }
 
 @Composable
-private fun MessagesTab(activity: MainActivity, messages: List<Pair<String,String>>) {
+private fun MessagesTab(activity: MainActivity, messages: List<Pair<String,String>>, query: String = "") {
+    val visible = remember(messages, query) {
+        if (query.isBlank()) messages
+        else messages.filter { matchesQuery(it.first, it.first, query) || it.second.contains(query.trim(), true) }
+    }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 90.dp)) {
         item {
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("${messages.size} messages", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(if (query.isBlank()) "${messages.size} messages" else "${visible.size} of ${messages.size} messages", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = { activity.markAllSmsRead() }) { Text("Read all", fontSize = 12.sp) }
             }
         }
@@ -1158,7 +1339,8 @@ private fun MessagesTab(activity: MainActivity, messages: List<Pair<String,Strin
                 TextButton(onClick = { activity.requestSmsPermission() }) { Text("Grant SMS access") }
             }
         }
-        items(messages) { row ->
+        if (messages.isNotEmpty() && visible.isEmpty()) item { Text("No message matches “$query”.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        itemsIndexed(visible, key = { i, row -> "sms-$i-${row.first}" }) { _, row ->
             Row(Modifier.fillMaxWidth().clickable { }.padding(horizontal = 16.dp, vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(46.dp).clip(CircleShape).background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) { Text(row.first.take(1).uppercase(), color = MaterialTheme.colorScheme.secondary, fontWeight = FontWeight.Bold) }
                 Spacer(Modifier.width(12.dp))
@@ -1346,8 +1528,8 @@ private fun ContactDetailScreen(activity: MainActivity, person: Person, recents:
     var newTag by remember { mutableStateOf("") }
     var showAllCalls by remember { mutableStateOf(false) }
     val blocked = activity.isBlockedNumber(person.number)
-    val history = recents.filter { it.number.filter { c -> c.isDigit() || c == '+' } == norm }
-    val totalSec = history.sumOf { it.dur }
+    val history = remember(recents, norm) { recents.filter { digitsOnly(it.number) == digitsOnly(norm) } }
+    val totalSec = remember(history) { history.sumOf { it.dur } }
 
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1691,14 +1873,116 @@ private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidt
 
 @Composable
 private fun DialerScreen(number: String, onNumber: (String) -> Unit, onBack: () -> Unit, onCall: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val haptic = LocalHapticFeedback.current
+    val primary = MaterialTheme.colorScheme.primary
+    val secondaryText = MaterialTheme.colorScheme.onSurfaceVariant
+    var field by remember { mutableStateOf(TextFieldValue(number)) }
+    LaunchedEffect(number) { if (field.text != number) field = TextFieldValue(number, selection = TextRange(number.length)) }
+
+    fun setNumber(v: String) { field = TextFieldValue(v, selection = TextRange(v.length)); onNumber(v) }
+    fun insertAtCursor(s2: String) {
+        val text = field.text
+        val start = field.selection.start.coerceIn(0, text.length)
+        val end = field.selection.end.coerceIn(0, text.length)
+        val lo = minOf(start, end); val hi = maxOf(start, end)
+        val merged = text.substring(0, lo) + s2 + text.substring(hi)
+        field = TextFieldValue(merged, selection = TextRange(lo + s2.length))
+        onNumber(merged)
+    }
+    fun deleteBeforeCursor() {
+        val text = field.text
+        if (text.isEmpty()) return
+        val pos = field.selection.end.coerceIn(0, text.length)
+        if (pos == 0) { setNumber(text.dropLast(1)); return }
+        val merged = text.substring(0, pos - 1) + text.substring(pos)
+        field = TextFieldValue(merged, selection = TextRange(pos - 1))
+        onNumber(merged)
+    }
+    fun tap() { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
+    fun longTap() { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
+
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background), horizontalAlignment = Alignment.CenterHorizontally) {
-        TopBar("Keypad", onBack); Spacer(Modifier.weight(1f)); Text(number.ifBlank { "Enter a number" }, fontSize = 27.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface); Spacer(Modifier.height(18.dp))
+        TopBar("Keypad", onBack)
+        Spacer(Modifier.weight(0.6f))
+        BasicTextField(
+            value = field,
+            onValueChange = { tfv -> field = tfv; onNumber(tfv.text.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }) },
+            singleLine = true,
+            textStyle = TextStyle(fontSize = 27.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface, textAlign = TextAlign.Center),
+            cursorBrush = SolidColor(primary),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+            decorationBox = { inner ->
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    if (field.text.isEmpty()) Text("Enter or paste a number", fontSize = 21.sp, fontWeight = FontWeight.Medium, color = secondaryText.copy(alpha = 0.55f))
+                    inner()
+                }
+            },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 22.dp)
+        )
+        Row(Modifier.padding(top = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            DialerAction(Icons.Filled.ContentPaste, "Paste", primary) {
+                val raw = try { clipboard.getText()?.text.orEmpty() } catch (_: Exception) { "" }
+                val clean = raw.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+                if (clean.isBlank()) Toast.makeText(context, "No phone number in the clipboard", Toast.LENGTH_SHORT).show()
+                else { tap(); insertAtCursor(clean); Toast.makeText(context, "Pasted $clean", Toast.LENGTH_SHORT).show() }
+            }
+            if (number.isNotBlank()) DialerAction(Icons.Filled.ContentCopy, "Copy", secondaryText) { clipboard.setText(AnnotatedString(number)); tap(); Toast.makeText(context, "Number copied", Toast.LENGTH_SHORT).show() }
+            if (number.isNotBlank()) DialerAction(Icons.Filled.Close, "Clear", Color(0xFFD64545)) { longTap(); setNumber("") }
+        }
+        Spacer(Modifier.height(18.dp))
         val keys = listOf("1" to "", "2" to "ABC", "3" to "DEF", "4" to "GHI", "5" to "JKL", "6" to "MNO", "7" to "PQRS", "8" to "TUV", "9" to "WXYZ", "*" to "", "0" to "+", "#" to "")
-        keys.chunked(3).forEach { row -> Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) { row.forEach { (digit, letters) -> FilledTonalButton(onClick = { onNumber(number + digit) }, modifier = Modifier.size(80.dp), shape = CircleShape, colors = ButtonDefaults.filledTonalButtonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Text(digit, fontSize = 23.sp); Text(letters, fontSize = 9.sp) } } }; Spacer(Modifier.height(5.dp)) } }
-        Spacer(Modifier.height(15.dp)); Row(verticalAlignment = Alignment.CenterVertically) { Button(onClick = onCall, shape = CircleShape, modifier = Modifier.size(62.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E9C67))) { Icon(Icons.Filled.Call, "Call") }; Spacer(Modifier.width(23.dp)); IconButton(onClick = { if (number.isNotEmpty()) onNumber(number.dropLast(1)) }) { Icon(Icons.Filled.Backspace, "Delete", tint = MaterialTheme.colorScheme.onSurfaceVariant) } }; Spacer(Modifier.weight(1f))
+        keys.chunked(3).forEach { row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+                row.forEach { (digit, letters) ->
+                    val plusKey: () -> Unit = { longTap(); insertAtCursor("+") }
+                    DialKey(digit, letters, { tap(); insertAtCursor(digit) }, if (digit == "0") plusKey else null)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+        }
+        Spacer(Modifier.height(14.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(62.dp))
+            Spacer(Modifier.width(18.dp))
+            Button(onClick = { longTap(); onCall() }, shape = CircleShape, modifier = Modifier.size(62.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E9C67))) { Icon(Icons.Filled.Call, "Call", tint = Color.White) }
+            Spacer(Modifier.width(18.dp))
+            Box(Modifier.size(58.dp).pointerInput(Unit) {
+                detectTapGestures(onTap = { tap(); deleteBeforeCursor() }, onLongPress = { longTap(); setNumber("") })
+            }, contentAlignment = Alignment.Center) { Icon(Icons.Filled.Backspace, "Delete", tint = secondaryText) }
+        }
+        Text("Hold 0 for +   ·   Hold delete to clear all", Modifier.padding(top = 12.dp), fontSize = 10.sp, color = secondaryText.copy(alpha = 0.85f))
+        Spacer(Modifier.weight(1f))
     }
 }
 
+@Composable
+private fun DialKey(digit: String, letters: String, onTap: () -> Unit, onLongPress: (() -> Unit)?) {
+    val longAction: ((Offset) -> Unit)? = if (onLongPress != null) {
+        val lp = onLongPress
+        { _: Offset -> lp() }
+    } else null
+    Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.size(80.dp).pointerInput(digit) { detectTapGestures(onTap = { onTap() }, onLongPress = longAction) }) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(digit, fontSize = 23.sp, color = MaterialTheme.colorScheme.onSurface)
+                if (letters.isNotBlank()) Text(letters, fontSize = 9.sp, letterSpacing = 1.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DialerAction(icon: ImageVector, label: String, tint: Color, onClick: () -> Unit) {
+    Surface(onClick = onClick, shape = RoundedCornerShape(50), color = tint.copy(alpha = 0.12f)) {
+        Row(Modifier.padding(horizontal = 13.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Icon(icon, label, tint = tint, modifier = Modifier.size(15.dp))
+            Text(label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = tint)
+        }
+    }
+}
 @Composable
 private fun ProfileScreen(onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit, onNotifications: () -> Unit) {
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
