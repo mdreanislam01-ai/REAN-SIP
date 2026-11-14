@@ -51,7 +51,7 @@ private val Palette = listOf(
     Color(0xFF087DB8), Color(0xFF16845B), Color(0xFF7053B5), Color(0xFFD47622),
     Color(0xFFC34F86), Color(0xFF455FC2), Color(0xFF168C8C), Color(0xFFCA4545), Color(0xFF68717D)
 )
-private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "")
+private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0)
 private val people = emptyList<Person>()
 private fun loadContacts(context: Context): List<Person> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return emptyList()
@@ -65,7 +65,7 @@ private fun loadCallLog(context: Context): List<Person> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) return emptyList()
     val result = mutableListOf<Person>()
     context.contentResolver.query(CallLog.Calls.CONTENT_URI, arrayOf(CallLog.Calls.CACHED_NAME, CallLog.Calls.NUMBER, CallLog.Calls.DATE, CallLog.Calls.TYPE), null, null, CallLog.Calls.DATE + " DESC")?.use { c ->
-        while (c.moveToNext()) { val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); val date = c.getLong(2); val missed = c.getInt(3) == CallLog.Calls.MISSED_TYPE; result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", spam = false, time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(date)))) }
+        while (c.moveToNext()) { val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); val date = c.getLong(2); val missed = c.getInt(3) == CallLog.Calls.MISSED_TYPE; result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", spam = false, time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(date)), callType = c.getInt(3))) }
     }
     return result
 }
@@ -357,10 +357,10 @@ private fun CallerXApp(activity: MainActivity) {
         } else {
             Scaffold(
                 containerColor = MaterialTheme.colorScheme.background,
-                floatingActionButton = if (tab == "Calls") ({ FloatingActionButton(onClick = { screen = "dialer" }, containerColor = color, contentColor = Color.White) { Icon(Icons.Filled.Dialpad, "Open dialer") } }) else ({ }),
+                floatingActionButton = { },
                 bottomBar = { NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
-                    listOf("Calls" to Icons.Filled.Call, "Messages" to Icons.AutoMirrored.Filled.Message, "Contacts" to Icons.Filled.Contacts, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
-                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false }, icon = { Icon(icon, label) }, label = { Text(label) }, alwaysShowLabel = true)
+                    listOf("Calls" to Icons.Filled.Dialpad, "Contacts" to Icons.Filled.Contacts, "Messages" to Icons.AutoMirrored.Filled.Message, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
+                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false }, icon = { Icon(icon, if (label == "Calls") "Keypad" else label) }, label = { Text(if (label == "Calls") "Keypad" else label) }, alwaysShowLabel = true)
                     }
                 } }
             ) { padding ->
@@ -370,14 +370,26 @@ private fun CallerXApp(activity: MainActivity) {
                     } else {
                         Header(tab, activity.registrationMessage, searchOpen, { searchOpen = !searchOpen }, query, { query = it }, { screen = "profile" }, { screen = "sip" })
                         if (tab == "Calls") {
-                            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 7.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                                listOf("All", "Missed", "Spam", "Favorites").forEach { label -> FilterChip(selected = filter == label, onClick = { filter = label }, label = { Text(label) }) }
+                            Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 14.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text("Dial", Modifier.weight(1f), fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                                IconButton(onClick = { val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager; clip.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let { number = it.filter { c -> c.isDigit() || c == '+' } } }) { Icon(Icons.Filled.ContentPaste, "Paste number") }
+                                IconButton(onClick = { number = "" }) { Icon(Icons.Filled.DeleteOutline, "Clear number") }
+                                IconButton(onClick = { searchOpen = !searchOpen }) { Icon(Icons.Filled.Search, "Search calls") }
+                            }
+                            if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp), singleLine = true, placeholder = { Text("Search calls") })
+                            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 5.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                listOf("All", "Outgoing", "Received", "Missed").forEach { label -> FilterChip(selected = filter == label, onClick = { filter = label }, label = { Text(label, maxLines = 1) }) }
+                            }
+                            var source by remember { mutableStateOf("All sources") }
+                            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 2.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                listOf("All sources", "SIP", "SIM").forEach { label -> FilterChip(selected = source == label, onClick = { source = label }, label = { Text(label) }) }
                             }
                             val filtered = recentCalls.filter { person ->
-                                (filter == "All" || (filter == "Spam" && person.spam) || (filter == "Favorites" && person.verified) || (filter == "Missed" && person.name == "Spam Likely")) &&
-                                    (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
+                                val categoryMatches = when (filter) { "Outgoing" -> person.callType == CallLog.Calls.OUTGOING_TYPE; "Received" -> person.callType == CallLog.Calls.INCOMING_TYPE; "Missed" -> person.callType == CallLog.Calls.MISSED_TYPE; else -> true }
+                                categoryMatches && (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
                             }
-                            LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
+                            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 4.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
+                            KeypadPanel(number, onNumber = { number = it }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true })
                         } else if (tab == "Contacts") {
                             LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) {
                                 item { SectionTitle("FAVORITES") }
@@ -418,16 +430,27 @@ private fun CallerXApp(activity: MainActivity) {
 }
 
 @Composable private fun Header(tab: String, sip: String, searchOpen: Boolean, onSearch: () -> Unit, query: String, onQuery: (String) -> Unit, onProfile: () -> Unit, onSip: () -> Unit) {
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(start = 16.dp, top = 76.dp, end = 16.dp, bottom = 12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onProfile) { Avatar("R", MaterialTheme.colorScheme.primary, 36) }
-            if (searchOpen) OutlinedTextField(query, onQuery, Modifier.weight(1f).height(56.dp), placeholder = { Text("Search name or number") }, singleLine = true, shape = RoundedCornerShape(22.dp))
-            else Text(if (tab == "Calls") "CallerX" else tab, Modifier.weight(1f), fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            IconButton(onClick = onSearch) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, "Search") }
-        }
-        if (tab == "Calls") {
-            Spacer(Modifier.height(9.dp))
-            AssistChip(onClick = onSip, label = { Text(sip, fontWeight = FontWeight.SemiBold) }, leadingIcon = { Icon(Icons.Filled.Cloud, null, tint = if (sip == "SIP Online") Color(0xFF2E9C67) else Color(0xFFD34F4F)) })
+    Row(Modifier.fillMaxWidth().background(Brush.horizontalGradient(listOf(Color(0xFF2147B8), Color(0xFF318BE8)))).padding(start = 18.dp, top = 30.dp, end = 18.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(48.dp).clip(RoundedCornerShape(14.dp)).background(Color.White.copy(alpha = .18f)).clickable(onClick = onProfile), contentAlignment = Alignment.Center) { Text("C", color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.Bold) }
+        Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text("CallerX", color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold); if (tab != "Calls") Text(tab, color = Color.White.copy(alpha = .85f), fontSize = 13.sp) }
+        AssistChip(onClick = onSip, label = { Text(sip, color = Color.White, fontWeight = FontWeight.SemiBold) }, leadingIcon = { Icon(Icons.Filled.Circle, null, tint = if (sip == "SIP Online") Color(0xFF39D6A1) else Color(0xFFFF7272), modifier = Modifier.size(12.dp)) }, colors = AssistChipDefaults.assistChipColors(containerColor = Color(0xFF102D69).copy(alpha = .45f)))
+    }
+}
+
+@Composable private fun KeypadPanel(number: String, onNumber: (String) -> Unit, onCall: () -> Unit) {
+    val keys = listOf("1" to "", "2" to "ABC", "3" to "DEF", "4" to "GHI", "5" to "JKL", "6" to "MNO", "7" to "PQRS", "8" to "TUV", "9" to "WXYZ", "*" to "", "0" to "+", "#" to "")
+    Surface(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp), shadowElevation = 8.dp) {
+        Column(Modifier.padding(horizontal = 24.dp, vertical = 5.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(Modifier.fillMaxWidth().height(32.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+                Text(number.ifBlank { " " }, fontSize = 20.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f), maxLines = 1)
+                if (number.isNotEmpty()) IconButton(onClick = { onNumber(number.dropLast(1)) }, modifier = Modifier.size(32.dp)) { Icon(Icons.Filled.Backspace, "Delete digit", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+            }
+            keys.chunked(3).forEach { row -> Row(Modifier.fillMaxWidth().weight(1f), verticalAlignment = Alignment.CenterVertically) { row.forEach { (digit, letters) -> Column(Modifier.weight(1f).fillMaxHeight().clickable { onNumber(number + digit) }, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Text(digit, fontSize = 29.sp, color = MaterialTheme.colorScheme.onSurface, lineHeight = 31.sp); if (letters.isNotEmpty()) Text(letters, fontSize = 9.sp, color = Color(0xFF579575), fontWeight = FontWeight.Bold, letterSpacing = 2.sp) } } } }
+            Row(Modifier.fillMaxWidth().height(58.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceEvenly) {
+                IconButton(onClick = { }) { Icon(Icons.Filled.Dialpad, "Keypad", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+                FilledIconButton(onClick = onCall, modifier = Modifier.size(58.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFF20A45A), contentColor = Color.White)) { Icon(Icons.Filled.Call, "Call", modifier = Modifier.size(27.dp)) }
+                IconButton(onClick = { if (number.isNotEmpty()) onNumber(number.dropLast(1)) }) { Icon(Icons.Filled.Backspace, "Delete", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+            }
         }
     }
 }
@@ -438,7 +461,7 @@ private fun CallerXApp(activity: MainActivity) {
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) { Text(person.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis); if (person.verified) { Spacer(Modifier.width(5.dp)); Icon(Icons.Filled.Verified, null, tint = color, modifier = Modifier.size(16.dp)) }; if (person.spam) { Spacer(Modifier.width(6.dp)); Text("Spam", color = Color(0xFFC64646), fontSize = 11.sp, fontWeight = FontWeight.Bold) } }
-            Text("${if (person.spam) "Missed call" else "Incoming call"} · ${person.number}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text("${when (person.callType) { CallLog.Calls.OUTGOING_TYPE -> "Outgoing call"; CallLog.Calls.MISSED_TYPE -> "Missed call"; else -> "Incoming call" }} · ${person.number}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         Text(person.time, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
