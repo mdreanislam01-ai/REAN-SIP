@@ -1024,7 +1024,7 @@ function selectCallMethod(method){
     </div>
     <div class="inc-end-wrap"><div class="act-btn"><div class="circ rej" onclick="endCall(false)"><svg viewBox="0 0 24 24"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.73-1.68-1.36-2.66-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg></div><span>End</span></div></div>`;
   go('s-incoming');
-  setTimeout(()=>{if(!isOngoing)acceptCall()},1800);
+  setTimeout(()=>{if(!isOngoing&&!activeSipSession)acceptCall()},1800);
 }
 
 function acceptCall(){
@@ -1150,12 +1150,61 @@ function setTheme(color,el){
   });
 }
 
-let sipUa=null, activeSipSession=null, sipConnected=false, sipTimerAutoAccept=null;
+let sipUa=null, activeSipSession=null, sipConnected=false, sipDomain='';
 const baseSelectCallMethod=selectCallMethod, baseAcceptCall=acceptCall, baseEndCall=endCall;
 function sipToast(message){
   const box=document.createElement('div');box.textContent=message;
   box.style.cssText='position:absolute;z-index:220;left:16px;right:16px;bottom:82px;padding:13px 16px;border-radius:14px;background:#202733;color:white;font-size:13px;box-shadow:0 5px 20px #0004';
   document.getElementById('phone').appendChild(box);setTimeout(()=>box.remove(),3600);
+}
+/* ---- Call tones: ringback for outgoing, ringtone for incoming (WebAudio, no files needed) ---- */
+let toneStopFn=null,toneTimer=null,vibrateTimer=null;
+function stopCallTones(){
+  if(toneStopFn){try{toneStopFn()}catch(e){}toneStopFn=null}
+  if(toneTimer){clearTimeout(toneTimer);toneTimer=null}
+  if(vibrateTimer){clearInterval(vibrateTimer);vibrateTimer=null}
+  try{navigator.vibrate&&navigator.vibrate(0)}catch(e){}
+}
+function playCallTone(freqs,onMs,offMs){
+  stopCallTones();
+  try{
+    const Ctx=window.AudioContext||window.webkitAudioContext;
+    if(!Ctx)return;
+    if(!playCallTone.ctx)playCallTone.ctx=new Ctx();
+    const ctx=playCallTone.ctx;
+    if(ctx.state==='suspended')ctx.resume();
+    const gain=ctx.createGain();gain.gain.value=0;gain.connect(ctx.destination);
+    const oscs=freqs.map(f=>{const o=ctx.createOscillator();o.type='sine';o.frequency.value=f;o.connect(gain);o.start();return o});
+    let stopped=false;
+    const level=v=>{const t=ctx.currentTime;gain.gain.cancelScheduledValues(t);gain.gain.setValueAtTime(v,t)};
+    const loop=()=>{
+      if(stopped)return;
+      level(0.18);
+      toneTimer=setTimeout(()=>{if(stopped)return;level(0);toneTimer=setTimeout(loop,offMs)},onMs);
+    };
+    loop();
+    toneStopFn=()=>{stopped=true;if(toneTimer){clearTimeout(toneTimer);toneTimer=null}level(0);oscs.forEach(o=>{try{o.stop()}catch(e){}});try{gain.disconnect()}catch(e){}};
+  }catch(e){}
+}
+function startIncomingAlert(){
+  playCallTone([880,660],900,1400);
+  try{if(navigator.vibrate){navigator.vibrate([700,500,700]);vibrateTimer=setInterval(()=>{try{navigator.vibrate([700,500,700])}catch(e){}},2100)}}catch(e){}
+}
+function startRingbackTone(){playCallTone([440,480],1000,3000)}
+function sipFailureMessage(cause){
+  switch(cause){
+    case 'User Denied Media Access':return 'Microphone permission denied — allow mic access so SIP calls can connect audio';
+    case 'WebRTC Error':return 'Audio device error (WebRTC) — check the microphone and browser permissions';
+    case 'Authentication Error':return 'SIP authentication failed — wrong username or password';
+    case 'Busy':return 'Line busy';
+    case 'Not Found':return 'Number not found on the SIP server (404) — check the dial format your provider expects';
+    case 'Unavailable':return 'Callee unavailable — the number may be offline on the SIP server';
+    case 'Request Timeout':return 'No response from the SIP server (timeout) — check internet and WSS URL';
+    case 'Rejected':return 'Call rejected by the server or callee';
+    case 'CANCELED':return 'Call canceled';
+    case 'Connection Error':return 'SIP connection lost — reconnect the SIP account';
+    default:return 'Call failed: '+(cause||'network or media error');
+  }
 }
 function persistSipFields(){
   ['sip-user','sip-server','sip-ws','sip-port','sip-transport'].forEach(id=>localStorage.setItem('cx-'+id,document.getElementById(id).value));
@@ -1163,16 +1212,19 @@ function persistSipFields(){
 function restoreSipFields(){
   ['sip-user','sip-server','sip-ws','sip-port','sip-transport'].forEach(id=>{const value=localStorage.getItem('cx-'+id);if(value!==null)document.getElementById(id).value=value});
 }
-function disconnectSip(){if(sipUa){try{sipUa.stop()}catch(e){}sipUa=null}sipConnected=false;setSipStatus(false)}
+function disconnectSip(){stopCallTones();activeSipSession=null;if(sipUa){try{sipUa.stop()}catch(e){}sipUa=null}sipConnected=false;setSipStatus(false)}
 function saveSip(){
-  const user=document.getElementById('sip-user').value.trim();
-  const domain=document.getElementById('sip-server').value.trim();
+  const rawUser=document.getElementById('sip-user').value.trim();
+  let user=rawUser;
+  let domain=document.getElementById('sip-server').value.trim();
+  if(rawUser.includes('@')){user=rawUser.split('@')[0];domain=rawUser.split('@')[1]||domain}
   const password=document.getElementById('sip-pass').value;
   const wsUrl=document.getElementById('sip-ws').value.trim();
   if(!user||!domain||!password||!wsUrl){alert('Enter your SIP username, password, domain, and secure WSS URL.');return}
   if(!/^wss:\/\//i.test(wsUrl)){alert('For secure VoIP, the SIP WebSocket URL must start with wss://');return}
   if(typeof JsSIP==='undefined'||!JsSIP.UA){alert('SIP engine is unavailable. Reinstall or update CallerX.');return}
   disconnectSip();persistSipFields();
+  sipDomain=domain;
   const socket=new JsSIP.WebSocketInterface(wsUrl);
   sipUa=new JsSIP.UA({sockets:[socket],uri:'sip:'+user+'@'+domain,password:password,register:true,session_timers:false,pcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'}]}});
   sipUa.on('registered',()=>{sipConnected=true;setSipStatus(true);sipToast('SIP registered securely');go('s-calls')});
@@ -1193,10 +1245,12 @@ function saveSip(){
       document.getElementById('inc-timer').style.display='none';
       document.getElementById('call-actions').innerHTML='<div class="inc-bottom-actions"><div class="act-btn" onclick="acceptCall()"><div class="circ" style="background:#34C759"><svg viewBox="0 0 24 24"><path fill="#fff" d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1 1 0 0 1 1-.24c1.1.37 2.3.56 3.6.56a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1C10.4 21 3 13.6 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.2.2 2.4.56 3.5a1 1 0 0 1-.25 1z"/></svg></div><span>Answer</span></div><div class="act-btn" onclick="endCall(false)"><div class="circ rej"><svg viewBox="0 0 24 24"><path fill="#fff" d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08c-.18-.17-.29-.42-.29-.7 0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71 0 .28-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.73-1.68-1.36-2.66-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg></div><span>Decline</span></div></div>';
       go('s-incoming');
+      startIncomingAlert();
     }
-    activeSipSession.on('accepted',()=>{sipConnected=true;document.getElementById('inc-label').textContent='Connected';baseAcceptCall()});
-    activeSipSession.on('ended',()=>{if(activeSipSession!==data.session)return;const connected=isOngoing;activeSipSession=null;baseEndCall(connected)});
-    activeSipSession.on('failed',(e)=>{if(activeSipSession!==data.session)return;sipToast('Call failed: '+(e.cause||'network or media error'));activeSipSession=null;baseEndCall(false)});
+    activeSipSession.on('progress',()=>{if(activeSipSession!==data.session)return;if(data.originator==='local'){document.getElementById('inc-label').textContent='Ringing…';startRingbackTone()}});
+    activeSipSession.on('accepted',()=>{if(activeSipSession!==data.session)return;stopCallTones();sipConnected=true;document.getElementById('inc-label').textContent='Connected';const a=document.getElementById('sip-remote-audio');if(a){a.volume=1;a.play().catch(()=>{})}baseAcceptCall()});
+    activeSipSession.on('ended',()=>{if(activeSipSession!==data.session)return;stopCallTones();const connected=isOngoing;activeSipSession=null;baseEndCall(connected)});
+    activeSipSession.on('failed',(e)=>{if(activeSipSession!==data.session)return;stopCallTones();sipToast(sipFailureMessage(e&&e.cause));activeSipSession=null;baseEndCall(false)});
     const pc=data.session.connection;
     if(pc&&pc.addEventListener)pc.addEventListener('track',event=>{const stream=event.streams&&event.streams[0];if(stream){let audio=document.getElementById('sip-remote-audio');if(!audio){audio=document.createElement('audio');audio.id='sip-remote-audio';audio.autoplay=true;audio.playsInline=true;document.body.appendChild(audio)}audio.srcObject=stream;audio.play().catch(()=>{})}});
   });
@@ -1207,16 +1261,27 @@ function selectCallMethod(method){
   if(!sipUa||!sipConnected){sipToast('Register a SIP account before placing SIP calls.');go('s-sip');return}
   const target=String(pendingCall.number||'').replace(/[^+0-9*#]/g,'');
   if(!target){sipToast('Enter a valid phone number.');return}
+  const domain=sipDomain||document.getElementById('sip-server').value.trim();
+  if(!domain){sipToast('SIP server domain is missing — save the SIP account again.');go('s-sip');return}
   try{
-    activeSipSession=sipUa.call('sip:'+target+'@'+document.getElementById('sip-server').value.trim(),{mediaConstraints:{audio:true,video:false},pcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'}]}});
+    activeSipSession=sipUa.call('sip:'+target+'@'+domain,{mediaConstraints:{audio:true,video:false},pcConfig:{iceServers:[{urls:'stun:stun.l.google.com:19302'}]}});
     baseSelectCallMethod('SIP');
+    document.getElementById('inc-label').textContent='Calling…';
   }catch(e){activeSipSession=null;sipToast('Could not start SIP call: '+e.message)}
 }
 function acceptCall(){
-  if(activeSipSession){if(activeSipSession.direction==='incoming'&&!activeSipSession.isEstablished())activeSipSession.answer({mediaConstraints:{audio:true,video:false}});return}
+  if(activeSipSession){
+    stopCallTones();
+    if(activeSipSession.direction==='incoming'&&!activeSipSession.isEstablished()){
+      document.getElementById('inc-label').textContent='Connecting…';
+      activeSipSession.answer({mediaConstraints:{audio:true,video:false}});
+    }
+    return;
+  }
   baseAcceptCall();
 }
 function endCall(ok){
+  stopCallTones();
   const session=activeSipSession;activeSipSession=null;
   if(session){try{session.terminate()}catch(e){}}
   baseEndCall(ok||isOngoing);
