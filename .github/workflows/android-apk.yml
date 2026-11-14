@@ -36,7 +36,7 @@ jobs:
           result=$?
           if [ "$result" -ne 0 ]; then
             tail -n 25 build.log
-            summary=$(tail -n 8 build.log | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            summary=$(grep -E -A3 -B1 'What went wrong|Execution failed|Could not|e: |error:|> Task .* FAILED' build.log | tail -n 18 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
             echo "::error::$summary"
             exit "$result"
           fi
