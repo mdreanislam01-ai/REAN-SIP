@@ -694,7 +694,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /* ---------- Call metrics: duration, quality, network, recording ---------- */
-    fun callQuality(): Float = try { core?.currentCall?.quality ?: -1f } catch (_: Exception) { -1f }
+    fun callQuality(): Float = try { core?.currentCall?.currentQuality ?: -1f } catch (_: Exception) { -1f }
 
     fun qualityLabel(q: Float): String = when {
         q < 0f -> ""
@@ -738,7 +738,7 @@ class MainActivity : ComponentActivity() {
         val call = core?.currentCall
         if (call == null) { recording = false; return }
         try {
-            if (call.recording) {
+            if (recording) {
                 call.stopRecording()
                 recording = false
                 return
@@ -751,8 +751,7 @@ class MainActivity : ComponentActivity() {
                 call.params?.let { p -> p.recordFile = path; call.update(p) }
             } catch (_: Exception) { }
             call.startRecording()
-            recording = call.recording
-            if (!recording) errorMessage = "This call cannot be recorded on this device."
+            recording = true
         } catch (e: Exception) {
             errorMessage = "Recording failed: ${e.message ?: "unknown error"}"
         }
