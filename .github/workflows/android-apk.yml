@@ -1,0 +1,60 @@
+name: Build CallerX APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'CallerX.html'
+      - 'android/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+      - '.github/workflows/android-apk.yml'
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Configure Android SDK
+        run: |
+          echo "ANDROID_HOME=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> "$GITHUB_ENV"
+          echo "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "${ANDROID_HOME:-/usr/local/lib/android/sdk}/platform-tools" >> "$GITHUB_PATH"
+      - name: Install Android SDK components
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Build debug APK
+        run: |
+          set +e
+          gradle --no-daemon :app:assembleDebug --stacktrace --console=plain > build.log 2>&1
+          result=$?
+          if [ "$result" -ne 0 ]; then
+            tail -n 25 build.log
+            summary=$(grep -E -i -A2 -B1 'e: |error:|unresolved reference|type mismatch|cannot infer|overload resolution|not enough information|cannot access|what went wrong|execution failed' build.log | head -n 30 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            echo "::error::$summary"
+            exit "$result"
+          fi
+          tail -n 25 build.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CallerX-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      - name: Publish installable APK download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: callerx-v1.4.2
+          name: CallerX Android APK v1.4.2
+          target_commitish: ${{ github.sha }}
+          body: Installable CallerX Android debug APK. SIP registration requires a SIP provider with secure WSS and WebRTC audio enabled.
+          files: android/app/build/outputs/apk/debug/app-debug.apk
+          overwrite_files: true
