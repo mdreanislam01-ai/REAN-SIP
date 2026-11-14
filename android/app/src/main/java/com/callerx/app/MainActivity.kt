@@ -552,14 +552,14 @@ class MainActivity : ComponentActivity() {
             params.setIdentityAddress(identity)
             params.setServerAddress(server)
             params.setRegisterEnabled(true)
-            // Route every outgoing call through this server (the registrar/PBX) so the
-            // INVITE goes to the PBX instead of straight to the dialled domain.
+            // Only use an explicit route when the user entered a Proxy. Otherwise leave
+            // the route unset, so the INVITE goes to the dialled address the standard
+            // way (the same as other SIP apps, and as CallerX did before). Forcing the
+            // registrar as the only route broke outgoing calls on this account.
             val proxy = acct.proxy.trim()
             if (proxy.isNotBlank()) {
                 val route = try { Factory.instance().createAddress(if (proxy.startsWith("sip:")) proxy else "sip:$proxy") } catch (_: Exception) { null }
-                if (route != null) params.setRoutesAddresses(arrayOf(route)) else params.setOutboundProxyEnabled(true)
-            } else {
-                params.setOutboundProxyEnabled(true)
+                if (route != null) params.setRoutesAddresses(arrayOf(route))
             }
             val account = c.createAccount(params)
             c.addAuthInfo(auth)
