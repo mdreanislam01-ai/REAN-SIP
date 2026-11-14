@@ -52,13 +52,13 @@ private val people = listOf(
 
 class MainActivity : ComponentActivity() {
     private var core: Core? = null
-    private var registered by mutableStateOf(false)
-    private var registrationMessage by mutableStateOf("SIP Offline")
-    private var callState by mutableStateOf("")
-    private var activeNumber by mutableStateOf("")
-    private var activeCallName by mutableStateOf("")
+    var registered by mutableStateOf(false)
+    var registrationMessage by mutableStateOf("SIP Offline")
+    var callState by mutableStateOf("")
+    var activeNumber by mutableStateOf("")
+    var activeCallName by mutableStateOf("")
     private var activeCall: Call? = null
-    private var errorMessage by mutableStateOf("")
+    var errorMessage by mutableStateOf("")
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startSipCall(activeNumber, activeCallName) else errorMessage = "Microphone permission is needed for SIP audio calls."
     }
@@ -75,7 +75,7 @@ class MainActivity : ComponentActivity() {
             val c = Factory.instance().createCore(null, null, applicationContext)
             core = c
             c.addListener(object : CoreListenerStub() {
-                override fun onRegistrationStateChanged(core: Core, proxyConfig: ProxyConfig, state: RegistrationState, message: String) {
+                override fun onAccountRegistrationStateChanged(core: Core, account: Account, state: RegistrationState, message: String) {
                     runOnUiThread {
                         registered = state == RegistrationState.Ok
                         registrationMessage = when (state) {
@@ -86,20 +86,20 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-                override fun onCallStateChanged(core: Core, call: Call, state: CallState, message: String) {
+                override fun onCallStateChanged(core: Core, call: Call, state: Call.State, message: String) {
                     runOnUiThread {
-                        activeCall = if (state == CallState.End || state == CallState.Error || state == CallState.Released) null else call
-                        if (state == CallState.IncomingReceived) {
+                        activeCall = if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) null else call
+                        if (state == Call.State.IncomingReceived) {
                             activeCallName = call.remoteAddress?.displayName?.takeIf { it.isNotBlank() } ?: "Incoming caller"
-                            activeNumber = call.remoteAddress?.username ?: call.remoteAddressAsString
+                            activeNumber = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
                         }
                         callState = when (state) {
-                            CallState.IncomingReceived -> "Incoming SIP call"
-                            CallState.OutgoingInit, CallState.OutgoingProgress, CallState.OutgoingRinging -> "Calling…"
-                            CallState.Connected -> "Connected"
-                            CallState.StreamsRunning -> "In call"
-                            CallState.End, CallState.Released -> "Call ended"
-                            CallState.Error -> "Call failed: $message"
+                            Call.State.IncomingReceived -> "Incoming SIP call"
+                            Call.State.OutgoingInit, Call.State.OutgoingProgress, Call.State.OutgoingRinging -> "Calling…"
+                            Call.State.Connected -> "Connected"
+                            Call.State.StreamsRunning -> "In call"
+                            Call.State.End, Call.State.Released -> "Call ended"
+                            Call.State.Error -> "Call failed: $message"
                             else -> callState
                         }
                     }
@@ -114,20 +114,20 @@ class MainActivity : ComponentActivity() {
     fun registerSip(username: String, password: String, domain: String, port: String, transport: String) {
         val c = core ?: run { initializeLinphone(); core } ?: return
         try {
-            c.defaultProxyConfig?.let { c.removeProxyConfig(it) }
+            c.clearAccounts()
             c.clearAllAuthInfo()
             val cleanDomain = domain.trim().removePrefix("sip:").substringBefore(';')
             val auth = Factory.instance().createAuthInfo(username.trim(), null, password, null, null, cleanDomain)
-            c.addAuthInfo(auth)
-            val proxy = c.createProxyConfig()
+            val params = c.createAccountParams()
             val identity = Factory.instance().createAddress("sip:${username.trim()}@$cleanDomain")
-            proxy.identityAddress = identity
-            val transportParam = when (transport.uppercase()) { "TLS" -> "tls"; "TCP" -> "tcp"; else -> "udp" }
-            proxy.serverAddr = "sip:$cleanDomain:${port.trim()};transport=$transportParam"
-            proxy.registerEnabled = true
-            proxy.done()
-            c.addProxyConfig(proxy)
-            c.defaultProxyConfig = proxy
+            val server = Factory.instance().createAddress("sip:$cleanDomain:${port.trim()};transport=${transport.lowercase()}")
+            params.setIdentityAddress(identity)
+            params.setServerAddress(server)
+            params.setRegisterEnabled(true)
+            val account = c.createAccount(params)
+            c.addAuthInfo(auth)
+            c.addAccount(account)
+            c.defaultAccount = account
             registrationMessage = "Registering…"
         } catch (e: Exception) {
             registered = false
@@ -155,7 +155,7 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) { errorMessage = "Call could not start: ${e.message ?: "network unavailable"}" }
     }
 
-    fun answerCall() { try { core?.currentCall?.let { core?.acceptCall(it) } } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
+    fun answerCall() { try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
     fun endCall() { try { core?.currentCall?.terminate() ?: core?.terminateAllCalls() } catch (_: Exception) { core?.terminateAllCalls() } }
     fun toggleMute(muted: Boolean) { core?.currentCall?.microphoneMuted = muted }
     fun setSpeaker(enabled: Boolean) {
@@ -167,7 +167,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        try { core?.stop(); core?.release() } catch (_: Exception) { }
+        try { core?.stop() } catch (_: Exception) { }
         core = null
         super.onDestroy()
     }
