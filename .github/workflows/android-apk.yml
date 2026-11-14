@@ -9,6 +9,9 @@ on:
       - 'settings.gradle.kts'
       - 'gradle.properties'
       - '.github/workflows/android-apk.yml'
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -46,3 +49,12 @@ jobs:
           name: CallerX-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+      - name: Publish installable APK download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: callerx-v1.0.0
+          name: CallerX Android APK v1.0.0
+          target_commitish: ${{ github.sha }}
+          body: Installable CallerX Android debug APK. SIP registration requires a SIP provider with secure WSS and WebRTC audio enabled.
+          files: android/app/build/outputs/apk/debug/app-debug.apk
+          overwrite_files: true
