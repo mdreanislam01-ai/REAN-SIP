@@ -52,6 +52,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -67,7 +68,7 @@ private val Palette = listOf(
 )
 private val PaletteNames = listOf("Blue", "Green", "Purple", "Orange", "Pink", "Indigo", "Teal", "Red", "Gray")
 private data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "", val dur: Long = 0)
-private data class SipAccount(val name: String, val user: String, val pass: String, val domain: String, val port: String, val transport: String, val proxy: String, val displayName: String, val autoBoot: Boolean, val enabled: Boolean, val isDefault: Boolean)
+data class SipAccount(val name: String, val user: String, val pass: String, val domain: String, val port: String, val transport: String, val proxy: String, val displayName: String, val autoBoot: Boolean, val enabled: Boolean, val isDefault: Boolean)
 
 private fun loadContacts(context: Context): List<Person> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return emptyList()
@@ -240,7 +241,7 @@ class MainActivity : ComponentActivity() {
             val subs = getSystemService(SubscriptionManager::class.java)?.activeSubscriptionInfoList.orEmpty()
             subs.sortedBy { it.simSlotIndex }.map {
                 val carrier = try { it.carrierName?.toString().orEmpty() } catch (_: Exception) { "" }
-                val line = try { it.number?.orEmpty() } catch (_: Exception) { "" }
+                val line = try { it.number.orEmpty() } catch (_: Exception) { "" }
                 Triple(it.simSlotIndex, carrier.ifBlank { "SIM ${it.simSlotIndex + 1}" }, line)
             }
         } catch (_: Exception) { emptyList() }
@@ -367,9 +368,9 @@ class MainActivity : ComponentActivity() {
                 c.addAccount(account)
                 if (a.isDefault && default == null) default = account
             }
-            c.defaultAccount = default ?: c.accounts.firstOrNull()
+            c.defaultAccount = default ?: c.accountList.firstOrNull()
             registered = false
-            registrationMessage = if (c.accounts.isNotEmpty()) "Registering…" else "SIP Offline"
+            registrationMessage = if (c.accountList.isNotEmpty()) "Registering…" else "SIP Offline"
         } catch (e: Exception) {
             registered = false
             registrationMessage = "SIP Offline"
@@ -689,7 +690,7 @@ class MainActivity : ComponentActivity() {
     /* ---------- Ongoing-call notification ---------- */
     private fun callPendingIntent(action: String, requestCode: Int): android.app.PendingIntent {
         val intent = Intent(this, CallNotificationReceiver::class.java).setAction(action)
-        return android.app.PendingIntent.getBroadcast(this, requestCode, intent, android.app.PendingIntent.FLAG_UPDATE_REQUEST or android.app.PendingIntent.FLAG_IMMUTABLE)
+        return android.app.PendingIntent.getBroadcast(this, requestCode, intent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
     }
 
     fun showCallNotification() {
@@ -712,7 +713,7 @@ class MainActivity : ComponentActivity() {
             val openIntent = Intent(this, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 .putExtra("callerx_open_call", true)
-            builder.setContentIntent(android.app.PendingIntent.getActivity(this, 0, openIntent, android.app.PendingIntent.FLAG_UPDATE_REQUEST or android.app.PendingIntent.FLAG_IMMUTABLE))
+            builder.setContentIntent(android.app.PendingIntent.getActivity(this, 0, openIntent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE))
             builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, if (muted) "Unmute" else "Mute", callPendingIntent("callerx.call.mute", 11)).build())
             builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, if (speaker) "Earpiece" else "Speaker", callPendingIntent("callerx.call.speaker", 12)).build())
             builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, "End call", callPendingIntent("callerx.call.end", 13)).build())
@@ -1029,7 +1030,7 @@ private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit) {
 private fun MessagesTab(activity: MainActivity, messages: List<Pair<String,String>>) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 90.dp)) {
         item {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text("${messages.size} messages", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = { activity.markAllSmsRead() }) { Text("Read all", fontSize = 12.sp) }
             }
