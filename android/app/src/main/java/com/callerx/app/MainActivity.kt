@@ -298,6 +298,7 @@ private fun CallerXApp(activity: MainActivity) {
     var sipPort by remember { mutableStateOf("5060") }
     var transport by remember { mutableStateOf("UDP") }
     var number by remember { mutableStateOf("") }
+    var keypadOpen by remember { mutableStateOf(false) }
     var muted by remember { mutableStateOf(false) }
     var speaker by remember { mutableStateOf(false) }
     var showCallSheet by remember { mutableStateOf(false) }
@@ -360,7 +361,7 @@ private fun CallerXApp(activity: MainActivity) {
                 floatingActionButton = { },
                 bottomBar = { NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     listOf("Calls" to Icons.Filled.Dialpad, "Contacts" to Icons.Filled.Contacts, "Messages" to Icons.AutoMirrored.Filled.Message, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
-                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false }, icon = { Icon(icon, if (label == "Calls") "Keypad" else label) }, label = { Text(if (label == "Calls") "Keypad" else label) }, alwaysShowLabel = true)
+                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false; if (label != "Calls") keypadOpen = false }, icon = { Icon(icon, if (label == "Calls") "Keypad" else label) }, label = { Text(if (label == "Calls") "Keypad" else label) }, alwaysShowLabel = true)
                     }
                 } }
             ) { padding ->
@@ -372,7 +373,7 @@ private fun CallerXApp(activity: MainActivity) {
                         if (tab == "Calls") {
                             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 14.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Text("Dial", Modifier.weight(1f), fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                                IconButton(onClick = { val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager; clip.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.let { number = it.filter { c -> c.isDigit() || c == '+' } } }) { Icon(Icons.Filled.ContentPaste, "Paste number") }
+                                IconButton(onClick = { keypadOpen = !keypadOpen }) { Icon(Icons.Filled.Dialpad, if (keypadOpen) "Hide keypad" else "Open keypad") }
                                 IconButton(onClick = { number = "" }) { Icon(Icons.Filled.DeleteOutline, "Clear number") }
                                 IconButton(onClick = { searchOpen = !searchOpen }) { Icon(Icons.Filled.Search, "Search calls") }
                             }
@@ -388,8 +389,8 @@ private fun CallerXApp(activity: MainActivity) {
                                 val categoryMatches = when (filter) { "Outgoing" -> person.callType == CallLog.Calls.OUTGOING_TYPE; "Received" -> person.callType == CallLog.Calls.INCOMING_TYPE; "Missed" -> person.callType == CallLog.Calls.MISSED_TYPE; else -> true }
                                 categoryMatches && (query.isBlank() || person.name.contains(query, true) || person.number.contains(query, true))
                             }
-                            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 4.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
-                            KeypadPanel(number, onNumber = { number = it }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true })
+                            LazyColumn(Modifier.weight(if (keypadOpen) .55f else 1f), contentPadding = PaddingValues(bottom = 4.dp)) { if (filtered.isEmpty()) item { Text("No recent calls found on this device.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }; items(filtered) { person -> CallRow(person, color, onAvatar = { selected = person }, onCall = { selected = person; showCallSheet = true }) } }
+                            if (keypadOpen) KeypadPanel(number, onNumber = { number = it }, onCall = { selected = Person("Dialed number", number, "?"); showCallSheet = true })
                         } else if (tab == "Contacts") {
                             LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) {
                                 item { SectionTitle("FAVORITES") }
