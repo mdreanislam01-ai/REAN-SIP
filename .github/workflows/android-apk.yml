@@ -52,23 +52,19 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.3
-          name: CallerX Android APK v1.5.3
+          tag_name: callerx-v1.5.4
+          name: CallerX Android APK v1.5.4
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.3 — keypad, contacts cache and search fixes:
-            - Keypad input no longer lags: contacts / call log / SMS are now loaded on a background
-              thread instead of the UI thread, with haptic feedback on every key
-            - Keypad number is a real editable field: tap to place the cursor, Paste (clipboard),
-              Copy and Clear buttons, hold 0 for "+", hold delete to clear everything
-            - The keypad clears itself automatically as soon as a call is placed
-            - SIP calls are stored in the app call history, so a cleared keypad never loses the call
-            - Contact cache stays fresh: ContentObservers on contacts / call log / SMS refresh the
-              lists automatically whenever the phone data changes
-            - Smoother, smarter search: debounced, memoized filtering with stable list keys, works on
-              Calls / Contacts / Messages, matches names, numbers, number endings, T9 keypad letters
-              and initials, with a live result count and a clear button
+            v1.5.4 — call screen no longer cut off by the status bar + heading shows the app name:
+            - The call screen (SIP / SIM 1 / SIM 2) now respects the status bar and navigation bar
+              insets, so the "SIP VOIP · HD AUDIO" badge, name, number, duration / network /
+              recording chips and the End button are never hidden behind system bars
+            - TopBar and the home header use real window insets instead of a hardcoded 24dp guess
+            - Home heading now shows the app name "CallerX"; the active menu name appears small in
+              the subtitle line
+            - Bottom navigation labels and icons are smaller so the menu takes less room
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true

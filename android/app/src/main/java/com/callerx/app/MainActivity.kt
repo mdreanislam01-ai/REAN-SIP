@@ -46,6 +46,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -1118,7 +1120,7 @@ private fun CallerXApp(activity: MainActivity) {
                 containerColor = MaterialTheme.colorScheme.background,
                 bottomBar = { NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     listOf("Calls" to Icons.Filled.Call, "Contacts" to Icons.Filled.Contacts, "Messages" to Icons.AutoMirrored.Filled.Message, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
-                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false; query = "" }, icon = { Icon(icon, label, modifier = Modifier.size(22.dp)) }, label = { Text(label, fontSize = 11.sp) }, alwaysShowLabel = true)
+                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false; query = "" }, icon = { Icon(icon, label, modifier = Modifier.size(20.dp)) }, label = { Text(label, fontSize = 9.sp, maxLines = 1) }, alwaysShowLabel = true)
                     }
                 } }
             ) { padding ->
@@ -1209,13 +1211,13 @@ private fun HomeHeader(tab: String, sip: String, sipOnline: Boolean, searchOpen:
         "Calls" -> "SIM 1, SIM 2 & SIP call history"
         "Contacts" -> "Device contacts & favorites"
         "Messages" -> "SMS inbox"
-        else -> "CallerX VoIP & Dual-SIM preferences"
+        else -> "VoIP & Dual-SIM preferences"
     }
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(start = 18.dp, end = 12.dp, top = 14.dp, bottom = 10.dp)) {
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).statusBarsPadding().padding(start = 18.dp, end = 12.dp, top = 10.dp, bottom = 10.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text(tab, fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onSurface)
-                Text(subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+                Text("CallerX", fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onSurface)
+                Text("$tab · $subtitle", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (tab == "Calls" || tab == "Contacts" || tab == "Messages") IconButton(onClick = onSearch) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, "Search", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
             SipPill(sip, sipOnline, onSip)
@@ -1438,7 +1440,7 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
     val netLabel = activity.networkTypeLabel()
     val netTint = if (quality >= 3f || !source.startsWith("SIP")) Color(0xFF22A06B) else if (quality >= 2f) Color(0xFFD47622) else if (quality >= 0f) Color(0xFFD64545) else Color(0xFF5C6873)
     Box(Modifier.fillMaxSize().background(background)) {
-        Column(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(horizontal = 24.dp, vertical = 14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
                 Surface(shape = RoundedCornerShape(50), color = sourceColor.copy(alpha = if (dark) .22f else .09f), border = androidx.compose.foundation.BorderStroke(1.dp, sourceColor.copy(alpha = .25f))) {
                     Row(Modifier.padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1869,7 +1871,7 @@ private fun BlockedScreen(activity: MainActivity, onBack: () -> Unit) {
 
 /* ---------- Misc screens ---------- */
 @Composable
-private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) } }
+private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).statusBarsPadding().padding(top = 6.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold) } }
 
 @Composable
 private fun DialerScreen(number: String, onNumber: (String) -> Unit, onBack: () -> Unit, onCall: () -> Unit) {
