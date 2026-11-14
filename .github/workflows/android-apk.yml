@@ -52,18 +52,20 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.6
-          name: CallerX Android APK v1.5.6
+          tag_name: callerx-v1.5.7
+          name: CallerX Android APK v1.5.7
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.6 — themed heading:
-            - The home heading bar now uses the active theme accent color across the FULL header
-              (all 9 accent colors + dark mode), with white heading text on top
-            - The SIP status pill sits on the coloured heading as a translucent white chip
-            - Status bar icons switch to light over the coloured heading (Android 15+ edge-to-edge)
-              so they stay visible on every accent color
-            - Everything else is unchanged
+            v1.5.7 — theme everywhere + NoXsip-style contact details:
+            - Every settings option icon, the call screen accent (badge, rings, avatar) and all
+              option rows now follow the selected theme accent color (all 9 accents + dark mode)
+            - Contact details redesigned like the NoXsip reference: centred themed avatar + name,
+              number card with round call/message buttons, WhatsApp / Telegram / Gmail message rows
+              (real intents, Gmail pre-fills the contact email when available), "Call logs" card with
+              Today/Yesterday dates, source and duration per call
+            - "+" in the top-right saves the number to device contacts
+            - Favorite / Edit / Block options and tags & notes are kept in a compact card below
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true

@@ -168,6 +168,18 @@ private val T9_MAP = mapOf(
 private fun digitsOnly(s: String) = s.filter { it.isDigit() }
 private fun toT9(s: String) = buildString { for (ch in s.lowercase()) { val d = T9_MAP[ch]; if (d != null) append(d) else if (ch.isDigit()) append(ch) } }
 
+private fun relDay(ts: Long): String {
+    if (ts <= 0L) return ""
+    val now = java.util.Calendar.getInstance()
+    val cal = java.util.Calendar.getInstance().apply { timeInMillis = ts }
+    val sameYear = cal.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR)
+    return when {
+        sameYear && cal.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR) -> "Today"
+        sameYear && cal.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR) - 1 -> "Yesterday"
+        else -> DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(ts))
+    }
+}
+
 private fun matchesQuery(name: String, number: String, rawQuery: String): Boolean {
     val q = rawQuery.trim()
     if (q.isEmpty()) return true
@@ -1430,7 +1442,7 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
     val background = if (dark) Color(0xFF071426) else Color(0xFFF9FAFB)
     val primaryText = if (dark) Color(0xFFF8FAFC) else Color(0xFF111827)
     val secondaryText = if (dark) Color(0xFFA6B2C2) else Color(0xFF64748B)
-    val sourceColor = when { source.startsWith("SIM 1") -> Color(0xFF2563EB); source.startsWith("SIM 2") -> Color(0xFF0F9D8A); else -> Color(0xFF5B5BD6) }
+    val sourceColor = MaterialTheme.colorScheme.primary
     val transition = rememberInfiniteTransition()
     val pulse by transition.animateFloat(initialValue = 1f, targetValue = 1.07f, animationSpec = infiniteRepeatable(animation = tween(2200, easing = FastOutSlowInEasing), repeatMode = RepeatMode.Reverse))
     var tick by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -1538,134 +1550,146 @@ private fun ContactDetailScreen(activity: MainActivity, person: Person, recents:
     var showAddTag by remember { mutableStateOf(false) }
     var newTag by remember { mutableStateOf("") }
     var showAllCalls by remember { mutableStateOf(false) }
+    var contactEmail by remember { mutableStateOf("") }
     val blocked = activity.isBlockedNumber(person.number)
     val history = remember(recents, norm) { recents.filter { digitsOnly(it.number) == digitsOnly(norm) } }
     val totalSec = remember(history) { history.sumOf { it.dur } }
+    val primary = MaterialTheme.colorScheme.primary
+    val secondaryText = MaterialTheme.colorScheme.onSurfaceVariant
+    val divider = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+
+    LaunchedEffect(person.number) {
+        contactEmail = withContext(Dispatchers.IO) {
+            try {
+                var email = ""
+                context.contentResolver.query(Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_URI, Uri.encode(norm)), arrayOf(ContactsContract.PhoneLookup._ID), null, null, null)?.use { c ->
+                    if (c.moveToNext()) {
+                        val id = c.getString(0)
+                        context.contentResolver.query(ContactsContract.CommonDataKinds.Email.CONTENT_URI, arrayOf(ContactsContract.CommonDataKinds.Email.ADDRESS), ContactsContract.CommonDataKinds.Email.CONTACT_ID + "=?", arrayOf(id), null)?.use { e -> if (e.moveToNext()) email = e.getString(0).orEmpty() }
+                    }
+                }
+                email
+            } catch (_: Exception) { "" }
+        }
+    }
+
+    fun openApp(url: String, missing: String) {
+        try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } catch (_: Exception) { activity.errorMessage = missing }
+    }
+    fun openGmail() {
+        val direct = Intent(Intent.ACTION_SENDTO, Uri.parse(if (contactEmail.isNotBlank()) "mailto:$contactEmail" else "mailto:"))
+        direct.setPackage("com.google.android.gm")
+        try { context.startActivity(direct) } catch (_: Exception) {
+            try { context.startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:"))) } catch (_: Exception) { activity.errorMessage = "No email app is installed on this device." }
+        }
+    }
+    fun addContact() {
+        val i = Intent(ContactsContract.Intents.Insert.ACTION)
+        i.type = ContactsContract.Contacts.CONTENT_TYPE
+        i.putExtra(ContactsContract.Intents.Insert.PHONE, norm)
+        try { context.startActivity(i) } catch (_: Exception) { activity.errorMessage = "No contacts app is available on this device." }
+    }
+    val digits = norm.filter { it.isDigit() }
 
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 24.dp).padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }
-            Text("Contact details", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            IconButton(onClick = { fav = !fav; prefs.edit().putBoolean("fav:$norm", fav).apply() }) { Icon(if (fav) Icons.Filled.Star else Icons.Filled.StarBorder, "Favorite", tint = if (fav) Color(0xFFE5A50A) else MaterialTheme.colorScheme.onSurfaceVariant) }
-            IconButton(onClick = onEdit) { Icon(Icons.Filled.Edit, "Edit contact", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp)) }
+        Row(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 6.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onSurface) }
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = { addContact() }) { Icon(Icons.Filled.Add, "Add to contacts", tint = MaterialTheme.colorScheme.onSurface) }
         }
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 28.dp)) {
-            Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(top = 22.dp, bottom = 22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Box(Modifier.size(82.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary), contentAlignment = Alignment.Center) {
-                    Text(person.initials.take(1).uppercase(), color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.Bold)
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(Modifier.size(96.dp).clip(CircleShape).background(primary), contentAlignment = Alignment.Center) {
+                Text(person.initials.take(1).uppercase(), color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(14.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(person.name, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                if (blocked) Surface(shape = RoundedCornerShape(50), color = Color(0xFFD64545).copy(alpha = 0.12f)) { Text("BLOCKED", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB33A3A), modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)) }
+            }
+            Spacer(Modifier.height(18.dp))
+            Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                Column(Modifier.fillMaxWidth()) {
+                    Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 10.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(person.number, fontSize = 16.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+                        Box(Modifier.size(46.dp).clip(CircleShape).background(primary.copy(alpha = 0.12f)).clickable(onClick = onCall), contentAlignment = Alignment.Center) { Icon(Icons.Filled.Call, "Call", tint = primary, modifier = Modifier.size(19.dp)) }
+                        Spacer(Modifier.width(10.dp))
+                        Box(Modifier.size(46.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).clickable(onClick = onMessage), contentAlignment = Alignment.Center) { Icon(Icons.AutoMirrored.Filled.Message, "Message", tint = MaterialTheme.colorScheme.onSurface, modifier = Modifier.size(19.dp)) }
+                    }
+                    HorizontalDivider(Modifier.padding(start = 16.dp, end = 16.dp), color = divider)
+                    AppLinkRow(Color(0xFF25D366), Icons.AutoMirrored.Filled.Message, "Message on WhatsApp") { openApp("https://wa.me/$digits", "WhatsApp is not installed on this device.") }
+                    HorizontalDivider(Modifier.padding(start = 16.dp, end = 16.dp), color = divider)
+                    AppLinkRow(Color(0xFF229ED9), Icons.Filled.Send, "Message on Telegram") { openApp("https://t.me/+$digits", "Telegram is not installed on this device.") }
+                    HorizontalDivider(Modifier.padding(start = 16.dp, end = 16.dp), color = divider)
+                    AppLinkRow(Color(0xFFEA4335), Icons.Filled.Mail, "Message on Gmail") { openGmail() }
                 }
-                Spacer(Modifier.height(12.dp))
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(person.name, fontSize = 21.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                    if (blocked) Surface(shape = RoundedCornerShape(50), color = Color(0xFFD64545).copy(alpha = 0.12f)) { Text("BLOCKED", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color(0xFFB33A3A), modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)) }
-                }
-                Text(person.number, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 3.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 16.dp)) {
-                    ActionPill(Icons.Filled.Call, "Call", onCall)
-                    ActionPill(Icons.AutoMirrored.Filled.Message, "Message", onMessage)
+            }
+            Row(Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 20.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Call logs", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+                Text("Total ${fmtDur(totalSec).ifBlank { "0s" }}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = primary)
+            }
+            Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                Column(Modifier.fillMaxWidth()) {
+                    val visibleHistory = if (showAllCalls) history else history.take(4)
+                    if (visibleHistory.isEmpty()) Text("No calls with this number yet.", Modifier.padding(16.dp), fontSize = 12.sp, color = secondaryText)
+                    visibleHistory.forEachIndexed { i, h ->
+                        val missed = h.callType == CallLog.Calls.MISSED_TYPE
+                        val outgoing = h.callType == CallLog.Calls.OUTGOING_TYPE
+                        val typeWord = if (missed) "Missed" else if (outgoing) "Outgoing" else "Received"
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("${relDay(h.ts)} ${h.time}".trim(), fontSize = 15.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                                Text(h.source, fontSize = 12.sp, color = secondaryText)
+                            }
+                            Text("$typeWord ${fmtDur(h.dur)}".trim(), fontSize = 13.sp, color = if (missed) Color(0xFFD64545) else secondaryText)
+                        }
+                        if (i != visibleHistory.lastIndex) HorizontalDivider(Modifier.padding(start = 16.dp, end = 16.dp), color = divider)
+                    }
+                    if (history.size > 4) TextButton(onClick = { showAllCalls = !showAllCalls }, modifier = Modifier.fillMaxWidth()) { Text(if (showAllCalls) "Show less" else "Show all calls", fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
                 }
             }
             Spacer(Modifier.height(14.dp))
-            Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-                    Column(Modifier.fillMaxWidth()) {
-                        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text("Call History", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                                Text("Duration & call source breakdown", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)) {
-                                Text("Total: ${fmtDur(totalSec).ifBlank { "0s" }}", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp))
-                            }
-                        }
-                        val visibleHistory = if (showAllCalls) history else history.take(4)
-                        if (visibleHistory.isEmpty()) Text("No calls with this number yet.", Modifier.padding(start = 16.dp, end = 16.dp, bottom = 14.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        visibleHistory.forEach { h ->
-                            val missed = h.callType == CallLog.Calls.MISSED_TYPE
-                            val outgoing = h.callType == CallLog.Calls.OUTGOING_TYPE
-                            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Icon(if (missed) Icons.Filled.CallMissed else if (outgoing) Icons.Filled.CallMade else Icons.Filled.CallReceived, null, tint = if (missed) Color(0xFFD64545) else if (outgoing) MaterialTheme.colorScheme.primary else Color(0xFF22A06B), modifier = Modifier.size(15.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text("${if (missed) "Missed" else if (outgoing) "Outgoing" else "Received"} · ${h.source}", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
-                                    Text(h.time, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                                Text(fmtDur(h.dur).ifBlank { "—" }, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            HorizontalDivider(Modifier.padding(start = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-                        }
-                        if (history.size > 4) {
-                            TextButton(onClick = { showAllCalls = !showAllCalls }, modifier = Modifier.fillMaxWidth()) { Text(if (showAllCalls) "Show less" else "Show all calls", fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
-                        } else Spacer(Modifier.height(6.dp))
+            Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    SettingRow(Icons.Filled.Star, primary, "Favorite", if (fav) "Saved in your favorites" else "Add this contact to favorites", toggle = true, checked = fav, onClick = { fav = !fav; prefs.edit().putBoolean("fav:$norm", fav).apply() })
+                    SettingRow(Icons.Filled.Edit, primary, "Edit contact", "Open the device contact editor", onClick = onEdit)
+                    SettingRow(if (blocked) Icons.Filled.Check else Icons.Filled.Block, Color(0xFFD64545), if (blocked) "Unblock number" else "Block number", if (blocked) "Calls from this number are rejected" else "Reject calls from this number", onClick = { activity.setBlocked(person.number, !blocked) })
+                }
+            }
+            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
+                Text("TAGS", fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = secondaryText)
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    tags.forEachIndexed { i, t ->
+                        AssistChip(onClick = { tags = tags.toMutableList().also { it.removeAt(i) }; prefs.edit().putString("tags:$norm", JSONArray(tags.toList()).toString()).apply() }, label = { Text(t, fontSize = 12.sp) }, leadingIcon = { Icon(Icons.Filled.Close, null, modifier = Modifier.size(13.dp)) })
+                    }
+                    AssistChip(onClick = { showAddTag = !showAddTag }, label = { Text("+ Add tag", fontSize = 12.sp) })
+                }
+                if (showAddTag) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+                        OutlinedTextField(newTag, { newTag = it }, Modifier.weight(1f), singleLine = true, placeholder = { Text("e.g. Office, VIP", fontSize = 12.sp) }, shape = RoundedCornerShape(14.dp))
+                        TextButton(onClick = { if (newTag.isNotBlank()) { tags = tags.toMutableList().also { it.add(newTag.trim()) }; prefs.edit().putString("tags:$norm", JSONArray(tags.toList()).toString()).apply(); newTag = ""; showAddTag = false } }) { Text("Add") }
                     }
                 }
-                Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Caller ID details", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
-                        DetailRow("Mobile", person.number)
-                        DetailRow("Carrier", "Bangladesh Mobile Network")
-                        DetailRow("Location", "Bangladesh")
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Text("Spam score", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Surface(shape = RoundedCornerShape(50), color = if (person.spam) Color(0xFFD64545).copy(alpha = 0.12f) else Color(0xFF22A06B).copy(alpha = 0.12f)) {
-                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)) {
-                                    Icon(if (person.spam) Icons.Filled.Warning else Icons.Filled.Verified, null, tint = if (person.spam) Color(0xFFB33A3A) else Color(0xFF1E7E52), modifier = Modifier.size(13.dp))
-                                    Text(if (person.spam) "Spam Likely" else "Low", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (person.spam) Color(0xFFB33A3A) else Color(0xFF1E7E52))
-                                }
-                            }
-                        }
-                    }
-                }
-                Column {
-                    Text("TAGS", fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        tags.forEachIndexed { i, t ->
-                            AssistChip(onClick = { tags = tags.toMutableList().also { it.removeAt(i) }; prefs.edit().putString("tags:$norm", JSONArray(tags.toList()).toString()).apply() }, label = { Text(t, fontSize = 12.sp) }, leadingIcon = { Icon(Icons.Filled.Close, null, modifier = Modifier.size(13.dp)) })
-                        }
-                        AssistChip(onClick = { showAddTag = !showAddTag }, label = { Text("+ Add tag", fontSize = 12.sp) })
-                    }
-                    if (showAddTag) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
-                            OutlinedTextField(newTag, { newTag = it }, Modifier.weight(1f), singleLine = true, placeholder = { Text("e.g. Office, VIP", fontSize = 12.sp) }, shape = RoundedCornerShape(14.dp))
-                            TextButton(onClick = { if (newTag.isNotBlank()) { tags = tags.toMutableList().also { it.add(newTag.trim()) }; prefs.edit().putString("tags:$norm", JSONArray(tags.toList()).toString()).apply(); newTag = ""; showAddTag = false } }) { Text("Add") }
-                        }
-                    }
-                }
-                Column {
-                    Text("NOTES", fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(note, { note = it; prefs.edit().putString("note:$norm", it).apply() }, Modifier.fillMaxWidth(), placeholder = { Text("Add a note about this contact...", fontSize = 13.sp) }, minLines = 3, shape = RoundedCornerShape(18.dp))
-                }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-                    TextButton(onClick = { activity.setBlocked(person.number, !blocked) }) {
-                        Icon(if (blocked) Icons.Filled.Check else Icons.Filled.Block, null, tint = Color(0xFFD64545), modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text(if (blocked) "Unblock number" else "Report or block number", color = Color(0xFFD64545))
-                    }
-                }
+                Spacer(Modifier.height(14.dp))
+                Text("NOTES", fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = secondaryText)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(note, { note = it; prefs.edit().putString("note:$norm", it).apply() }, Modifier.fillMaxWidth(), placeholder = { Text("Add a note about this contact...", fontSize = 13.sp) }, minLines = 3, shape = RoundedCornerShape(18.dp))
             }
         }
     }
 }
 
 @Composable
-private fun ActionPill(icon: ImageVector, label: String, onClick: () -> Unit) {
-    Surface(onClick = onClick, shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)) {
-        Row(Modifier.padding(horizontal = 22.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            Icon(icon, label, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
-            Text(label, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
-        }
+private fun AppLinkRow(tint: Color, icon: ImageVector, label: String, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)).background(tint), contentAlignment = Alignment.Center) { Icon(icon, label, tint = Color.White, modifier = Modifier.size(17.dp)) }
+        Spacer(Modifier.width(12.dp))
+        Text(label, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+        Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f), modifier = Modifier.size(18.dp))
     }
 }
 
-@Composable
-private fun DetailRow(key: String, value: String) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(key, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
-    }
-}
+
 
 /* ---------- SIP accounts ---------- */
 @Composable
@@ -1819,22 +1843,22 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
         }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
             SectionTitle("ACCOUNT")
-            SettingRow(Icons.Filled.Person, Color(0xFFC34F86), "My Profile & User Account", "CallerX profile · auto backup on", onProfile)
+            SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "My Profile & User Account", "CallerX profile · auto backup on", onProfile)
             SectionTitle("VOIP & SIP")
-            SettingRow(Icons.Filled.Cloud, Color(0xFF2563EB), "SIP Account", if (defaultAcc != null) "${defaultAcc.domain} · ${activity.registrationMessage}" else "No account added", onSip)
-            SettingRow(Icons.Filled.GraphicEq, Color(0xFF7053B5), "Audio & Codec", "Opus HD, G.722 · noise suppression on", onRoute = null, onClick = { activity.errorMessage = "Codecs in use: Opus 48k HD, PCMU, PCMA, G.722 and DTMF events. Echo cancellation is always on." })
+            SettingRow(Icons.Filled.Cloud, MaterialTheme.colorScheme.primary, "SIP Account", if (defaultAcc != null) "${defaultAcc.domain} · ${activity.registrationMessage}" else "No account added", onSip)
+            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio & Codec", "Opus HD, G.722 · noise suppression on", onRoute = null, onClick = { activity.errorMessage = "Codecs in use: Opus 48k HD, PCMU, PCMA, G.722 and DTMF events. Echo cancellation is always on." })
             SectionTitle("SIM CALLING & RECORDING")
-            SettingRow(Icons.Filled.SimCard, Color(0xFF0EA5E9), "SIM 1", "Show SIM 1 as a call option", toggle = true, checked = sim1, onClick = { sim1 = !sim1; prefs.edit().putBoolean("setting:SIM 1", sim1).apply() })
-            SettingRow(Icons.Filled.SimCard, Color(0xFF0F9D8A), "SIM 2", "Show SIM 2 as a call option", toggle = true, checked = sim2, onClick = { sim2 = !sim2; prefs.edit().putBoolean("setting:SIM 2", sim2).apply() })
-            SettingRow(Icons.Filled.SwapCalls, Color(0xFF455FC2), "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else "Use the default route automatically", toggle = true, checked = ask, onClick = { ask = !ask; prefs.edit().putBoolean("setting:Ask before each call", ask).apply() })
-            SettingRow(Icons.Filled.Mic, Color(0xFFD64545), "Auto Call Recording", if (autoRec) "On · every call is recorded (${activity.recordingCount()} saved)" else "Off · ${activity.recordingCount()} recordings saved", toggle = true, checked = autoRec, onClick = { autoRec = !autoRec; prefs.edit().putBoolean("setting:autoRecord", autoRec).apply() })
-            SettingRow(Icons.Filled.Call, Color(0xFF16845B), "Default call route", if (route.isBlank()) "Not set — you are asked every time" else "All calls go via $route", onRoute)
+            SettingRow(Icons.Filled.SimCard, MaterialTheme.colorScheme.primary, "SIM 1", "Show SIM 1 as a call option", toggle = true, checked = sim1, onClick = { sim1 = !sim1; prefs.edit().putBoolean("setting:SIM 1", sim1).apply() })
+            SettingRow(Icons.Filled.SimCard, MaterialTheme.colorScheme.primary, "SIM 2", "Show SIM 2 as a call option", toggle = true, checked = sim2, onClick = { sim2 = !sim2; prefs.edit().putBoolean("setting:SIM 2", sim2).apply() })
+            SettingRow(Icons.Filled.SwapCalls, MaterialTheme.colorScheme.primary, "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else "Use the default route automatically", toggle = true, checked = ask, onClick = { ask = !ask; prefs.edit().putBoolean("setting:Ask before each call", ask).apply() })
+            SettingRow(Icons.Filled.Mic, MaterialTheme.colorScheme.primary, "Auto Call Recording", if (autoRec) "On · every call is recorded (${activity.recordingCount()} saved)" else "Off · ${activity.recordingCount()} recordings saved", toggle = true, checked = autoRec, onClick = { autoRec = !autoRec; prefs.edit().putBoolean("setting:autoRecord", autoRec).apply() })
+            SettingRow(Icons.Filled.Call, MaterialTheme.colorScheme.primary, "Default call route", if (route.isBlank()) "Not set — you are asked every time" else "All calls go via $route", onRoute)
             SectionTitle("GENERAL & SYSTEM")
-            SettingRow(Icons.Filled.Phone, Color(0xFF22A06B), "Dialer & Default Permission", if (activity.isDefaultDialer()) "CallerX is the default dialer" else "Set as default dialer · grant permissions", onDialer)
-            SettingRow(Icons.Filled.Block, Color(0xFFCA4545), "Blocked numbers", "${activity.blockedNumbers().size} numbers · calls are rejected", onBlocked)
-            SettingRow(Icons.Filled.FlashOn, Color(0xFFD47622), "Power Mode", "Unrestricted · best for background SIP", onPower)
-            SettingRow(Icons.Filled.Palette, Color(0xFF7053B5), "Theme color", "Accent applies to the whole app", onTheme)
-            SettingRow(Icons.Filled.DarkMode, Color(0xFF68717D), "Dark Mode", if (dark) "On" else "Off", toggle = true, checked = dark, onClick = { onDark(!dark) })
+            SettingRow(Icons.Filled.Phone, MaterialTheme.colorScheme.primary, "Dialer & Default Permission", if (activity.isDefaultDialer()) "CallerX is the default dialer" else "Set as default dialer · grant permissions", onDialer)
+            SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Blocked numbers", "${activity.blockedNumbers().size} numbers · calls are rejected", onBlocked)
+            SettingRow(Icons.Filled.FlashOn, MaterialTheme.colorScheme.primary, "Power Mode", "Unrestricted · best for background SIP", onPower)
+            SettingRow(Icons.Filled.Palette, MaterialTheme.colorScheme.primary, "Theme color", "Accent applies to the whole app", onTheme)
+            SettingRow(Icons.Filled.DarkMode, MaterialTheme.colorScheme.primary, "Dark Mode", if (dark) "On" else "Off", toggle = true, checked = dark, onClick = { onDark(!dark) })
         }
     }
 }
@@ -1967,9 +1991,9 @@ private fun ProfileScreen(onBack: () -> Unit, onTheme: () -> Unit, onSettings: (
             Spacer(Modifier.height(18.dp))
             Column(Modifier.fillMaxWidth()) {
                 SettingRow(Icons.Filled.Edit, MaterialTheme.colorScheme.primary, "Edit Profile", "Name, number and status are stored on this device", onClick = { })
-                SettingRow(Icons.Filled.Settings, Color(0xFF68717D), "Notifications", "Open Android notification settings for CallerX", onClick = onNotifications)
-                SettingRow(Icons.Filled.Palette, Color(0xFF7053B5), "Theme", "Change the accent color of the whole app", onClick = onTheme)
-                SettingRow(Icons.Filled.Settings, Color(0xFF455FC2), "Settings", "Back to all settings", onClick = onSettings)
+                SettingRow(Icons.Filled.Settings, MaterialTheme.colorScheme.primary, "Notifications", "Open Android notification settings for CallerX", onClick = onNotifications)
+                SettingRow(Icons.Filled.Palette, MaterialTheme.colorScheme.primary, "Theme", "Change the accent color of the whole app", onClick = onTheme)
+                SettingRow(Icons.Filled.Settings, MaterialTheme.colorScheme.primary, "Settings", "Back to all settings", onClick = onSettings)
             }
         }
     }
@@ -1993,7 +2017,7 @@ private fun ThemeScreen(selected: Int, onSelect: (Int) -> Unit, dark: Boolean, o
                 }
             }
             Spacer(Modifier.height(8.dp))
-            SettingRow(Icons.Filled.DarkMode, Color(0xFF68717D), "Dark Mode", if (dark) "On" else "Off", toggle = true, checked = dark, onClick = { onDark(!dark) })
+            SettingRow(Icons.Filled.DarkMode, MaterialTheme.colorScheme.primary, "Dark Mode", if (dark) "On" else "Off", toggle = true, checked = dark, onClick = { onDark(!dark) })
         }
     }
 }
