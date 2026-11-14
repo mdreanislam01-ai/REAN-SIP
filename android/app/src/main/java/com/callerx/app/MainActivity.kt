@@ -138,6 +138,8 @@ class MainActivity : ComponentActivity() {
     var callConnected by mutableStateOf(false)
     var muted by mutableStateOf(false)
     var speaker by mutableStateOf(false)
+    var callStartedAt by mutableStateOf(0L)
+    var recording by mutableStateOf(false)
     private var incomingVibrationOn = false
     var dialIntentNumber by mutableStateOf("")
     var callUiRequested by mutableStateOf(false)
@@ -474,10 +476,14 @@ class MainActivity : ComponentActivity() {
                                     try { call.decline(Reason.Busy) } catch (_: Exception) { }
                                 } else startIncomingVibration()
                             }
-                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> { callConnected = false; muted = false; speaker = false }
-                            Call.State.Connected -> { callConnected = true; stopIncomingVibration() }
-                            Call.State.StreamsRunning -> { callConnected = true; stopIncomingVibration() }
-                            Call.State.End, Call.State.Released, Call.State.Error -> stopIncomingVibration()
+                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> { callConnected = false; muted = false; speaker = false; callStartedAt = 0L; recording = false }
+                            Call.State.Connected -> { callConnected = true; stopIncomingVibration(); if (callStartedAt == 0L) callStartedAt = System.currentTimeMillis() }
+                            Call.State.StreamsRunning -> {
+                                callConnected = true; stopIncomingVibration()
+                                if (callStartedAt == 0L) callStartedAt = System.currentTimeMillis()
+                                maybeAutoRecord()
+                            }
+                            Call.State.End, Call.State.Released, Call.State.Error -> { stopIncomingVibration(); callStartedAt = 0L; recording = false }
                             else -> { }
                         }
                         callState = when (state) {
@@ -686,6 +692,79 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) { }
         showCallNotification()
     }
+
+    /* ---------- Call metrics: duration, quality, network, recording ---------- */
+    fun callQuality(): Float = try { core?.currentCall?.quality ?: -1f } catch (_: Exception) { -1f }
+
+    fun qualityLabel(q: Float): String = when {
+        q < 0f -> ""
+        q >= 4f -> "Excellent"
+        q >= 3f -> "Good"
+        q >= 2f -> "Fair"
+        else -> "Poor"
+    }
+
+    fun networkTypeLabel(): String {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager ?: return "Network"
+            val net = cm.activeNetwork ?: return "No network"
+            val caps = cm.getNetworkCapabilities(net) ?: return "Network"
+            when {
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> cellularGeneration()
+                else -> "Network"
+            }
+        } catch (_: Exception) { "Network" }
+    }
+
+    private fun cellularGeneration(): String {
+        return try {
+            val tm = getSystemService(android.telephony.TelephonyManager::class.java) ?: return "Mobile"
+            val type = if (Build.VERSION.SDK_INT >= 30) tm.dataNetworkType else @Suppress("DEPRECATION") tm.networkType
+            when (type) {
+                android.telephony.TelephonyManager.NETWORK_TYPE_NR -> "5G"
+                android.telephony.TelephonyManager.NETWORK_TYPE_LTE -> "4G LTE"
+                android.telephony.TelephonyManager.NETWORK_TYPE_HSPAP, android.telephony.TelephonyManager.NETWORK_TYPE_HSPA,
+                android.telephony.TelephonyManager.NETWORK_TYPE_UMTS, android.telephony.TelephonyManager.NETWORK_TYPE_EVDO_0,
+                android.telephony.TelephonyManager.NETWORK_TYPE_EVDO_A -> "3G"
+                android.telephony.TelephonyManager.NETWORK_TYPE_EDGE, android.telephony.TelephonyManager.NETWORK_TYPE_GPRS,
+                android.telephony.TelephonyManager.NETWORK_TYPE_CDMA -> "2G"
+                else -> "Mobile"
+            }
+        } catch (_: Exception) { "Mobile" }
+    }
+
+    fun toggleCallRecording() {
+        val call = core?.currentCall
+        if (call == null) { recording = false; return }
+        try {
+            if (call.recording) {
+                call.stopRecording()
+                recording = false
+                return
+            }
+            val dir = File(filesDir, "recordings")
+            if (!dir.exists()) dir.mkdirs()
+            val safe = activeCallName.filter { it.isLetterOrDigit() }.ifBlank { "call" }
+            val path = File(dir, "${safe}_${System.currentTimeMillis()}.mkv").absolutePath
+            try {
+                call.params?.let { p -> p.recordFile = path; call.update(p) }
+            } catch (_: Exception) { }
+            call.startRecording()
+            recording = call.recording
+            if (!recording) errorMessage = "This call cannot be recorded on this device."
+        } catch (e: Exception) {
+            errorMessage = "Recording failed: ${e.message ?: "unknown error"}"
+        }
+    }
+
+    private fun maybeAutoRecord() {
+        if (recording) return
+        if (!prefs().getBoolean("setting:autoRecord", false)) return
+        toggleCallRecording()
+    }
+
+    fun recordingCount(): Int = try { File(filesDir, "recordings").listFiles()?.size ?: 0 } catch (_: Exception) { 0 }
 
     /* ---------- Ongoing-call notification ---------- */
     private fun callPendingIntent(action: String, requestCode: Int): android.app.PendingIntent {
@@ -1123,6 +1202,21 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
     val sourceColor = when { source.startsWith("SIM 1") -> Color(0xFF2563EB); source.startsWith("SIM 2") -> Color(0xFF0F9D8A); else -> Color(0xFF5B5BD6) }
     val transition = rememberInfiniteTransition()
     val pulse by transition.animateFloat(initialValue = 1f, targetValue = 1.07f, animationSpec = infiniteRepeatable(animation = tween(2200, easing = FastOutSlowInEasing), repeatMode = RepeatMode.Reverse))
+    var tick by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(activity.callStartedAt, activity.callConnected) {
+        while (activity.callStartedAt > 0L) { tick = System.currentTimeMillis(); delay(1000) }
+    }
+    LaunchedEffect(TelecomCallBridge.state) {
+        val s = TelecomCallBridge.state
+        if (s == "Incoming cellular call" || s == "Call ended") activity.callStartedAt = 0L
+        if (s == "Connected" && activity.callStartedAt == 0L) activity.callStartedAt = System.currentTimeMillis()
+    }
+    val durationSec = if (activity.callStartedAt > 0L) ((tick - activity.callStartedAt).coerceAtLeast(0L) / 1000L) else 0L
+    val durationText = String.format("%02d:%02d", durationSec / 60, durationSec % 60)
+    val quality = activity.callQuality()
+    val qLabel = activity.qualityLabel(quality)
+    val netLabel = activity.networkTypeLabel()
+    val netTint = if (quality >= 3f || !source.startsWith("SIP")) Color(0xFF22A06B) else if (quality >= 2f) Color(0xFFD47622) else if (quality >= 0f) Color(0xFFD64545) else Color(0xFF5C6873)
     Box(Modifier.fillMaxSize().background(background)) {
         Column(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
@@ -1142,6 +1236,11 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
             Row(Modifier.padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box(Modifier.size(7.dp).clip(CircleShape).background(if (incoming) Color(0xFFF59E0B) else Color(0xFF22A06B)))
                 Text(state.ifBlank { "Connecting…" }, color = secondaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            }
+            Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (activity.callStartedAt > 0L) CallInfoChip(Icons.Filled.History, "Duration $durationText", if (dark) Color(0xFF7DD8A8) else Color(0xFF1E7E52))
+                CallInfoChip(Icons.Filled.SignalCellular4Bar, if (qLabel.isNotBlank() && source.startsWith("SIP")) "$netLabel · $qLabel" else netLabel, netTint)
+                if (activity.recording) CallInfoChip(Icons.Filled.FiberManualRecord, "Recording", Color(0xFFE5484D))
             }
             Spacer(Modifier.weight(1f))
             Box(Modifier.size(200.dp), contentAlignment = Alignment.Center) {
@@ -1168,11 +1267,22 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
                     CallControl(Icons.Filled.MicOff, "Mute", activity.muted, dark, secondaryText) { activity.toggleMute(!activity.muted) }
                     CallControl(Icons.Filled.VolumeUp, "Speaker", activity.speaker, dark, secondaryText) { activity.setSpeakerOn(!activity.speaker) }
                     CallControl(Icons.Filled.Pause, if (hold) "Resume" else "Hold", hold, dark, secondaryText) { hold = !hold; activity.toggleHold(hold) }
+                    if (!isCell) CallControl(Icons.Filled.FiberManualRecord, if (activity.recording) "Stop" else "Record", activity.recording, dark, secondaryText) { activity.toggleCallRecording() }
                 }
                 Spacer(Modifier.height(20.dp))
                 FilledIconButton(onClick = onEnd, modifier = Modifier.size(66.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFFDC3F45), contentColor = Color.White)) { Icon(Icons.Filled.CallEnd, "End call", modifier = Modifier.size(29.dp)) }
                 Text("End call", color = primaryText, fontSize = 12.sp, modifier = Modifier.padding(top = 7.dp, bottom = 22.dp))
             }
+        }
+    }
+}
+
+@Composable
+private fun CallInfoChip(icon: ImageVector, text: String, tint: Color) {
+    Surface(shape = RoundedCornerShape(50), color = tint.copy(alpha = 0.14f)) {
+        Row(Modifier.padding(horizontal = 10.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            Icon(icon, null, tint = tint, modifier = Modifier.size(13.dp))
+            Text(text, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = tint)
         }
     }
 }
@@ -1486,7 +1596,7 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.SimCard, Color(0xFF0EA5E9), "SIM 1", "Show SIM 1 as a call option", toggle = true, checked = sim1, onClick = { sim1 = !sim1; prefs.edit().putBoolean("setting:SIM 1", sim1).apply() })
             SettingRow(Icons.Filled.SimCard, Color(0xFF0F9D8A), "SIM 2", "Show SIM 2 as a call option", toggle = true, checked = sim2, onClick = { sim2 = !sim2; prefs.edit().putBoolean("setting:SIM 2", sim2).apply() })
             SettingRow(Icons.Filled.SwapCalls, Color(0xFF455FC2), "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else "Use the default route automatically", toggle = true, checked = ask, onClick = { ask = !ask; prefs.edit().putBoolean("setting:Ask before each call", ask).apply() })
-            SettingRow(Icons.Filled.Mic, Color(0xFFD64545), "Auto Call Recording", if (autoRec) "On: every call is recorded" else "Off", toggle = true, checked = autoRec, onClick = { autoRec = !autoRec; prefs.edit().putBoolean("setting:autoRecord", autoRec).apply() })
+            SettingRow(Icons.Filled.Mic, Color(0xFFD64545), "Auto Call Recording", if (autoRec) "On · every call is recorded (${activity.recordingCount()} saved)" else "Off · ${activity.recordingCount()} recordings saved", toggle = true, checked = autoRec, onClick = { autoRec = !autoRec; prefs.edit().putBoolean("setting:autoRecord", autoRec).apply() })
             SettingRow(Icons.Filled.Call, Color(0xFF16845B), "Default call route", if (route.isBlank()) "Not set — you are asked every time" else "All calls go via $route", onRoute)
             SectionTitle("GENERAL & SYSTEM")
             SettingRow(Icons.Filled.Phone, Color(0xFF22A06B), "Dialer & Default Permission", if (activity.isDefaultDialer()) "CallerX is the default dialer" else "Set as default dialer · grant permissions", onDialer)
