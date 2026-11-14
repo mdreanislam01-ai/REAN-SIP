@@ -14,5 +14,5 @@ dependencyResolutionManagement {
         maven { url 'https://download.linphone.org/releases/android/maven_repository/' }
     }
 }
-rootProject.name = "Rean Dialer"
+rootProject.name = "CallerX"
 include ':app'

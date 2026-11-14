@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">রিয়ান ডায়ালার</string>
+    <string name="app_name">CallerX</string>
     <string name="channel_service_name">SIP সংযোগ</string>
     <string name="channel_calls_name">ইনকামিং কল</string>
     <string name="channel_calls_desc">ইনকামিং SIP কলের উচ্চ অগ্রাধিকার নোটিফিকেশন</string>

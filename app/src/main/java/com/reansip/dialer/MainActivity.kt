@@ -1,69 +1,113 @@
 package com.reansip.dialer
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.app.role.RoleManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.view.View
-import android.widget.LinearLayout
-import android.widget.TextView
+import android.provider.Settings
+import android.telecom.TelecomManager
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import com.google.android.material.card.MaterialCardView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.reansip.dialer.core.CoreManager
 import com.reansip.dialer.core.ReanCoreService
-import com.reansip.dialer.data.CallLogStore
-import com.reansip.dialer.data.RecentCall
 import com.reansip.dialer.data.SipAccount
 import com.reansip.dialer.data.SipAccountStore
-import com.reansip.dialer.databinding.ActivityMainBinding
-import com.reansip.dialer.ui.accounts.AccountEditActivity
-import com.reansip.dialer.ui.call.CallActivity
+import org.json.JSONObject
 import org.linphone.core.Call
 import org.linphone.core.RegistrationState
-import java.text.DateFormat
-import java.util.Date
 
+/**
+ * Renders the UI supplied by the user, unmodified in structure, from local app
+ * assets. Native code only supplies Android permissions and the SIP engine.
+ */
 class MainActivity : AppCompatActivity(), CoreManager.Events {
 
-    private lateinit var binding: ActivityMainBinding
-    private val accountStore by lazy { SipAccountStore(this) }
+    companion object {
+        const val ACTION_SHOW_INCOMING = "com.reansip.dialer.action.SHOW_INCOMING"
+        const val EXTRA_NUMBER = "number"
+        const val EXTRA_NAME = "name"
+    }
 
-    private val permissionRequester = registerForActivityResult(
+    private lateinit var webView: WebView
+    private var pageReady = false
+    private var pendingIncoming: Pair<String, String>? = null
+    private var afterPermissions: (() -> Unit)? = null
+
+    private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { grants ->
-        if (grants[Manifest.permission.RECORD_AUDIO] == true) {
-            startCoreServiceIfAllowed()
+    ) { result ->
+        val microphoneAllowed = result[Manifest.permission.RECORD_AUDIO]
+            ?: hasPermission(Manifest.permission.RECORD_AUDIO)
+        val next = afterPermissions
+        afterPermissions = null
+        if (microphoneAllowed) {
+            next?.invoke()
         } else {
-            Toast.makeText(this, R.string.permission_microphone, Toast.LENGTH_LONG).show()
+            sendToUi("callerXError(${js(getString(R.string.permission_microphone))})")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            grants[Manifest.permission.POST_NOTIFICATIONS] == false
+            result[Manifest.permission.POST_NOTIFICATIONS] == false
         ) {
             Toast.makeText(this, R.string.permission_notifications, Toast.LENGTH_LONG).show()
         }
     }
 
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, window.decorView).hide(WindowInsetsCompat.Type.systemBars())
 
-        bindUi()
+        setContentView(R.layout.activity_callerx)
+        webView = findViewById(R.id.callerxWebView)
+        webView.setBackgroundColor(android.graphics.Color.BLACK)
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            allowFileAccess = true
+            allowContentAccess = false
+            allowFileAccessFromFileURLs = false
+            allowUniversalAccessFromFileURLs = false
+            blockNetworkLoads = true
+            builtInZoomControls = false
+            displayZoomControls = false
+            setSupportZoom(false)
+            mediaPlaybackRequiresUserGesture = true
+        }
+        webView.addJavascriptInterface(CallerXBridge(this), "CallerXNative")
+        webView.webChromeClient = WebChromeClient()
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                // This UI is bundled with the APK. Keeping navigation local protects the
+                // deliberately narrow Javascript interface above.
+                return request.url.scheme != "file"
+            }
+        }
+        webView.loadUrl("file:///android_asset/callerx-ui.html")
+
         CoreManager.ensureCore(this)
-        requestCallPermissionsIfNeeded()
-        refreshAll()
+        consumeIntent(intent)
     }
 
     override fun onResume() {
         super.onResume()
         CoreManager.addListener(this)
-        refreshAll()
-        startCoreServiceIfAllowed()
+        if (SipAccountStore(this).activeAccount() != null && hasPermission(Manifest.permission.RECORD_AUDIO)) {
+            ReanCoreService.start(this)
+        }
     }
 
     override fun onPause() {
@@ -71,263 +115,208 @@ class MainActivity : AppCompatActivity(), CoreManager.Events {
         super.onPause()
     }
 
-    private fun bindUi() = with(binding) {
-        buttonAccounts.setOnClickListener { showAccountPicker() }
-        buttonAddFirstAccount.setOnClickListener { openAccountEditor() }
-        buttonSwitchAccount.setOnClickListener { showAccountPicker() }
-
-        buttonDialpadTab.setOnClickListener { showDialpad(true) }
-        buttonRecentsTab.setOnClickListener { showDialpad(false) }
-
-        val digits = mapOf(
-            key1 to "1", key2 to "2", key3 to "3",
-            key4 to "4", key5 to "5", key6 to "6",
-            key7 to "7", key8 to "8", key9 to "9",
-            keyStar to "*", key0 to "0", keyHash to "#"
-        )
-        digits.forEach { (button, digit) ->
-            button.setOnClickListener { editNumber.append(digit) }
-        }
-        key0.setOnLongClickListener {
-            if (!editNumber.text.toString().endsWith("+")) editNumber.append("+")
-            true
-        }
-        buttonBackspace.setOnClickListener {
-            val t = editNumber.text
-            if (t.isNotEmpty()) t.delete(t.length - 1, t.length)
-        }
-        buttonBackspace.setOnLongClickListener {
-            editNumber.text?.clear()
-            true
-        }
-        buttonCall.setOnClickListener { placeCall() }
+    override fun onDestroy() {
+        webView.removeJavascriptInterface("CallerXNative")
+        webView.destroy()
+        super.onDestroy()
     }
 
-    private fun requestCallPermissionsIfNeeded() {
-        val needed = mutableListOf<String>()
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            needed += Manifest.permission.RECORD_AUDIO
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            needed += Manifest.permission.POST_NOTIFICATIONS
-        }
-        if (needed.isNotEmpty()) permissionRequester.launch(needed.toTypedArray())
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeIntent(intent)
     }
 
-    private fun startCoreServiceIfAllowed() {
-        if (accountStore.activeAccount() == null) return
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+    private fun consumeIntent(intent: Intent?) {
+        if (intent?.action != ACTION_SHOW_INCOMING) return
+        val number = intent.getStringExtra(EXTRA_NUMBER).orEmpty()
+        val name = intent.getStringExtra(EXTRA_NAME).orEmpty()
+        if (number.isNotBlank()) showIncoming(name, number)
+    }
+
+    /** Called only by the known local asset after its DOM and its supplied JS are ready. */
+    fun onCallerXUiReady() {
+        pageReady = true
+        hydrateSipUi()
+        pendingIncoming?.let { (name, number) ->
+            pendingIncoming = null
+            showIncoming(name, number)
+        }
+    }
+
+    fun saveSipFromUi(payload: String) {
+        val data = try {
+            JSONObject(payload)
+        } catch (_: Throwable) {
+            sendToUi("callerXError(${js("Invalid SIP account details")})")
+            return
+        }
+        val username = data.optString("username").trim()
+        val server = data.optString("server").trim()
+        if (username.isBlank() || server.isBlank()) {
+            sendToUi("callerXError(${js("Username and SIP server are required")})")
+            return
+        }
+        withCallPermissions {
+            val store = SipAccountStore(this)
+            val previous = store.activeAccount()
+            val port = data.optString("port").trim()
+            val domain = server.removePrefix("sip:").removePrefix("sips:").removeSuffix("/")
+                .let { raw ->
+                    if (port.isBlank() || raw.substringAfterLast(':', "").all { it.isDigit() }) raw
+                    else "$raw:$port"
+                }
+            val newPassword = data.optString("password")
+            val account = SipAccount(
+                id = previous?.id ?: System.currentTimeMillis(),
+                label = previous?.label ?: "CallerX SIP",
+                username = username,
+                password = newPassword.ifBlank { previous?.password.orEmpty() },
+                domain = domain,
+                transport = data.optString("transport", "TLS").uppercase(),
+                displayName = previous?.displayName.orEmpty(),
+                registerEnabled = true
+            )
+            store.upsert(account)
+            store.setActive(account.id)
+            CoreManager.applyAccounts(this)
             ReanCoreService.start(this)
+            sendToUi("callerXOnSipSaved()")
         }
     }
 
-    private fun refreshAll() {
-        val active = accountStore.activeAccount()
-        binding.emptyAccountPanel.visibility = if (active == null) View.VISIBLE else View.GONE
-        binding.dialerPanel.visibility = if (active == null) View.GONE else View.VISIBLE
-        binding.activeAccountLabel.text = active?.let { "${it.displayLabel()} • ${it.domain}" }.orEmpty()
-        binding.buttonSwitchAccount.visibility = if (accountStore.list().size > 1) View.VISIBLE else View.GONE
-        updateRegistration(CoreManager.lastRegState, CoreManager.lastRegMessage)
-        renderRecents()
-    }
-
-    private fun updateRegistration(state: RegistrationState, message: String) = with(binding) {
-        when (state) {
-            RegistrationState.Ok -> {
-                statusLabel.setText(R.string.registered)
-                statusDot.setBackgroundResource(R.drawable.bg_status)
+    fun startSipCallFromUi(number: String) {
+        withCallPermissions {
+            if (SipAccountStore(this).activeAccount() == null) {
+                sendToUi("callerXError(${js(getString(R.string.sip_not_ready))})")
+                return@withCallPermissions
             }
-            RegistrationState.Progress -> {
-                statusLabel.setText(R.string.registration_progress)
-                statusDot.setBackgroundResource(R.drawable.bg_status_warn)
-            }
-            RegistrationState.Failed -> {
-                statusLabel.setText(R.string.registration_failed)
-                statusDot.setBackgroundResource(R.drawable.bg_status_error)
-            }
-            else -> {
-                statusLabel.setText(R.string.not_registered)
-                statusDot.setBackgroundResource(R.drawable.bg_status_warn)
+            ReanCoreService.start(this)
+            CoreManager.applyAccounts(this)
+            if (!CoreManager.startCall(this, number)) {
+                sendToUi("callerXError(${js(getString(R.string.invalid_number))})")
             }
         }
-        if (message.isNotBlank() && state == RegistrationState.Failed) {
-            activeAccountLabel.text = message
+    }
+
+    fun openSystemDialer(number: String) {
+        val target = number.replace(Regex("[^0-9+*#]"), "")
+        if (target.isBlank()) return
+        try {
+            startActivity(Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", target, null)))
+        } catch (_: Throwable) {
+            sendToUi("callerXError(${js("No phone dialer is available")})")
         }
     }
 
-    private fun showDialpad(dialpad: Boolean) = with(binding) {
-        dialpadContent.visibility = if (dialpad) View.VISIBLE else View.GONE
-        recentsContent.visibility = if (dialpad) View.GONE else View.VISIBLE
-        buttonDialpadTab.isEnabled = !dialpad
-        buttonRecentsTab.isEnabled = dialpad
-        if (!dialpad) renderRecents()
+    fun answerCallFromUi() {
+        CoreManager.currentCall()?.let(CoreManager::answer)
     }
 
-    private fun placeCall() {
-        val raw = binding.editNumber.text?.toString().orEmpty().trim()
-        if (raw.isEmpty()) {
-            binding.editNumber.error = getString(R.string.invalid_number)
+    fun endCallFromUi() {
+        CoreManager.hangup(CoreManager.currentCall())
+    }
+
+    fun setMutedFromUi(muted: Boolean) {
+        CoreManager.setMicMuted(muted)
+    }
+
+    fun setSpeakerFromUi(on: Boolean) {
+        CoreManager.currentCall()?.let { CoreManager.routeSpeaker(it, on) }
+    }
+
+    fun toggleHoldFromUi() {
+        CoreManager.currentCall()?.let(CoreManager::toggleHold)
+    }
+
+    /** Recording remains opt-in from the record button already present in the supplied UI. */
+    fun toggleRecordingFromUi() {
+        CoreManager.toggleRecording()
+    }
+
+    fun setAutoRecordingFromUi(enabled: Boolean) {
+        CoreManager.setRecordingEnabled(enabled)
+    }
+
+    fun requestCallPermissionsFromUi() {
+        withCallPermissions { /* permissions are now available for native SIP calling */ }
+    }
+
+    fun requestDefaultDialerFromUi() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val roles = getSystemService(RoleManager::class.java)
+                if (roles.isRoleAvailable(RoleManager.ROLE_DIALER) && !roles.isRoleHeld(RoleManager.ROLE_DIALER)) {
+                    startActivity(roles.createRequestRoleIntent(RoleManager.ROLE_DIALER))
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                startActivity(Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER).putExtra(
+                    TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME,
+                    packageName
+                ))
+            }
+        } catch (_: Throwable) {
+            startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
+        }
+    }
+
+    private fun withCallPermissions(action: () -> Unit) {
+        val missing = buildList {
+            if (!hasPermission(Manifest.permission.RECORD_AUDIO)) add(Manifest.permission.RECORD_AUDIO)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                !hasPermission(Manifest.permission.POST_NOTIFICATIONS)
+            ) add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (missing.isEmpty()) action() else {
+            afterPermissions = action
+            permissionsLauncher.launch(missing.toTypedArray())
+        }
+    }
+
+    private fun hasPermission(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+    private fun hydrateSipUi() {
+        val account = SipAccountStore(this).activeAccount()
+        val accountObject = account?.let {
+            "{username:${js(it.username)},server:${js(it.domain.substringBefore(':'))},port:${js(it.domain.substringAfter(':', "5060"))},transport:${js(it.transport)}}"
+        } ?: "null"
+        val online = CoreManager.lastRegState == RegistrationState.Ok
+        sendToUi("callerXHydrateSip($accountObject,$online)")
+    }
+
+    private fun showIncoming(name: String, number: String) {
+        if (!pageReady) {
+            pendingIncoming = name to number
             return
         }
-        if (accountStore.activeAccount() == null) {
-            Toast.makeText(this, R.string.sip_not_ready, Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestCallPermissionsIfNeeded()
-            return
-        }
-        startCoreServiceIfAllowed()
-        // applyAccounts is idempotent and ensures an account is loaded before dialing.
-        CoreManager.applyAccounts(this)
-        if (CoreManager.startCall(this, raw)) {
-            startActivity(Intent(this, CallActivity::class.java))
-        } else {
-            Toast.makeText(this, R.string.sip_not_ready, Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun showAccountPicker() {
-        val accounts = accountStore.list()
-        if (accounts.isEmpty()) {
-            openAccountEditor()
-            return
-        }
-        val labels = accounts.map { a ->
-            if (a.id == accountStore.activeId()) "${a.displayLabel()}  ✓" else a.displayLabel()
-        }.toTypedArray()
-        val checked = accounts.indexOfFirst { it.id == accountStore.activeId() }.coerceAtLeast(0)
-        AlertDialog.Builder(this)
-            .setTitle(R.string.select_account)
-            .setSingleChoiceItems(labels, checked) { dialog, which ->
-                accountStore.setActive(accounts[which].id)
-                CoreManager.applyAccounts(this)
-                startCoreServiceIfAllowed()
-                dialog.dismiss()
-                refreshAll()
-            }
-            .setNegativeButton(R.string.add_account) { _, _ -> openAccountEditor() }
-            .setPositiveButton(R.string.edit_account) { _, _ ->
-                openAccountEditor(accounts[checked])
-            }
-            .show()
-    }
-
-    private fun openAccountEditor(account: SipAccount? = null) {
-        startActivity(Intent(this, AccountEditActivity::class.java).apply {
-            if (account != null) putExtra(AccountEditActivity.EXTRA_ACCOUNT_ID, account.id)
-        })
-    }
-
-    private fun renderRecents() {
-        val container = binding.recentsList
-        container.removeAllViews()
-        val history = CallLogStore(this).list()
-        if (history.isEmpty()) {
-            val empty = TextView(this).apply {
-                text = "${getString(R.string.no_recents)}\n${getString(R.string.no_recents_body)}"
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_secondary))
-                textSize = 15f
-                gravity = android.view.Gravity.CENTER
-                setPadding(24, 90, 24, 90)
-            }
-            container.addView(empty, LinearLayout.LayoutParams(-1, -2))
-            return
-        }
-        history.forEach { entry -> container.addView(recentRow(entry)) }
-        val clear = TextView(this).apply {
-            text = getString(R.string.clear_history)
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.danger))
-            textSize = 14f
-            gravity = android.view.Gravity.CENTER
-            setPadding(16, 28, 16, 20)
-            setOnClickListener { confirmClearHistory() }
-        }
-        container.addView(clear, LinearLayout.LayoutParams(-1, -2))
-    }
-
-    private fun recentRow(entry: RecentCall): View {
-        val card = MaterialCardView(this).apply {
-            radius = 20f
-            cardElevation = 0f
-            setCardBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.surface_card))
-            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 8 }
-            isClickable = true
-            isFocusable = true
-            setOnClickListener {
-                binding.editNumber.setText(entry.number)
-                showDialpad(true)
-            }
-        }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-            setPadding(18, 14, 18, 14)
-        }
-        val details = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
-        }
-        val name = TextView(this).apply {
-            text = entry.displayName.ifBlank { entry.number }
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_primary))
-            textSize = 16f
-            maxLines = 1
-        }
-        val type = when {
-            entry.missed -> getString(R.string.missed_call)
-            entry.direction == "in" -> getString(R.string.incoming)
-            else -> getString(R.string.outgoing)
-        }
-        val detail = TextView(this).apply {
-            val duration = if (entry.durationSec > 0) " • ${durationText(entry.durationSec)}" else ""
-            text = "$type$duration • ${DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(entry.timestamp))}"
-            setTextColor(ContextCompat.getColor(this@MainActivity, if (entry.missed) R.color.danger else R.color.text_secondary))
-            textSize = 12f
-            maxLines = 1
-        }
-        details.addView(name)
-        details.addView(detail)
-        row.addView(details)
-        val number = TextView(this).apply {
-            text = if (entry.displayName.isNotBlank()) entry.number else ""
-            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.text_muted))
-            textSize = 12f
-            maxLines = 1
-        }
-        row.addView(number)
-        card.addView(row)
-        return card
-    }
-
-    private fun durationText(seconds: Int): String = getString(R.string.duration_format, seconds / 60, seconds % 60)
-
-    private fun confirmClearHistory() {
-        AlertDialog.Builder(this)
-            .setMessage(R.string.confirm_clear_history)
-            .setNegativeButton(R.string.no, null)
-            .setPositiveButton(R.string.yes) { _, _ ->
-                CallLogStore(this).clear()
-                renderRecents()
-                Toast.makeText(this, R.string.history_cleared, Toast.LENGTH_SHORT).show()
-            }
-            .show()
+        sendToUi("callerXShowIncoming(${js(name)},${js(number)})")
     }
 
     override fun onRegistrationStateChanged(state: RegistrationState, message: String) {
-        updateRegistration(state, message)
-    }
-
-    override fun onRecentsChanged() {
-        renderRecents()
+        sendToUi("callerXSetSipStatus(${js(if (state == RegistrationState.Ok) "ok" else "offline")})")
     }
 
     override fun onCallStateChanged(call: Call, state: Call.State, message: String) {
-        if (state == Call.State.IncomingReceived) return
-        if (state == Call.State.OutgoingInit || state == Call.State.OutgoingProgress || state == Call.State.OutgoingRinging) {
-            startActivity(Intent(this, CallActivity::class.java))
+        when (state) {
+            Call.State.IncomingReceived -> {
+                showIncoming(call.remoteAddress.displayName.orEmpty(), call.remoteAddress.username ?: call.remoteAddress.asStringUriOnly())
+            }
+            Call.State.Connected, Call.State.StreamsRunning -> sendToUi("callerXCallConnected()")
+            Call.State.End, Call.State.Error, Call.State.Released -> sendToUi("callerXCallEnded()")
+            else -> Unit
         }
     }
+
+    override fun onBackPressed() {
+        sendToUi("go('s-calls')")
+    }
+
+    private fun sendToUi(script: String) {
+        if (!pageReady || isFinishing || isDestroyed) return
+        runOnUiThread { webView.evaluateJavascript("javascript:$script", null) }
+    }
+
+    private fun js(value: String): String = JSONObject.quote(value)
 }

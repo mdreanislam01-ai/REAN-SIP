@@ -16,6 +16,7 @@ import org.linphone.core.CoreListenerStub
 import org.linphone.core.Factory
 import org.linphone.core.RegistrationState
 import org.linphone.core.TransportType
+import java.io.File
 import java.util.IdentityHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -194,6 +195,7 @@ object CoreManager {
         return try {
             val params = c.createCallParams(null) ?: return false
             params.setVideoEnabled(false)
+            configureRecordingFile(params)
             c.inviteAddressWithParams(address, params)
             true
         } catch (t: Throwable) {
@@ -207,6 +209,7 @@ object CoreManager {
             val c = core ?: return
             val params = c.createCallParams(call) ?: return
             params.setVideoEnabled(false)
+            configureRecordingFile(params)
             call.acceptWithParams(params)
         } catch (t: Throwable) {
             Log.e(TAG, "answer failed", t)
@@ -230,6 +233,49 @@ object CoreManager {
     }
 
     fun isMicMuted(): Boolean = micMuted
+
+    @Volatile
+    private var recordingRequested = false
+
+    @Volatile
+    private var recordingActive = false
+
+    /**
+     * A record file is prepared for every SIP call but no audio is written until
+     * the existing Auto Record / record control in the CallerX UI enables it.
+     */
+    private fun configureRecordingFile(params: org.linphone.core.CallParams) {
+        val ctx = appContext ?: return
+        try {
+            val dir = File(ctx.filesDir, "recordings").apply { mkdirs() }
+            val file = File(dir, "CallerX-${System.currentTimeMillis()}.wav")
+            params.setRecordFile(file.absolutePath)
+        } catch (t: Throwable) {
+            Log.w(TAG, "prepare recording", t)
+        }
+    }
+
+    fun setRecordingEnabled(enabled: Boolean) {
+        recordingRequested = enabled
+        val call = currentCall() ?: return
+        try {
+            if (enabled && !recordingActive) {
+                call.startRecording()
+                recordingActive = true
+            } else if (!enabled && recordingActive) {
+                call.stopRecording()
+                recordingActive = false
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "recording", t)
+            recordingActive = false
+        }
+    }
+
+    fun toggleRecording(): Boolean {
+        setRecordingEnabled(!recordingRequested)
+        return recordingRequested
+    }
 
     /** Returns true when ON hold after the toggle. */
     fun toggleHold(call: Call): Boolean {
@@ -334,9 +380,13 @@ object CoreManager {
                         meta.answered = true
                         meta.startMillis = System.currentTimeMillis()
                     }
+                    if (recordingRequested && !recordingActive) setRecordingEnabled(true)
                     ReanCoreService.get()?.onCallActive()
                 }
                 Call.State.End, Call.State.Error -> {
+                    try { if (recordingActive) call.stopRecording() } catch (_: Throwable) { }
+                    recordingActive = false
+                    recordingRequested = false
                     logRecent(call)
                 }
                 Call.State.Released -> {

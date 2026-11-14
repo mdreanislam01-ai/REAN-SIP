@@ -22,7 +22,6 @@ import androidx.core.content.ContextCompat
 import com.reansip.dialer.MainActivity
 import com.reansip.dialer.R
 import com.reansip.dialer.ReanDialerApp
-import com.reansip.dialer.ui.incoming.IncomingCallActivity
 import org.linphone.core.Call
 import org.linphone.core.RegistrationState
 
@@ -118,9 +117,10 @@ class ReanCoreService : Service(), CoreManager.Events {
         val number = call.remoteAddress.username ?: call.remoteAddress.asStringUriOnly()
         val name = call.remoteAddress.displayName ?: ""
 
-        val fullScreen = Intent(this, IncomingCallActivity::class.java).apply {
-            putExtra(IncomingCallActivity.EXTRA_NUMBER, number)
-            putExtra(IncomingCallActivity.EXTRA_NAME, name)
+        val fullScreen = Intent(this, MainActivity::class.java).apply {
+            action = MainActivity.ACTION_SHOW_INCOMING
+            putExtra(MainActivity.EXTRA_NUMBER, number)
+            putExtra(MainActivity.EXTRA_NAME, name)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
         val pi = PendingIntent.getActivity(

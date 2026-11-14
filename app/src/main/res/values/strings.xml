@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Rean Dialer</string>
+    <string name="app_name">CallerX</string>
     <string name="channel_service_name">SIP connection</string>
     <string name="channel_calls_name">Incoming calls</string>
     <string name="channel_calls_desc">High-priority notifications for incoming SIP calls</string>
@@ -8,13 +8,15 @@
     <string name="reg_ok">Connected • ready for calls</string>
     <string name="reg_registering">Connecting to SIP server…</string>
     <string name="reg_failed">Connection failed</string>
+
+    <!-- Kept for existing native SIP surfaces; caller-facing UI is the supplied HTML. -->
     <string name="dialpad">Dialpad</string>
     <string name="recents">Recents</string>
     <string name="accounts">Accounts</string>
     <string name="add_account">Add account</string>
     <string name="edit_account">Edit account</string>
     <string name="no_account_title">Add your SIP account</string>
-    <string name="no_account_body">Rean Dialer is private by design. Your server details stay only on this device.</string>
+    <string name="no_account_body">Your server details stay only on this device.</string>
     <string name="add_first_account">Add SIP account</string>
     <string name="account_label">Account name</string>
     <string name="account_label_hint">e.g. Office line</string>

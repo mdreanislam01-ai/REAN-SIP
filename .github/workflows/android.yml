@@ -1,4 +1,4 @@
-name: Build Rean Dialer APK
+name: Build CallerX APK
 
 on:
   push:
@@ -54,13 +54,13 @@ jobs:
         run: |
           mkdir -p artifacts
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -n1)
-          cp "$APK" "artifacts/ReanDialer-v1.0.0-build${{ github.run_number }}.apk"
+          cp "$APK" "artifacts/CallerX-v1.0.0-build${{ github.run_number }}.apk"
           cd artifacts && sha256sum *.apk > checksums.sha256 && ls -la
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ReanDialer-debug-build${{ github.run_number }}
+          name: CallerX-debug-build${{ github.run_number }}
           path: artifacts/
           retention-days: 30
 
@@ -72,5 +72,5 @@ jobs:
           gh release delete dev-latest --yes --cleanup-tag || true
           gh release create dev-latest artifacts/*.apk artifacts/checksums.sha256 \
             --target "$GITHUB_SHA" \
-            --title "Rean Dialer — latest dev build (#$GITHUB_RUN_NUMBER)" \
+            --title "CallerX — latest dev build (#$GITHUB_RUN_NUMBER)" \
             --notes "Automated APK build from commit $GITHUB_SHA (branch: $GITHUB_REF_NAME). Verify the download with checksums.sha256." || true

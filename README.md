@@ -1,21 +1,18 @@
-# Rean Dialer
+# CallerX
 
-**Rean Dialer** is a private, native Android SIP/VoIP dialer built with Kotlin and the professional Linphone SIP engine.
+**CallerX** is a native Android SIP/VoIP dialer. Its UI is rendered directly from the supplied `CallerX-Complete-UI.html` design and its launcher icon uses the supplied CallerX logo.
 
-## Highlights
+## Included
 
-- SIP calling over UDP, TCP, or TLS
-- Add, edit, and switch between multiple personal SIP accounts
-- Foreground SIP service for dependable incoming calls and lock-screen call UI
-- Native dialpad, DTMF keypad, mute, speaker routing, and hold/resume controls
-- Live in-call codec and call-quality feedback
-- On-device call history; no analytics or cloud tracking
-- English and বাংলা interface, selected automatically by device language
-- Ocean Blue dark interface, optimized for Android 8.0+ (API 26)
+- Supplied CallerX HTML UI (Calls, Messages, Contacts, Settings, SIP, Call screens, and all supplied navigation)
+- SIP calling with UDP, TCP, and TLS via Linphone
+- SIP account storage and registration
+- Foreground SIP service, wake lock, incoming-call notification, and lock-screen CallerX UI
+- Call controls connected to the native SIP engine: mute, speaker route, hold, end call, and opt-in auto recording
+- Runtime microphone and Android 13+ notification permission handling
+- Existing “Set as Default Dialer” action opens Android’s supported default-dialer request
 
-> No SIP server is preconfigured. Add your own account under **Accounts**.
-
-## Build locally
+## Build
 
 Requirements: Android SDK platform 34 and JDK 17.
 
@@ -23,16 +20,8 @@ Requirements: Android SDK platform 34 and JDK 17.
 ./gradlew assembleDebug
 ```
 
-The debug APK is produced at:
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
+## Automated APK
 
-## Download APK
-
-Every push builds a debug APK in GitHub Actions and updates the rolling [`dev-latest` release](https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/dev-latest). Download its APK and `checksums.sha256`, verify the checksum, then open the APK on your Android device to install.
-
-## Privacy
-
-SIP credentials and call history are stored locally on the device. Rean Dialer does not include tracking, advertising SDKs, or account telemetry.
+Every push to the working branch runs GitHub Actions, uploads an APK artifact, and updates the rolling [`dev-latest` release](https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/dev-latest) with an APK and SHA-256 checksum.
