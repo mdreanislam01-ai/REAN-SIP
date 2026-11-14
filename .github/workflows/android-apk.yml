@@ -52,21 +52,22 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.9
-          name: CallerX Android APK v1.5.9
+          tag_name: callerx-v1.5.10
+          name: CallerX Android APK v1.5.10
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.9 — settings headers fixed & profile is now editable:
-            - Every sub-screen header (SIP accounts, SIP form, Settings, Blocked numbers) now uses
-              the unified TopBar with the real status bar inset, so headings are never pushed under
-              the status bar on any screen
-            - All headers (TopBar + the Settings tab heading) are coloured with the active theme
-              accent, matching the home heading
-            - Settings > My Profile is fully editable: name, mobile number, Gmail/email and status
-              are saved on the device and shown on the profile hero
-            - Profile photo: "Change photo" opens the system photo picker, the picture is stored in
-              app storage and shown in the round avatar; "Remove photo" clears it
+            v1.5.10 — SIP connection stability:
+            - Foreground keep-alive service (low-priority "SIP service" notification) keeps the SIP
+              registration and the process alive while the app is in the background, so returning to
+              the app no longer shows "Registering…/Reconnecting"
+            - SIP keepalive packets every 30 s (linphonerc) keep the carrier NAT pinhole open, which
+              stops mid-call audio drops
+            - During a call a partial wake lock + Wi-Fi lock is held so the CPU/radio never sleeps
+              mid-conversation
+            - Network callback re-registers instantly when Wi-Fi/mobile data switches or returns
+            - Automatic registration retry every 20 s after a failure; the error dialog now appears
+              only after several consecutive failures and mentions the auto-retry
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true
