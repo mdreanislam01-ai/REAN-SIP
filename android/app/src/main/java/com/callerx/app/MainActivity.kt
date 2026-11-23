@@ -1492,13 +1492,12 @@ private fun CallerXApp(activity: MainActivity) {
         val win = (view.context as? android.app.Activity)?.window
         if (win != null) {
             val statusColor = when (screen) {
-                "dialer" -> if (dark) Color(0xFF101318) else Color(0xFFF6F8FA)   // white dialer, dark icons
                 "call" -> if (dark) Color(0xFF071426) else Color(0xFFF9FAFB)
                 else -> color                                                     // accent header, white icons
             }
             if (Build.VERSION.SDK_INT < 35) win.statusBarColor = statusColor.toArgb()   // ignored (edge-to-edge) on Android 15+
             androidx.core.view.WindowCompat.getInsetsController(win, view).isAppearanceLightStatusBars =
-                (screen == "dialer" || screen == "call") && !dark
+                screen == "call" && !dark
             /* Call screen must show over the lock screen and keep the screen on,
                otherwise locking the phone kills the visible call UI / mic. */
             if (screen == "call") {
@@ -2499,19 +2498,23 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
 
     Column(
         Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
-            .statusBarsPadding().navigationBarsPadding(),
+            .navigationBarsPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        /* ---- Slim top bar: back arrow + a light CallerX heading ---- */
+        /* ---- Top strip in the app theme colour: the colour is drawn behind the
+               status bar as well, so no white band is left above the header ---- */
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
+            Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primary).statusBarsPadding()
+                .padding(start = 4.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onSurface) }
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onPrimary)
+            }
             Text(
                 "CallerX", Modifier.weight(1f), textAlign = TextAlign.Center,
-                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.3.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                fontSize = 14.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.3.sp,
+                color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.95f)
             )
             Spacer(Modifier.size(48.dp))   // balances the back arrow, keeps "CallerX" centred
         }

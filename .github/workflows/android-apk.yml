@@ -52,11 +52,18 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.13
-          name: CallerX Android APK v1.5.13
+          tag_name: callerx-v1.5.14
+          name: CallerX Android APK v1.5.14
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.14 — Dialpad header uses the app theme colour:
+            - The white strip at the top of the dial pad (status bar + CallerX row) is now
+              painted with the app theme colour, exactly like the home header, so the whole
+              top of the screen looks like one piece. The clock / Wi-Fi / battery icons are
+              white on it and stay readable.
+            - The theme colour setting still applies everywhere.
 
             v1.5.13 — Dialpad number box moved above the keypad:
             - The typed number now sits in its own rounded box just above the keypad (where
