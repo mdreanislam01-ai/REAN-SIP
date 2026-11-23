@@ -52,11 +52,27 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.15
-          name: CallerX Android APK v1.5.15
+          tag_name: callerx-v1.5.16
+          name: CallerX Android APK v1.5.16
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.16 — polish pack: photos, badge, speed dial, live timer, signing:
+            - Contact photos in recents and contacts (initials only as a fallback).
+            - Missed-call badge (last 24 h) on the Calls tab of the bottom bar.
+            - Live call timer in the ongoing-call notification (chronometer, no battery cost).
+            - Tap the header chip for a SIP status popup: account, server:port, transport,
+              online/offline and the registration message.
+            - Speed dial: pick 1-9 from any recent call's ⋮ menu, then hold that key in the
+              dial pad to call it (hold 0 still types "+").
+            - Recent searches appear as chips under the search bar; tap to search again.
+            - Dark mode now uses a darker shade of the accent for the header.
+            - Registration retries back off 10 s → 20 s → 40 s → 80 s (max 120 s) instead of
+              hitting the server every 20 s.
+            - Silent weekly backup to phone storage.
+            - Release signing support: drop keystore.properties in the repo root (see
+              keystore.properties.example); release builds then use your own key.
 
             v1.5.15 — SIP account chip, Profile & Backup, calmer scrolling:
             - The chip on the right of the header shows the SIP account's own name (green dot

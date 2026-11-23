@@ -12,9 +12,35 @@ android {
         applicationId = "com.callerx.app"
         minSdk = 23
         targetSdk = 35
-        versionCode = 34
-        versionName = "1.5.15"
+        versionCode = 35
+        versionName = "1.5.16"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+    }
+
+    /* Release signing: drop a keystore.properties (not committed) next to
+       settings.gradle.kts to sign release builds with your own key.
+       Without it, release builds fall back to the debug key. */
+    val keystorePropsFile = rootProject.file("keystore.properties")
+    val hasKeystore = keystorePropsFile.exists()
+    val keystoreProps = java.util.Properties().apply {
+        if (hasKeystore) keystorePropsFile.inputStream().use { load(it) }
+    }
+    signingConfigs {
+        if (hasKeystore) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = if (hasKeystore) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
+        }
     }
 
     buildFeatures { compose = true }

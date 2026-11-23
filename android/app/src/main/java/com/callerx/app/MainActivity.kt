@@ -123,14 +123,22 @@ private val Palette = listOf(
     Color(0xFFC34F86), Color(0xFF455FC2), Color(0xFF168C8C), Color(0xFFCA4545), Color(0xFF68717D)
 )
 private val PaletteNames = listOf("Blue", "Green", "Purple", "Orange", "Pink", "Indigo", "Teal", "Red", "Gray")
-data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "", val dur: Long = 0, val ts: Long = 0L)
+data class Person(val name: String, val number: String, val initials: String, val verified: Boolean = false, val spam: Boolean = false, val time: String = "", val callType: Int = 0, val source: String = "", val dur: Long = 0, val ts: Long = 0L, val photoUri: String = "")
 data class SipAccount(val name: String, val user: String, val pass: String, val domain: String, val port: String, val transport: String, val proxy: String, val displayName: String, val autoBoot: Boolean, val enabled: Boolean, val isDefault: Boolean)
 
 private fun loadContacts(context: Context): List<Person> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return emptyList()
     val result = mutableListOf<Person>()
-    context.contentResolver.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI, arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER), null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " COLLATE NOCASE")?.use { c ->
-        while (c.moveToNext()) { val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?")) }
+    context.contentResolver.query(
+        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+        arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER, ContactsContract.CommonDataKinds.Phone.PHOTO_URI),
+        null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " COLLATE NOCASE"
+    )?.use { c ->
+        while (c.moveToNext()) {
+            val name = c.getString(0).orEmpty()
+            val number = c.getString(1).orEmpty()
+            result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", photoUri = c.getString(2).orEmpty()))
+        }
     }
     return result.distinctBy { it.number }
 }
@@ -214,6 +222,21 @@ private fun relDay(ts: Long): String {
 
 /* Canonical digits for forgiving number search: +8801712345678, 8801712345678,
    01712345678 and 1712345678 all become the same key, so any of them finds the others. */
+private fun loadRecentSearches(prefs: android.content.SharedPreferences): List<String> =
+    try {
+        val arr = JSONArray(prefs.getString("search:recent", "[]") ?: "[]")
+        (0 until arr.length()).map { arr.optString(it) }.filter { it.isNotBlank() }
+    } catch (_: Exception) { emptyList() }
+
+private fun saveRecentSearch(prefs: android.content.SharedPreferences, query: String) {
+    val clean = query.trim()
+    if (clean.isBlank()) return
+    try {
+        val list = (listOf(clean) + loadRecentSearches(prefs).filter { !it.equals(clean, true) }).take(5)
+        prefs.edit().putString("search:recent", JSONArray(list).toString()).apply()
+    } catch (_: Exception) { }
+}
+
 private fun canonicalDigits(s: String): String {
     var d = digitsOnly(s)
     if (d.startsWith("00")) d = d.drop(2)
@@ -507,13 +530,20 @@ object SipEngine {
         } catch (_: Exception) { }
     }
 
+    /* Retries back off instead of hammering the server every 20 s:
+       10 s → 20 s → 40 s → 80 s, capped at 120 s, and reset once registered. */
+    private var regRetryDelay = 10_000L
     private fun scheduleRegRetry() {
         if (regRetryPending) return
         regRetryPending = true
         mainHandler.postDelayed({
             regRetryPending = false
-            if (!isRegistered) { try { core?.refreshRegisters() } catch (_: Exception) { } ; scheduleRegRetry() }
-        }, 20000)
+            if (!isRegistered) {
+                try { core?.refreshRegisters() } catch (_: Exception) { }
+                regRetryDelay = (regRetryDelay * 2).coerceAtMost(120_000L)
+                scheduleRegRetry()
+            } else regRetryDelay = 10_000L
+        }, regRetryDelay)
     }
 
     private fun acquireCallLocks() {
@@ -881,6 +911,10 @@ object SipEngine {
             @Suppress("DEPRECATION")
             val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(ctx, "callerx_call_v2") else Notification.Builder(ctx)
             val title = (a?.activeCallName ?: "").ifBlank { a?.activeNumber ?: "" }.ifBlank { "CallerX call" }
+            /* A chronometer makes the notification show a live mm:ss timer
+               without re-posting it every second. */
+            val startedAt = CallBridge.activity?.callStartedAt ?: 0L
+            val inCall = (a?.callState ?: lastCallState) == "In call"
             builder.setSmallIcon(R.mipmap.ic_launcher)
                 .setContentTitle(title)
                 .setContentText("${a?.callState ?: lastCallState} · ${a?.activeCallSource ?: "SIP VOIP · HD AUDIO"}")
@@ -888,6 +922,7 @@ object SipEngine {
                 .setOnlyAlertOnce(true)
                 .setShowWhen(true)
                 .setCategory(Notification.CATEGORY_CALL)
+            if (inCall && startedAt > 0L) { builder.setWhen(startedAt); builder.setUsesChronometer(true) }
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
             val openIntent = Intent(ctx, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -1117,7 +1152,7 @@ class MainActivity : ComponentActivity() {
 
     /* Always keeps a local copy (used by Restore and by Android's own backup),
        and on Android 10+ also drops a readable file in Downloads/CallerX. */
-    fun backupToPhoneStorage(): Boolean {
+    fun backupToPhoneStorage(silent: Boolean = false): Boolean {
         return try {
             val json = createBackupJson()
             val stamp = android.text.format.DateFormat.format("yyyyMMdd-HHmm", Date()).toString()
@@ -1147,13 +1182,27 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) { }
             }
             callerxPrefs().edit().putLong("backup:lastPhone", System.currentTimeMillis()).apply()
-            resumeTick++
-            errorMessage = if (publicPath.isBlank()) "Backup saved inside the app: $name" else "Backup saved to $publicPath"
+            if (!silent) {
+                resumeTick++
+                errorMessage = if (publicPath.isBlank()) "Backup saved inside the app: $name" else "Backup saved to $publicPath"
+            }
             true
         } catch (e: Exception) {
-            errorMessage = "Backup failed: ${e.message ?: "unknown error"}"
+            if (!silent) errorMessage = "Backup failed: ${e.message ?: "unknown error"}"
             false
         }
+    }
+
+    /* Silent weekly snapshot: keeps a fresh copy in phone storage even if the
+       user never opens the backup screen. */
+    private fun maybeAutoBackup() {
+        try {
+            val prefs = callerxPrefs()
+            val last = prefs.getLong("backup:lastAuto", 0L)
+            if (System.currentTimeMillis() - last < 7L * 24 * 3600 * 1000) return
+            prefs.edit().putLong("backup:lastAuto", System.currentTimeMillis()).apply()
+            lifecycleScope.launch(Dispatchers.IO) { try { backupToPhoneStorage(silent = true) } catch (_: Exception) { } }
+        } catch (_: Exception) { }
     }
 
     fun chooseGoogleBackupAccount() {
@@ -1454,6 +1503,7 @@ class MainActivity : ComponentActivity() {
         /* The engine runs in the foreground service, not here: locking the
            phone or destroying this Activity must never stop the mic/call. */
         startKeepAliveService()
+        maybeAutoBackup()
         registerDataObservers()
         refreshData()
         setContent { CallerXApp(this) }
@@ -1566,10 +1616,17 @@ private fun CallerXApp(activity: MainActivity) {
     val contacts = activity.contactsCache
     val recentCalls = activity.callsCache
     val messages = activity.smsCache
+    val photoByNumber = remember(contacts) {
+        contacts.filter { it.photoUri.isNotBlank() }.associate { canonicalDigits(it.number) to it.photoUri }
+    }
+    var recentSearches by remember { mutableStateOf(loadRecentSearches(activity.getSharedPreferences("callerx", Context.MODE_PRIVATE))) }
     var dark by remember { mutableStateOf(false) }
     var accent by remember { mutableIntStateOf(0) }
     var number by remember { mutableStateOf("") }
     var showCallSheet by remember { mutableStateOf(false) }
+    var showSipInfo by remember { mutableStateOf(false) }
+    var speedDialPerson by remember { mutableStateOf<Person?>(null) }
+    var searchTick by remember { mutableIntStateOf(0) }
     var sheetNumber by remember { mutableStateOf("") }
     var sheetName by remember { mutableStateOf("") }
     var sheetDefault by remember { mutableStateOf(false) }
@@ -1589,6 +1646,7 @@ private fun CallerXApp(activity: MainActivity) {
         when {
             // close any open sheet first
             showCallSheet -> showCallSheet = false
+            showSipInfo -> showSipInfo = false
             showRouteDialog -> showRouteDialog = false
             showDialerDialog -> showDialerDialog = false
             showError -> { showError = false; activity.errorMessage = "" }
@@ -1728,8 +1786,24 @@ private fun CallerXApp(activity: MainActivity) {
                 containerColor = MaterialTheme.colorScheme.background,
                 contentWindowInsets = WindowInsets(0, 0, 0, 0),
                 bottomBar = { NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                    // missed calls from the last 24 h get a badge, like the system dialer
+                    val missedCount = remember(recentCalls) {
+                        val dayAgo = System.currentTimeMillis() - 24L * 3600 * 1000
+                        recentCalls.count { it.callType == CallLog.Calls.MISSED_TYPE && it.ts >= dayAgo }
+                    }
                     listOf("Calls" to Icons.Filled.Call, "Contacts" to Icons.Filled.Contacts, "Messages" to Icons.AutoMirrored.Filled.Message, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
-                        NavigationBarItem(selected = tab == label, onClick = { tab = label; query = "" }, icon = { Icon(icon, label, modifier = Modifier.size(20.dp)) }, label = { Text(label, fontSize = 9.sp, maxLines = 1) }, alwaysShowLabel = true)
+                        NavigationBarItem(
+                            selected = tab == label,
+                            onClick = { tab = label; query = "" },
+                            icon = {
+                                if (label == "Calls" && missedCount > 0) {
+                                    BadgedBox(badge = { Badge { Text("$missedCount", fontSize = 9.sp) } }) {
+                                        Icon(icon, label, modifier = Modifier.size(20.dp))
+                                    }
+                                } else Icon(icon, label, modifier = Modifier.size(20.dp))
+                            },
+                            label = { Text(label, fontSize = 9.sp, maxLines = 1) }, alwaysShowLabel = true
+                        )
                     }
                 } }
             ) { padding ->
@@ -1753,16 +1827,24 @@ private fun CallerXApp(activity: MainActivity) {
                             tab = tab,
                             online = activity.registered,
                             accountLabel = sipAccountLabel,
+                            dark = dark,
                             query = query,
                             onQuery = { query = it },
                             focus = searchFocus,
-                            onSearchDone = { keyboardController?.hide() },
+                            recentSearches = recentSearches,
+                            onPickRecent = { q -> query = q },
+                            onSearchDone = { if (query.isNotBlank()) { saveRecentSearch(prefs, query); recentSearches = loadRecentSearches(prefs); searchTick++ }; keyboardController?.hide() },
                             resultText = if (debouncedQuery.isBlank()) "" else "$hits result${if (hits == 1) "" else "s"}",
-                            onSip = { screen = "sip" }
+                            onSip = { showSipInfo = true }
                         )
                     }
                     when (tab) {
-                        "Calls" -> CallsTab(recentCalls, filter, { filter = it }, debouncedQuery, onAvatar = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) }, onMessage = { p -> activity.openSms(p.number) }, onClearHistory = { activity.clearCallHistory() }, onKeypad = { screen = "dialer" })
+                        "Calls" -> CallsTab(recentCalls, photoByNumber, filter, { filter = it }, debouncedQuery,
+                            onAvatar = { p -> selected = p; screen = "contact" },
+                            onCall = { p -> requestCall(p.number, p.name) },
+                            onMessage = { p -> activity.openSms(p.number) },
+                            onSpeedDial = { p -> speedDialPerson = p },
+                            onClearHistory = { activity.clearCallHistory() }, onKeypad = { screen = "dialer" })
                         "Contacts" -> {
                             val favoriteNumbers = remember(contacts, activity.resumeTick) {
                                 contacts.filter { c -> val norm = c.number.filter { it.isDigit() || it == '+' }; prefs.getBoolean("fav:$norm", false) }.map { it.number }.toSet()
@@ -1788,6 +1870,65 @@ private fun CallerXApp(activity: MainActivity) {
                     if (setDef) activity.setDefaultRoute(sheetNumber, route)
                     placeCall(route, sheetNumber, sheetName)
                 })
+        }
+        /* Speed-dial picker: choose 1-9 for the number from the overflow menu. */
+        val spPerson = speedDialPerson
+        if (spPerson != null) {
+            AlertDialog(
+                onDismissRequest = { speedDialPerson = null },
+                title = { Text("Speed dial for ${spPerson.name}") },
+                text = {
+                    Column {
+                        Text(spPerson.number, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Text("Hold a key in the dial pad to call it.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(10.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            (1..9).forEach { d ->
+                                Surface(
+                                    onClick = {
+                                        prefs.edit().putString("speed:$d", spPerson.number).apply()
+                                        speedDialPerson = null
+                                        Toast.makeText(context, "Speed dial $d → ${spPerson.number}", Toast.LENGTH_SHORT).show()
+                                    },
+                                    shape = CircleShape,
+                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                                    modifier = Modifier.size(30.dp)
+                                ) {
+                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text("$d", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { speedDialPerson = null }) { Text("Cancel") } }
+            )
+        }
+        if (showSipInfo) {
+            val accounts = remember(activity.accountsTick, activity.resumeTick) { activity.accountsList() }
+            val acc = accounts.firstOrNull { it.isDefault } ?: accounts.firstOrNull { it.enabled } ?: accounts.firstOrNull()
+            AlertDialog(
+                onDismissRequest = { showSipInfo = false },
+                title = { Text(if (acc == null) "SIP status" else (acc.displayName.ifBlank { acc.name }).ifBlank { acc.user }) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text(
+                            if (acc == null) "No SIP account added" else if (activity.registered) "Online · registered" else "Offline · connecting",
+                            fontWeight = FontWeight.SemiBold, fontSize = 13.sp,
+                            color = if (acc == null) Color(0xFFD64545) else if (activity.registered) Color(0xFF1E7E52) else Color(0xFFD47622)
+                        )
+                        if (acc != null) {
+                            Text("${acc.user}@${acc.domain}:${acc.port} · ${acc.transport.uppercase()}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Registration refresh 300 s · keepalive 15 s · Opus 16 kHz mono", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Text(activity.registrationMessage, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showSipInfo = false; screen = "sip" }) { Text("Manage accounts") } },
+                dismissButton = { TextButton(onClick = { showSipInfo = false }) { Text("Close") } }
+            )
         }
         if (showRouteDialog) {
             val current = activity.defaultRoute()
@@ -1839,11 +1980,14 @@ private fun HomeHeader(
     tab: String,
     online: Boolean,
     accountLabel: String,
+    dark: Boolean,
     query: String,
     onQuery: (String) -> Unit,
     focus: FocusRequester,
     onSearchDone: () -> Unit,
     resultText: String,
+    recentSearches: List<String>,
+    onPickRecent: (String) -> Unit,
     onSip: () -> Unit
 ) {
     /* Three lines, Google-Dialer style:
@@ -1856,7 +2000,8 @@ private fun HomeHeader(
         "Messages" -> "SIM 1 · SIM 2 · SMS inbox"
         else -> "SIM 1 · SIM 2 · SIP"
     }
-    val headerColor = MaterialTheme.colorScheme.primary
+    // dark mode keeps the accent but a couple of steps darker, so white text still pops
+    val headerColor = if (dark) shade(MaterialTheme.colorScheme.primary, 0.72f) else MaterialTheme.colorScheme.primary
     val headerText = MaterialTheme.colorScheme.onPrimary
     Column(
         Modifier.fillMaxWidth().background(headerColor).statusBarsPadding()
@@ -1872,6 +2017,24 @@ private fun HomeHeader(
         }
         Spacer(Modifier.height(9.dp))
         SearchField(query, onQuery, focus, onSearchDone, headerColor)
+        /* Last searches, one tap away (only while the field is empty). */
+        if (query.isBlank() && recentSearches.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = 8.dp).horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                recentSearches.take(4).forEach { q ->
+                    Surface(onClick = { onPickRecent(q) }, shape = RoundedCornerShape(50), color = Color.White.copy(alpha = 0.16f)) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.History, null, tint = headerText.copy(alpha = 0.85f), modifier = Modifier.size(12.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text(q, fontSize = 11.sp, color = headerText, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.widthIn(max = 110.dp))
+                        }
+                    }
+                }
+            }
+        }
         if (resultText.isNotBlank()) {
             Text(resultText, fontSize = 10.sp, color = headerText.copy(alpha = 0.85f),
                 modifier = Modifier.padding(start = 4.dp, top = 5.dp), maxLines = 1)
@@ -1939,6 +2102,31 @@ private fun rememberSlowFling(): FlingBehavior {
     }
 }
 
+/* Small helper so the header can be a darker shade of the accent in dark mode. */
+private fun shade(c: Color, f: Float) = Color(
+    (c.red * f).coerceIn(0f, 1f), (c.green * f).coerceIn(0f, 1f), (c.blue * f).coerceIn(0f, 1f), c.alpha
+)
+
+/* Contact photo when the contact has one, initials otherwise. */
+@Composable
+private fun PersonAvatar(person: Person, photoUri: String, tint: Color, size: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
+    val context = LocalContext.current
+    var bitmap by remember(photoUri) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    LaunchedEffect(photoUri) {
+        bitmap = withContext(Dispatchers.IO) {
+            try {
+                if (photoUri.isBlank()) null
+                else context.contentResolver.openInputStream(Uri.parse(photoUri))?.use { android.graphics.BitmapFactory.decodeStream(it)?.asImageBitmap() }
+            } catch (_: Exception) { null }
+        }
+    }
+    Box(Modifier.size(size).clip(CircleShape).background(tint.copy(alpha = 0.13f)).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
+        val bmp = bitmap
+        if (bmp != null) Image(bmp, person.name, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        else Text(person.initials.take(1).uppercase(), color = tint, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+    }
+}
+
 @Composable
 private fun OnlinePill(online: Boolean, accountLabel: String, onClick: () -> Unit) {
     /* Shows the SIP account's own name (green dot while it is registered) and
@@ -1964,7 +2152,7 @@ private fun OnlinePill(online: Boolean, accountLabel: String, onClick: () -> Uni
 }
 
 @Composable
-private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -> Unit, query: String, onAvatar: (Person) -> Unit, onCall: (Person) -> Unit, onMessage: (Person) -> Unit, onClearHistory: () -> Unit, onKeypad: () -> Unit) {
+private fun CallsTab(recents: List<Person>, photos: Map<String, String>, filter: String, onFilter: (String) -> Unit, query: String, onAvatar: (Person) -> Unit, onCall: (Person) -> Unit, onMessage: (Person) -> Unit, onSpeedDial: (Person) -> Unit, onClearHistory: () -> Unit, onKeypad: () -> Unit) {
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             /* chips scroll sideways so the "Clear" button never wraps ("Cle ar") */
@@ -1986,7 +2174,10 @@ private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -
             }
             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 90.dp), flingBehavior = rememberSlowFling()) {
                 if (filtered.isEmpty()) item { Text(if (query.isBlank()) "No recent calls found on this device." else "No calls match “$query”.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                itemsIndexed(filtered, key = { i, p -> "call-$i-${p.number}-${p.ts}" }) { _, p -> CallRow(p, onAvatar = { onAvatar(p) }, onCall = { onCall(p) }, onMessage = { onMessage(p) }) }
+                itemsIndexed(filtered, key = { i, p -> "call-$i-${p.number}-${p.ts}" }) { _, p ->
+                    CallRow(p, photoUri = photos[canonicalDigits(p.number)] ?: "",
+                        onAvatar = { onAvatar(p) }, onCall = { onCall(p) }, onMessage = { onMessage(p) }, onSpeedDial = { onSpeedDial(p) })
+                }
             }
         }
         FloatingActionButton(onClick = onKeypad, modifier = Modifier.align(Alignment.BottomEnd).padding(end = 18.dp, bottom = 14.dp), shape = RoundedCornerShape(16.dp), containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White) { Icon(Icons.Filled.Dialpad, "Open keypad", modifier = Modifier.size(23.dp)) }
@@ -1994,7 +2185,7 @@ private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -
 }
 
 @Composable
-private fun CallRow(person: Person, onAvatar: () -> Unit, onCall: () -> Unit, onMessage: () -> Unit) {
+private fun CallRow(person: Person, photoUri: String, onAvatar: () -> Unit, onCall: () -> Unit, onMessage: () -> Unit, onSpeedDial: () -> Unit) {
     val missed = person.callType == CallLog.Calls.MISSED_TYPE
     val outgoing = person.callType == CallLog.Calls.OUTGOING_TYPE
     val tint = if (missed) Color(0xFFD64545) else if (outgoing) MaterialTheme.colorScheme.primary else Color(0xFF22A06B)
@@ -2003,9 +2194,7 @@ private fun CallRow(person: Person, onAvatar: () -> Unit, onCall: () -> Unit, on
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     Row(Modifier.fillMaxWidth().clickable(onClick = onCall).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(46.dp).clip(CircleShape).background(tint.copy(alpha = 0.13f)).clickable(onClick = onAvatar), contentAlignment = Alignment.Center) {
-            Text(person.initials.take(1).uppercase(), color = tint, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-        }
+        PersonAvatar(person, photoUri, tint, 46.dp, onAvatar)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2030,6 +2219,7 @@ private fun CallRow(person: Person, onAvatar: () -> Unit, onCall: () -> Unit, on
             DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                 DropdownMenuItem(text = { Text("Call") }, onClick = { showMenu = false; onCall() })
                 DropdownMenuItem(text = { Text("Message") }, onClick = { showMenu = false; onMessage() })
+                DropdownMenuItem(text = { Text("Speed dial") }, onClick = { showMenu = false; onSpeedDial() })
                 DropdownMenuItem(text = { Text("Copy number") }, onClick = {
                     showMenu = false
                     try { clipboard.setText(AnnotatedString(person.number)); Toast.makeText(context, "Copied ${person.number}", Toast.LENGTH_SHORT).show() } catch (_: Exception) { }
@@ -2063,9 +2253,7 @@ private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit, o
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     Row(Modifier.fillMaxWidth().clickable(onClick = onOpen).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(46.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)).clickable(onClick = onOpen), contentAlignment = Alignment.Center) {
-            Text(person.initials.take(1).uppercase(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-        }
+        PersonAvatar(person, person.photoUri, MaterialTheme.colorScheme.primary, 46.dp, onOpen)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(person.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurface, fontSize = 15.sp)
@@ -2663,6 +2851,17 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
         if (numberRef.value.isBlank()) return
         try { clipboard.setText(AnnotatedString(numberRef.value)); Toast.makeText(context, "Copied ${numberRef.value}", Toast.LENGTH_SHORT).show() } catch (_: Exception) { }
     }
+    val speedPrefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
+    fun speedDial(digit: String) {
+        val num = speedPrefs.getString("speed:$digit", "") ?: ""
+        if (num.isBlank()) {
+            Toast.makeText(context, "No speed dial on $digit · set one from a recent call's ⋮ menu", Toast.LENGTH_SHORT).show()
+        } else {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            onNumber(num)
+            onCall()
+        }
+    }
     fun insertPlus() {
         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         val t = numberRef.value
@@ -2785,8 +2984,12 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
                                 playTone(digit)
                                 append(digit)
                             },
-                            /* long-press 0 types "+" (and a leading "+" when empty) */
-                            onLongPress = if (digit == "0") ({ playTone(digit); insertPlus() }) else null
+                            /* long-press 0 types "+", long-press 1-9 dials a speed-dial number */
+                            onLongPress = when {
+                                digit == "0" -> ({ playTone(digit); insertPlus() })
+                                digit.length == 1 && digit[0] in '1'..'9' -> ({ speedDial(digit) })
+                                else -> null
+                            }
                         )
                     }
                 }
