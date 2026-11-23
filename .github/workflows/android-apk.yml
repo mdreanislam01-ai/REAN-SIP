@@ -52,11 +52,27 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.11
-          name: CallerX Android APK v1.5.11
+          tag_name: callerx-v1.5.12
+          name: CallerX Android APK v1.5.12
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.12 — Header, status bar and Truecaller-style dialpad:
+            - Header is now three clean lines: "CallerX", "SIM 1 · SIM 2 · SIP", then one
+              full-width search bar inside the coloured header. The right side shows only
+              "Online" / "Offline" (no more "SIP Online" chip overlapping the title).
+            - The status bar (clock, wifi, battery) is painted with the app theme colour
+              instead of a white strip, so the icons are always readable and the top of the
+              screen looks like part of the app. The dialer keeps a light bar with dark icons.
+            - No more double status-bar padding on Android 15 (that white gap above the header).
+            - Dialpad rebuilt like Truecaller: paste icon top-right, copy icon left of the
+              number, backspace right of it (long-press clears everything), contact name above
+              the number, flat keys with DTMF tones and haptics, and the green call button
+              centred at the bottom.
+            - Call-history filter chips scroll sideways so the Clear button no longer wraps.
+            - Audio routing respects a connected Bluetooth / wired headset (SCO started) and
+              the speaker toggle.
 
             v1.5.11 — Lock-screen mic, network drops, search & dialpad (Google Dialer style):
             - SIP engine now lives in the foreground service (microphone type), not in the

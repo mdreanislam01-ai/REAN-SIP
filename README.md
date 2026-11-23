@@ -41,13 +41,29 @@ The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow files runs the **Build CallerX APK** GitHub Actions workflow. It builds the debug APK, uploads it as a workflow artifact, and publishes it to the rolling GitHub release:
 
-**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.11>**
+**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.12>**
 
 ## Notes
 
 - This is a debug build, signed with the default debug key. For Play Store distribution a release keystore is required.
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
+
+## v1.5.12 — header, status bar and Truecaller-style dialpad
+
+- Header is three clean lines: **CallerX**, then **SIM 1 · SIM 2 · SIP**, then a single
+  full-width search bar inside the coloured header (it was previously hidden behind a
+  magnifier toggle and overlapped the title). The right side shows only **Online** /
+  **Offline**.
+- The status bar (clock / Wi-Fi / battery) is painted with the app theme colour instead of
+  a white strip, with white icons; the dialer keeps a light bar with dark icons. The
+  duplicate status-bar padding on Android 15 that left a white gap is gone.
+- Dialpad now follows Truecaller: paste icon top-right, copy icon left of the number,
+  backspace right of it (long-press clears all), matched contact name above the number,
+  flat keys with DTMF tones + haptics, and a centred green call button.
+- Call-history filter chips scroll sideways, so the **Clear** button no longer wraps.
+- Audio routing honours a connected Bluetooth / wired headset (SCO started) and the
+  speaker toggle.
 
 ## v1.5.11 — lock-screen mic, network drops, search & dialpad
 

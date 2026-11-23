@@ -52,10 +52,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -65,6 +70,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -79,6 +85,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.focus.FocusRequester
@@ -566,9 +574,11 @@ object SipEngine {
         } catch (_: Exception) { }
     }
 
-    /* Route to a Bluetooth / wired headset when one is connected, otherwise
-       honour the speaker toggle. This is what makes the mic work with a
-       headset in a pocket / on a locked phone instead of the earpiece. */
+    /* Audio routing done properly:
+         · Bluetooth / wired headset wins when it is connected (unless the user
+           asked for the speaker), and the platform SCO link is started so some
+           OEMs do not keep the voice on the earpiece.
+         · otherwise speaker or earpiece, matching the on-screen toggle. */
     private fun routeAudio(preferSpeaker: Boolean) {
         val ctx = appContext ?: return
         val c = core ?: return
@@ -576,24 +586,25 @@ object SipEngine {
             val am = ctx.getSystemService(AudioManager::class.java) ?: return
             am.mode = AudioManager.MODE_IN_COMMUNICATION
             val devices = c.audioDevices
-            /* Linphone only lists devices that are actually available, so a
-               Bluetooth/wired entry here means a headset is connected. */
-            val headset = devices.firstOrNull {
-                val n = it.type.toString().lowercase()
-                n.contains("bluetooth") || n.contains("wired") || n.contains("headset")
+            fun pick(vararg names: String): AudioDevice? =
+                devices.firstOrNull { d -> names.any { n -> d.type.name.equals(n, ignoreCase = true) } }
+            val headset = pick("Bluetooth", "Headset", "Headphones", "HearingAid")
+            val target = if (preferSpeaker) (pick("Speaker") ?: headset)
+                else (headset ?: pick("Earpiece") ?: pick("Speaker") ?: devices.firstOrNull())
+            if (target != null) {
+                c.outputAudioDevice = target
+                val isHeadset = target.type.name.equals("Bluetooth", true) ||
+                    target.type.name.equals("Headset", true) || target.type.name.equals("Headphones", true)
+                if (isHeadset) try { c.inputAudioDevice = target } catch (_: Exception) { }
             }
-            if (headset != null) {
-                c.outputAudioDevice = headset
-                try { c.inputAudioDevice = headset } catch (_: Exception) { }
-                return
+            val useBluetooth = headset != null && headset.type.name.equals("Bluetooth", true) && !preferSpeaker
+            if (Build.VERSION.SDK_INT < 31) {
+                try {
+                    if (useBluetooth) { am.startBluetoothSco(); am.isBluetoothScoOn = true }
+                    else { am.stopBluetoothSco(); am.isBluetoothScoOn = false }
+                } catch (_: Exception) { }
             }
-            val target = if (preferSpeaker) {
-                devices.firstOrNull { it.type == AudioDevice.Type.Speaker }
-            } else {
-                devices.firstOrNull { it.type == AudioDevice.Type.Earpiece }
-                    ?: devices.firstOrNull { it.type == AudioDevice.Type.Speaker }
-            } ?: devices.firstOrNull()
-            if (target != null) c.outputAudioDevice = target
+            try { am.isSpeakerphoneOn = preferSpeaker && headset == null } catch (_: Exception) { }
         } catch (_: Exception) { }
     }
 
@@ -1254,10 +1265,14 @@ class MainActivity : ComponentActivity() {
     }
 
     /* ---------- Lifecycle ---------- */
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
-        window.statusBarColor = android.graphics.Color.WHITE
+        /* The status bar must match the app theme colour, not a white strip:
+           a white bar with white icons made the clock/battery unreadable.
+           CallerXApp repaints this on every screen change. */
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        window.statusBarColor = 0xFF087DB8.toInt()   // default accent; repainted by CallerXApp
         window.navigationBarColor = android.graphics.Color.rgb(234, 240, 252)
         intent?.data?.schemeSpecificPart?.let { dialIntentNumber = it }
         callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
@@ -1378,10 +1393,8 @@ private fun CallerXApp(activity: MainActivity) {
     var screen by remember { mutableStateOf("home") }
     var filter by remember { mutableStateOf("All") }
     var query by remember { mutableStateOf("") }
-    var searchOpen by remember { mutableStateOf(false) }
     val searchFocus = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
-    LaunchedEffect(searchOpen) { if (searchOpen) searchFocus.requestFocus() }
     var selected by remember { mutableStateOf<Person?>(null) }
     // lists come from the activity cache: loaded on a background thread, kept fresh by ContentObservers
     val contacts = activity.contactsCache
@@ -1405,7 +1418,7 @@ private fun CallerXApp(activity: MainActivity) {
 
     /* ---------- Back button: never leave the app, always step back one level ---------- */
     var lastBackPress by remember { mutableStateOf(0L) }
-    fun goHome(to: String = "Calls") { screen = "home"; tab = to; searchOpen = false; query = "" }
+    fun goHome(to: String = "Calls") { screen = "home"; tab = to; query = "" }
     BackHandler(enabled = true) {
         when {
             // close any open sheet first
@@ -1426,7 +1439,7 @@ private fun CallerXApp(activity: MainActivity) {
             screen == "dialer" -> goHome("Calls")
 
             // home: close search, then jump to Calls tab, then minimise (do not exit)
-            screen == "home" && searchOpen -> { searchOpen = false; query = "" }
+            screen == "home" && query.isNotBlank() -> { query = ""; keyboardController?.hide() }
             screen == "home" && tab != "Calls" -> { tab = "Calls"; query = "" }
             else -> {
                 val now = System.currentTimeMillis()
@@ -1467,14 +1480,22 @@ private fun CallerXApp(activity: MainActivity) {
     val scheme = if (dark) darkColorScheme(primary = color, onPrimary = Color.White, secondary = color, background = Color(0xFF101318), surface = Color(0xFF1B2027), surfaceVariant = Color(0xFF232A33), onSurface = Color(0xFFF2F5F8), onSurfaceVariant = Color(0xFF9AA6B2), outlineVariant = Color(0xFF39424C))
     else lightColorScheme(primary = color, onPrimary = Color.White, secondary = color, background = Color(0xFFF6F8FA), surface = Color.White, surfaceVariant = Color(0xFFEDF1F5), onSurface = Color(0xFF141A21), onSurfaceVariant = Color(0xFF5C6873), outlineVariant = Color(0xFFDDE3E9))
 
-    // on Android 15+ (edge-to-edge) keep the status bar icons readable over the coloured heading
+    /* Paint the status bar (clock / wifi / battery strip) with the app theme
+       colour so it looks like part of the header instead of a white band.
+       Icons switch to white over the coloured header and to dark over the
+       light call screen, so they are always readable. */
     val view = LocalView.current
     SideEffect {
         val win = (view.context as? android.app.Activity)?.window
         if (win != null) {
-            if (Build.VERSION.SDK_INT >= 35) {
-                androidx.core.view.WindowCompat.getInsetsController(win, view).isAppearanceLightStatusBars = !(dark || screen == "home")
+            val statusColor = when (screen) {
+                "dialer" -> if (dark) Color(0xFF101318) else Color(0xFFF6F8FA)   // white dialer, dark icons
+                "call" -> if (dark) Color(0xFF071426) else Color(0xFFF9FAFB)
+                else -> color                                                     // accent header, white icons
             }
+            if (Build.VERSION.SDK_INT < 35) win.statusBarColor = statusColor.toArgb()   // ignored (edge-to-edge) on Android 15+
+            androidx.core.view.WindowCompat.getInsetsController(win, view).isAppearanceLightStatusBars =
+                (screen == "dialer" || screen == "call") && !dark
             /* Call screen must show over the lock screen and keep the screen on,
                otherwise locking the phone kills the visible call UI / mic. */
             if (screen == "call") {
@@ -1540,27 +1561,32 @@ private fun CallerXApp(activity: MainActivity) {
         } else {
             Scaffold(
                 containerColor = MaterialTheme.colorScheme.background,
+                contentWindowInsets = WindowInsets(0, 0, 0, 0),
                 bottomBar = { NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     listOf("Calls" to Icons.Filled.Call, "Contacts" to Icons.Filled.Contacts, "Messages" to Icons.AutoMirrored.Filled.Message, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
-                        NavigationBarItem(selected = tab == label, onClick = { tab = label; searchOpen = false; query = "" }, icon = { Icon(icon, label, modifier = Modifier.size(20.dp)) }, label = { Text(label, fontSize = 9.sp, maxLines = 1) }, alwaysShowLabel = true)
+                        NavigationBarItem(selected = tab == label, onClick = { tab = label; query = "" }, icon = { Icon(icon, label, modifier = Modifier.size(20.dp)) }, label = { Text(label, fontSize = 9.sp, maxLines = 1) }, alwaysShowLabel = true)
                     }
                 } }
             ) { padding ->
                 Column(Modifier.fillMaxSize().padding(padding)) {
                     if (tab != "Settings") {
-                        HomeHeader(tab, activity.registrationMessage, activity.registered, searchOpen, { searchOpen = !searchOpen; if (!searchOpen) query = "" }, query, { query = it }, onSip = { screen = "sip" })
-                        if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).focusRequester(searchFocus), singleLine = true,
-                            placeholder = { Text("Search by name, number or keypad letters") }, leadingIcon = { Icon(Icons.Filled.Search, null) },
-                            trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Filled.Close, "Clear search", modifier = Modifier.size(18.dp)) } },
-                            /* Always a text keyboard: a numeric keyboard on Calls made
-                               name search impossible, which is why search felt broken. */
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Search),
-                            keyboardActions = KeyboardActions(onSearch = { keyboardController?.hide() }),
-                            shape = RoundedCornerShape(14.dp))
-                        if (searchOpen && debouncedQuery.isNotBlank()) {
-                            val hits = when (tab) { "Contacts" -> contacts.count { matchesQuery(it.name, it.number, debouncedQuery) }; "Messages" -> messages.count { matchesQuery(it.first, it.first, debouncedQuery) || it.second.contains(debouncedQuery, true) }; else -> recentCalls.count { matchesQuery(it.name, it.number, debouncedQuery) } }
-                            Text("$hits result${if (hits == 1) "" else "s"}", Modifier.padding(start = 18.dp, bottom = 2.dp), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        /* Header = CallerX / SIM 1 · SIM 2 · SIP / full-width search bar,
+                           with only "Online" on the right (see HomeHeader). */
+                        val hits = when (tab) {
+                            "Contacts" -> contacts.count { matchesQuery(it.name, it.number, debouncedQuery) }
+                            "Messages" -> messages.count { matchesQuery(it.first, it.first, debouncedQuery) || it.second.contains(debouncedQuery, true) }
+                            else -> recentCalls.count { matchesQuery(it.name, it.number, debouncedQuery) }
                         }
+                        HomeHeader(
+                            tab = tab,
+                            online = activity.registered,
+                            query = query,
+                            onQuery = { query = it },
+                            focus = searchFocus,
+                            onSearchDone = { keyboardController?.hide() },
+                            resultText = if (debouncedQuery.isBlank()) "" else "$hits result${if (hits == 1) "" else "s"}",
+                            onSip = { screen = "sip" }
+                        )
                     }
                     when (tab) {
                         "Calls" -> CallsTab(recentCalls, filter, { filter = it }, debouncedQuery, onAvatar = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) }, onMessage = { p -> activity.openSms(p.number) }, onClearHistory = { activity.clearCallHistory() }, onKeypad = { screen = "dialer" })
@@ -1636,35 +1662,100 @@ private fun CallerXApp(activity: MainActivity) {
 }
 
 @Composable
-private fun HomeHeader(tab: String, sip: String, sipOnline: Boolean, searchOpen: Boolean, onSearch: () -> Unit, query: String, onQuery: (String) -> Unit, onSip: () -> Unit) {
+private fun HomeHeader(
+    tab: String,
+    online: Boolean,
+    query: String,
+    onQuery: (String) -> Unit,
+    focus: FocusRequester,
+    onSearchDone: () -> Unit,
+    resultText: String,
+    onSip: () -> Unit
+) {
+    /* Three lines, Google-Dialer style:
+         1. CallerX
+         2. SIM 1 · SIM 2 · SIP
+         3. one full-width search bar (never taller than it needs to be)   */
     val subtitle = when (tab) {
-        "Calls" -> "SIM 1, SIM 2 & SIP call history"
-        "Contacts" -> "Device contacts & favorites"
-        "Messages" -> "SMS inbox"
-        else -> "VoIP & Dual-SIM preferences"
+        "Calls" -> "SIM 1 · SIM 2 · SIP"
+        "Contacts" -> "SIM 1 · SIM 2 · SIP · contacts"
+        "Messages" -> "SIM 1 · SIM 2 · SMS inbox"
+        else -> "SIM 1 · SIM 2 · SIP"
     }
-    // the heading takes the active theme accent across the whole header bar
     val headerColor = MaterialTheme.colorScheme.primary
     val headerText = MaterialTheme.colorScheme.onPrimary
-    Column(Modifier.fillMaxWidth().background(headerColor).statusBarsPadding().padding(start = 18.dp, end = 12.dp, top = 10.dp, bottom = 10.dp)) {
+    Column(
+        Modifier.fillMaxWidth().background(headerColor).statusBarsPadding()
+            .padding(start = 18.dp, end = 14.dp, top = 10.dp, bottom = 10.dp)
+    ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("CallerX", fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = headerText)
-                Text("$tab · $subtitle", fontSize = 10.sp, color = headerText.copy(alpha = 0.78f), modifier = Modifier.padding(top = 2.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("CallerX", fontSize = 23.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.4).sp, color = headerText)
+                Text(subtitle, fontSize = 11.sp, color = headerText.copy(alpha = 0.85f), maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 1.dp))
             }
-            if (tab == "Calls" || tab == "Contacts" || tab == "Messages") IconButton(onClick = onSearch) { Icon(if (searchOpen) Icons.Filled.Close else Icons.Filled.Search, "Search", tint = headerText) }
-            SipPill(sip, sipOnline, onSip)
+            OnlinePill(online, onSip)
+        }
+        Spacer(Modifier.height(9.dp))
+        SearchField(query, onQuery, focus, onSearchDone, headerColor)
+        if (resultText.isNotBlank()) {
+            Text(resultText, fontSize = 10.sp, color = headerText.copy(alpha = 0.85f),
+                modifier = Modifier.padding(start = 4.dp, top = 5.dp), maxLines = 1)
+        }
+    }
+}
+
+/* Compact full-width search box that lives inside the coloured header:
+   exactly as wide as the header, no extra padding, one line high. */
+@Composable
+private fun SearchField(query: String, onQuery: (String) -> Unit, focus: FocusRequester, onDone: () -> Unit, accent: Color) {
+    Surface(shape = RoundedCornerShape(12.dp), color = Color.White, modifier = Modifier.fillMaxWidth().height(44.dp)) {
+        Row(
+            Modifier.fillMaxSize().padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Filled.Search, "Search", tint = Color(0xFF6B7681), modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                if (query.isEmpty()) {
+                    Text("Search name, number or T9", fontSize = 13.5.sp, color = Color(0xFF8B95A1), maxLines = 1,
+                        overflow = TextOverflow.Ellipsis)
+                }
+                /* Text keyboard on every tab: a numeric keyboard made name
+                   search impossible, which is why search felt broken. */
+                BasicTextField(
+                    value = query,
+                    onValueChange = onQuery,
+                    singleLine = true,
+                    textStyle = TextStyle(fontSize = 15.sp, color = Color(0xFF141A21)),
+                    cursorBrush = SolidColor(accent),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { onDone() }),
+                    modifier = Modifier.fillMaxWidth().focusRequester(focus)
+                )
+            }
+            if (query.isNotEmpty()) {
+                Surface(onClick = { onQuery("") }, shape = CircleShape, color = Color.Transparent, modifier = Modifier.size(24.dp)) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Icon(Icons.Filled.Close, "Clear search", tint = Color(0xFF6B7681), modifier = Modifier.size(15.dp))
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun SipPill(sip: String, online: Boolean, onClick: () -> Unit) {
-    // sits on the coloured heading, so it uses a translucent white chip
+private fun OnlinePill(online: Boolean, onClick: () -> Unit) {
+    // only "Online" / "Offline" on the right of the heading, like a status chip
     Surface(onClick = onClick, shape = RoundedCornerShape(50), color = Color.White.copy(alpha = 0.18f)) {
-        Row(Modifier.padding(horizontal = 12.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Box(Modifier.size(7.dp).clip(CircleShape).background(if (online) Color(0xFF6EE7A8) else Color(0xFFFF8A8A)))
-            Text(sip, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 1)
+        Row(
+            Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Box(Modifier.size(7.dp).clip(CircleShape).background(if (online) Color(0xFF6EE7A8) else Color(0xFFFF9B9B)))
+            Text(if (online) "Online" else "Offline", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 1)
         }
     }
 }
@@ -1673,12 +1764,16 @@ private fun SipPill(sip: String, online: Boolean, onClick: () -> Unit) {
 private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -> Unit, query: String, onAvatar: (Person) -> Unit, onCall: (Person) -> Unit, onMessage: (Person) -> Unit, onClearHistory: () -> Unit, onKeypad: () -> Unit) {
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)).padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                listOf("All", "Missed", "Received", "Outgoing").forEach { label ->
-                    FilterChip(selected = filter == label, onClick = { onFilter(label) }, label = { Text(label, maxLines = 1, fontSize = 12.sp) }, shape = RoundedCornerShape(18.dp))
+            /* chips scroll sideways so the "Clear" button never wraps ("Cle ar") */
+            Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)).padding(start = 14.dp, end = 4.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.weight(1f).horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    listOf("All", "Missed", "Received", "Outgoing").forEach { label ->
+                        FilterChip(selected = filter == label, onClick = { onFilter(label) }, label = { Text(label, maxLines = 1, softWrap = false, fontSize = 12.sp) }, shape = RoundedCornerShape(18.dp))
+                    }
                 }
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = onClearHistory) { Text("Clear", fontSize = 12.sp) }
+                TextButton(onClick = onClearHistory, contentPadding = PaddingValues(horizontal = 10.dp)) {
+                    Text("Clear", fontSize = 12.sp, maxLines = 1, softWrap = false)
+                }
             }
             val filtered = remember(recents, filter, query) {
                 recents.filter { p ->
@@ -2273,7 +2368,7 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                     Text("Settings", fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onPrimary)
                     Text("CallerX VoIP & Dual-SIM Preferences", fontSize = 11.sp, color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.78f), modifier = Modifier.padding(top = 2.dp))
                 }
-                SipPill(if (activity.registered) "SIP Registered" else "SIP Offline", activity.registered, onSip)
+                OnlinePill(activity.registered, onSip)
             }
         }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
@@ -2344,12 +2439,13 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
     val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
     val secondaryText = MaterialTheme.colorScheme.onSurfaceVariant
+    val accent = MaterialTheme.colorScheme.primary
     // gestures must always read the newest number, so keep it in a stable ref
     val numberRef = remember { mutableStateOf(number) }
     numberRef.value = number
     fun append(s2: String) { onNumber(numberRef.value + s2) }
-    fun deleteLast() { val t = numberRef.value; if (t.isNotEmpty()) onNumber(t.dropLast(1)) }
-    fun clearAll() { onNumber("") }
+    fun deleteLast() { val t = numberRef.value; if (t.isNotEmpty()) { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); onNumber(t.dropLast(1)) } }
+    fun clearAll() { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onNumber("") }
     fun pasteNumber() {
         val raw = try { clipboard.getText()?.text.orEmpty() } catch (_: Exception) { "" }
         val clean = raw.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
@@ -2361,6 +2457,7 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
         try { clipboard.setText(AnnotatedString(numberRef.value)); Toast.makeText(context, "Copied ${numberRef.value}", Toast.LENGTH_SHORT).show() } catch (_: Exception) { }
     }
     fun insertPlus() {
+        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         val t = numberRef.value
         if (!t.startsWith("+")) onNumber("+" + t)
     }
@@ -2389,101 +2486,194 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
         }
         if (tone >= 0) try { toneGenerator?.startTone(tone, 150) } catch (_: Exception) { }
     }
-    // Live contact suggestions while typing (T9 + number), like Google Dialer
+    // Live contact suggestions while typing (T9 + number), like Truecaller / Google Dialer
     val suggestions = remember(contacts, number) {
         if (number.length < 2) emptyList()
-        else contacts.filter { matchesQuery(it.name, it.number, number) }.take(5)
+        else contacts.filter { matchesQuery(it.name, it.number, number) }.take(3)
     }
+    // name of the contact that matches the typed digits (shown above the number)
+    val matchName = suggestions.firstOrNull()?.name
 
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).statusBarsPadding().navigationBarsPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+    Column(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding().navigationBarsPadding(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        /* ---- Top bar: back on the left, paste on the right (Truecaller layout) ---- */
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onSurface) }
             Spacer(Modifier.weight(1f))
-            TextButton(onClick = { insertPlus() }) { Text("+", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+            IconAction(Icons.Filled.ContentPaste, "Paste number", secondaryText, onTap = { pasteNumber() })
+            Spacer(Modifier.width(4.dp))
         }
-        Box(Modifier.fillMaxWidth().padding(horizontal = 26.dp).pointerInput(Unit) {
-            detectTapGestures(onLongPress = { pasteNumber() }, onTap = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) })
-        }, contentAlignment = Alignment.Center) {
-            Text(if (number.isEmpty()) "Enter a number" else number,
-                fontSize = if (number.length > 14) 23.sp else 30.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.6.sp,
-                color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+
+        /* ---- Typed number: copy on the left, number in the middle, backspace on the right ---- */
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconAction(
+                Icons.Filled.ContentCopy, "Copy number", secondaryText,
+                enabled = number.isNotEmpty(), onTap = { copyNumber() }
+            )
+            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                if (matchName != null && number.length >= 3) {
+                    Text(matchName, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = accent,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Text(
+                    if (number.isEmpty()) "Enter a number" else number,
+                    fontSize = when { number.length > 16 -> 20.sp; number.length > 11 -> 24.sp; number.isEmpty() -> 20.sp; else -> 32.sp },
+                    fontWeight = if (number.isEmpty()) FontWeight.Normal else FontWeight.Medium,
+                    letterSpacing = 0.8.sp,
+                    color = if (number.isEmpty()) secondaryText.copy(alpha = 0.7f) else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            // backspace appears only when there is something to delete; long-press clears everything
+            IconAction(
+                Icons.Filled.Backspace, "Delete number", secondaryText,
+                enabled = number.isNotEmpty(), onTap = { deleteLast() }, onLongPress = { clearAll() }
+            )
         }
-        /* Paste / Copy / Clear row (visible like Google Dialer, not hidden) */
-        Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { pasteNumber() }) { Text("Paste", fontSize = 12.sp) }
-            TextButton(onClick = { copyNumber() }, enabled = number.isNotEmpty()) { Text("Copy", fontSize = 12.sp) }
-            TextButton(onClick = { clearAll() }, enabled = number.isNotEmpty()) { Text("Clear", fontSize = 12.sp) }
-        }
-        Text("Long-press the number to paste a copied one", Modifier.padding(top = 2.dp), fontSize = 10.sp, color = secondaryText.copy(alpha = 0.7f))
-        /* Suggestions list */
+
+        /* ---- Middle area: contact suggestions, keypad is pinned to the bottom ---- */
         if (suggestions.isNotEmpty()) {
-            Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp)) {
+            Column(
+                Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState())
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
                 suggestions.forEach { person ->
-                    Row(Modifier.fillMaxWidth().clickable { onNumber(person.number) }.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) {
-                            Text(person.initials.take(1).uppercase(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                            .clickable { onNumber(person.number) }.padding(horizontal = 8.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(Modifier.size(38.dp).clip(CircleShape).background(accent.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) {
+                            Text(person.initials.take(1).uppercase(), color = accent, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(person.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp)
                             Text(person.number, color = secondaryText, fontSize = 12.sp, maxLines = 1)
                         }
-                        IconButton(onClick = { onCallPerson(person) }, modifier = Modifier.size(38.dp)) { Icon(Icons.Filled.Call, "Call ${person.name}", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp)) }
+                        IconButton(onClick = { onCallPerson(person) }, modifier = Modifier.size(38.dp)) { Icon(Icons.Filled.Call, "Call ${person.name}", tint = accent, modifier = Modifier.size(19.dp)) }
                     }
                 }
             }
         } else {
             Spacer(Modifier.weight(1f))
         }
-        val keys = listOf("1" to "", "2" to "ABC", "3" to "DEF", "4" to "GHI", "5" to "JKL", "6" to "MNO", "7" to "PQRS", "8" to "TUV", "9" to "WXYZ", "*" to "", "0" to "+", "#" to "")
-        keys.chunked(3).forEach { row ->
-            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                row.forEach { (digit, letters) ->
-                    DialKey(digit, letters) {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        playTone(digit)
-                        append(digit)
+
+        /* ---- Keypad: flat Truecaller-style keys, 3 columns ---- */
+        val keys = listOf(
+            "1" to "", "2" to "ABC", "3" to "DEF",
+            "4" to "GHI", "5" to "JKL", "6" to "MNO",
+            "7" to "PQRS", "8" to "TUV", "9" to "WXYZ",
+            "*" to "", "0" to "+", "#" to ""
+        )
+        Column(Modifier.fillMaxWidth().padding(horizontal = 6.dp)) {
+            keys.chunked(3).forEach { row ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    row.forEach { (digit, letters) ->
+                        DialKey(
+                            digit = digit, letters = letters, modifier = Modifier.weight(1f),
+                            onTap = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                playTone(digit)
+                                append(digit)
+                            },
+                            /* long-press 0 types "+" (and a leading "+" when empty) */
+                            onLongPress = if (digit == "0") ({ playTone(digit); insertPlus() }) else null
+                        )
                     }
                 }
             }
-            Spacer(Modifier.height(10.dp))
         }
-        Spacer(Modifier.height(8.dp))
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(26.dp)) {
-            Box(Modifier.size(64.dp))
-            Button(onClick = {
-                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                if (number.isBlank()) Toast.makeText(context, "Enter a number first", Toast.LENGTH_SHORT).show() else onCall()
-            }, shape = CircleShape, modifier = Modifier.size(64.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E9C67))) { Icon(Icons.Filled.Call, "Call", tint = Color.White, modifier = Modifier.size(25.dp)) }
-            /* Backspace only appears when there is something to delete (Google Dialer) */
-            if (number.isNotEmpty()) {
-                Surface(onClick = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); deleteLast() }, shape = CircleShape, color = Color.Transparent, modifier = Modifier.size(50.dp)) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Icon(Icons.Filled.Backspace, "Delete", tint = secondaryText, modifier = Modifier.size(22.dp)) }
+
+        /* ---- Green call button, centred like Truecaller ---- */
+        Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 14.dp), contentAlignment = Alignment.Center) {
+            Surface(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    if (number.isBlank()) Toast.makeText(context, "Enter a number first", Toast.LENGTH_SHORT).show() else onCall()
+                },
+                shape = CircleShape,
+                color = if (number.isBlank()) Color(0xFF9CC7AE) else Color(0xFF2E9C67),
+                shadowElevation = 6.dp,
+                modifier = Modifier.size(68.dp)
+            ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.Call, "Call", tint = Color.White, modifier = Modifier.size(27.dp))
                 }
-            } else {
-                Box(Modifier.size(50.dp))
             }
         }
-        Spacer(Modifier.weight(0.4f))
     }
 }
 
+/* Small round icon action with ripple + optional long-press, used for copy,
+   paste and backspace so they sit exactly where Truecaller places them. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun DialKey(digit: String, letters: String, onTap: () -> Unit) {
-    /* Surface(onClick) gives ripple feedback + TalkBack semantics, unlike a
-       raw pointerInput box which felt dead and was hard to press. */
-    Surface(onClick = onTap, shape = CircleShape, color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
-        modifier = Modifier.size(72.dp)) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(digit, fontSize = 25.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
-                if (letters.isNotBlank()) Text(letters, fontSize = 9.sp, letterSpacing = 1.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun IconAction(
+    icon: ImageVector,
+    label: String,
+    tint: Color,
+    enabled: Boolean = true,
+    onTap: () -> Unit,
+    onLongPress: (() -> Unit)? = null
+) {
+    val interaction = remember { MutableInteractionSource() }
+    Box(
+        Modifier.size(48.dp).clip(CircleShape)
+            .combinedClickable(
+                interactionSource = interaction,
+                indication = LocalIndication.current,
+                enabled = enabled,
+                onClick = onTap,
+                onLongClick = onLongPress
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(icon, label, tint = tint.copy(alpha = if (enabled) 1f else 0.3f), modifier = Modifier.size(21.dp))
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun DialKey(
+    digit: String,
+    letters: String,
+    modifier: Modifier = Modifier,
+    onTap: () -> Unit,
+    onLongPress: (() -> Unit)? = null
+) {
+    /* Flat keys like Truecaller: big digit, small letter row, ripple on press.
+       combinedClickable also gives TalkBack semantics and long-press support. */
+    val interaction = remember { MutableInteractionSource() }
+    Box(
+        modifier.height(60.dp).clip(RoundedCornerShape(18.dp))
+            .combinedClickable(
+                interactionSource = interaction,
+                indication = LocalIndication.current,
+                onClick = onTap,
+                onLongClick = onLongPress
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(digit, fontSize = 27.sp, fontWeight = FontWeight.Normal, color = MaterialTheme.colorScheme.onSurface)
+            if (letters.isNotBlank()) {
+                Text(letters, fontSize = 9.5.sp, letterSpacing = 1.4.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
 }
-
 
 @Composable
 private fun ProfileScreen(activity: MainActivity, onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit, onNotifications: () -> Unit) {
