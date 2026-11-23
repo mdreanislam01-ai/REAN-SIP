@@ -2515,9 +2515,9 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
             Modifier.fillMaxWidth().padding(horizontal = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconAction(
-                Icons.Filled.ContentCopy, "Copy number", secondaryText,
-                enabled = number.isNotEmpty(), onTap = { copyNumber() }
+            // copy / backspace only appear once there is a number (Truecaller behaviour)
+            if (number.isEmpty()) Box(Modifier.size(48.dp)) else IconAction(
+                Icons.Filled.ContentCopy, "Copy number", secondaryText, onTap = { copyNumber() }
             )
             Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                 if (matchName != null && number.length >= 3) {
@@ -2534,10 +2534,10 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
                     modifier = Modifier.fillMaxWidth()
                 )
             }
-            // backspace appears only when there is something to delete; long-press clears everything
-            IconAction(
+            // backspace only when there is something to delete; long-press clears everything
+            if (number.isEmpty()) Box(Modifier.size(48.dp)) else IconAction(
                 Icons.Filled.Backspace, "Delete number", secondaryText,
-                enabled = number.isNotEmpty(), onTap = { deleteLast() }, onLongPress = { clearAll() }
+                onTap = { deleteLast() }, onLongPress = { clearAll() }
             )
         }
 
