@@ -52,22 +52,27 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.10
-          name: CallerX Android APK v1.5.10
+          tag_name: callerx-v1.5.11
+          name: CallerX Android APK v1.5.11
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
 
-            v1.5.10 — SIP connection stability:
-            - Foreground keep-alive service (low-priority "SIP service" notification) keeps the SIP
-              registration and the process alive while the app is in the background, so returning to
-              the app no longer shows "Registering…/Reconnecting"
-            - SIP keepalive packets every 30 s (linphonerc) keep the carrier NAT pinhole open, which
-              stops mid-call audio drops
-            - During a call a partial wake lock + Wi-Fi lock is held so the CPU/radio never sleeps
-              mid-conversation
-            - Network callback re-registers instantly when Wi-Fi/mobile data switches or returns
-            - Automatic registration retry every 20 s after a failure; the error dialog now appears
-              only after several consecutive failures and mentions the auto-retry
+            v1.5.11 — Lock-screen mic, network drops, search & dialpad (Google Dialer style):
+            - SIP engine now lives in the foreground service (microphone type), not in the
+              Activity, so locking the phone, minimising the app or the system killing the
+              Activity no longer kills the call or the microphone. Incoming SIP calls show a
+              full-screen call UI over the lock screen and can be answered from there.
+            - Audio focus + MODE_IN_COMMUNICATION + wake/Wi-Fi locks are held from the first
+              ring until the call ends; Bluetooth / wired headset audio routing is honoured.
+            - SIP re-registers automatically after reboot (boot receiver) and on every
+              Wi-Fi/mobile switch; keepalive tightened to 15 s, registration refresh every
+              5 minutes, and Opus switched to mono 16 kHz so calls survive weak 4G.
+            - Search bar fixed: text keyboard on every tab (was numeric on Calls, so names
+              could not be typed), auto-focus, +880/880/00/0 number equivalence, and real
+              T9 keypad search (type 72446 to find a contact whose name spells it).
+            - Dialpad rebuilt like Google Dialer: ripple keys, DTMF tones, haptics, live
+              contact suggestions while typing, Paste/Copy/Clear, + key, and a backspace
+              that only appears when there is a number to delete.
           files: android/app/build/outputs/apk/debug/app-debug.apk
           overwrite_files: true

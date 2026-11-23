@@ -41,10 +41,23 @@ The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow files runs the **Build CallerX APK** GitHub Actions workflow. It builds the debug APK, uploads it as a workflow artifact, and publishes it to the rolling GitHub release:
 
-**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.10>**
+**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.11>**
 
 ## Notes
 
 - This is a debug build, signed with the default debug key. For Play Store distribution a release keystore is required.
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
+
+## v1.5.11 — lock-screen mic, network drops, search & dialpad
+
+- SIP engine runs in the foreground service (microphone FGS type), independent of the Activity:
+  locking the phone / minimising / system killing the Activity no longer stops the microphone
+  or drops the call. Incoming SIP calls use a full-screen intent over the lock screen.
+- Audio focus + `MODE_IN_COMMUNICATION`, wake/Wi-Fi locks from first ring, Bluetooth/wired
+  headset routing, and a boot receiver that re-registers SIP after reboot.
+- Network stability: 15 s SIP keepalive, 5-minute registration refresh, Opus mono 16 kHz
+  (was 48 kHz stereo), re-register on network-available only (not on lost).
+- Search: text keyboard on all tabs, auto-focus, +880/880/00/0 equivalence, true T9 search.
+- Dialpad: Google-Dialer style keys with ripple, DTMF tones, haptics, live contact
+  suggestions, Paste/Copy/Clear, + key, conditional backspace.
