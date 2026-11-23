@@ -52,11 +52,24 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.12
-          name: CallerX Android APK v1.5.12
+          tag_name: callerx-v1.5.13
+          name: CallerX Android APK v1.5.13
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.13 — Dialpad number box moved above the keypad:
+            - The typed number now sits in its own rounded box just above the keypad (where
+              your screenshot marked it), with copy on the left and backspace on the right,
+              instead of being pinned to the very top of the screen.
+            - Press and hold that box to paste a copied number (the extra Paste button in the
+              top bar was removed). A small "press and hold to paste" hint shows while empty.
+            - The app heading "CallerX" stays visible at the top in a light, subtle style with
+              the back arrow.
+            - Contact suggestions still list the matching numbers between the heading and the
+              number box, and tapping one fills it in.
+            - Status bar icons now follow the screen colour properly (dark icons on the light
+              dialer, white icons on the coloured header).
 
             v1.5.12 — Header, status bar and Truecaller-style dialpad:
             - Header is now three clean lines: "CallerX", "SIM 1 · SIM 2 · SIP", then one

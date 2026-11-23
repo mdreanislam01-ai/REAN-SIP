@@ -1271,8 +1271,11 @@ class MainActivity : ComponentActivity() {
         /* The status bar must match the app theme colour, not a white strip:
            a white bar with white icons made the clock/battery unreadable.
            CallerXApp repaints this on every screen change. */
-        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        /* Only the modern insets controller is used: the legacy
+           systemUiVisibility flags used to fight it and left white icons on a
+           white status bar. CallerXApp sets the colours/appearance per screen. */
         window.statusBarColor = 0xFF087DB8.toInt()   // default accent; repainted by CallerXApp
+        androidx.core.view.WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightNavigationBars = true
         window.navigationBarColor = android.graphics.Color.rgb(234, 240, 252)
         intent?.data?.schemeSpecificPart?.let { dialIntentNumber = it }
         callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
@@ -2499,46 +2502,18 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
             .statusBarsPadding().navigationBarsPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        /* ---- Top bar: back on the left, paste on the right (Truecaller layout) ---- */
+        /* ---- Slim top bar: back arrow + a light CallerX heading ---- */
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onSurface) }
-            Spacer(Modifier.weight(1f))
-            IconAction(Icons.Filled.ContentPaste, "Paste number", secondaryText, onTap = { pasteNumber() })
-            Spacer(Modifier.width(4.dp))
-        }
-
-        /* ---- Typed number: copy on the left, number in the middle, backspace on the right ---- */
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 10.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // copy / backspace only appear once there is a number (Truecaller behaviour)
-            if (number.isEmpty()) Box(Modifier.size(48.dp)) else IconAction(
-                Icons.Filled.ContentCopy, "Copy number", secondaryText, onTap = { copyNumber() }
+            Text(
+                "CallerX", Modifier.weight(1f), textAlign = TextAlign.Center,
+                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.3.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
             )
-            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                if (matchName != null && number.length >= 3) {
-                    Text(matchName, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = accent,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                Text(
-                    if (number.isEmpty()) "Enter a number" else number,
-                    fontSize = when { number.length > 16 -> 20.sp; number.length > 11 -> 24.sp; number.isEmpty() -> 20.sp; else -> 32.sp },
-                    fontWeight = if (number.isEmpty()) FontWeight.Normal else FontWeight.Medium,
-                    letterSpacing = 0.8.sp,
-                    color = if (number.isEmpty()) secondaryText.copy(alpha = 0.7f) else MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-            // backspace only when there is something to delete; long-press clears everything
-            if (number.isEmpty()) Box(Modifier.size(48.dp)) else IconAction(
-                Icons.Filled.Backspace, "Delete number", secondaryText,
-                onTap = { deleteLast() }, onLongPress = { clearAll() }
-            )
+            Spacer(Modifier.size(48.dp))   // balances the back arrow, keeps "CallerX" centred
         }
 
         /* ---- Middle area: contact suggestions, keypad is pinned to the bottom ---- */
@@ -2569,6 +2544,20 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
         } else {
             Spacer(Modifier.weight(1f))
         }
+
+        /* ---- Number display, right above the keypad (Truecaller placement).
+               Long-press it to paste a copied number. ---- */
+        NumberBar(
+            number = number,
+            matchName = if (number.length >= 3) matchName else null,
+            accent = accent,
+            secondaryText = secondaryText,
+            onCopy = { copyNumber() },
+            onDelete = { deleteLast() },
+            onClear = { clearAll() },
+            onPaste = { pasteNumber() }
+        )
+        Spacer(Modifier.height(6.dp))
 
         /* ---- Keypad: flat Truecaller-style keys, 3 columns ---- */
         val keys = listOf(
@@ -2612,6 +2601,74 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
                     Icon(Icons.Filled.Call, "Call", tint = Color.White, modifier = Modifier.size(27.dp))
                 }
             }
+        }
+    }
+}
+
+/* Number display placed just above the keypad (Truecaller style):
+   copy on the left, big number in the middle, backspace on the right.
+   A long-press anywhere on the box pastes a copied number. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun NumberBar(
+    number: String,
+    matchName: String?,
+    accent: Color,
+    secondaryText: Color,
+    onCopy: () -> Unit,
+    onDelete: () -> Unit,
+    onClear: () -> Unit,
+    onPaste: () -> Unit
+) {
+    val interaction = remember { MutableInteractionSource() }
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (number.isEmpty()) 0.30f else 0.5f),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp).height(72.dp)
+    ) {
+        Row(
+            Modifier.fillMaxSize()
+                .combinedClickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClick = { },
+                    onLongClick = { onPaste() }
+                )
+                .padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (number.isEmpty()) Box(Modifier.size(44.dp)) else IconAction(
+                Icons.Filled.ContentCopy, "Copy number", secondaryText, onTap = onCopy
+            )
+            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                if (matchName != null) {
+                    Text(matchName, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = accent,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Text(
+                    if (number.isEmpty()) "Enter a number" else number,
+                    fontSize = when {
+                        number.isEmpty() -> 18.sp
+                        number.length > 16 -> 21.sp
+                        number.length > 11 -> 25.sp
+                        else -> 32.sp
+                    },
+                    fontWeight = if (number.isEmpty()) FontWeight.Normal else FontWeight.Medium,
+                    letterSpacing = 0.8.sp,
+                    color = if (number.isEmpty()) secondaryText.copy(alpha = 0.65f) else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (number.isEmpty()) {
+                    Text("press and hold to paste a copied number", fontSize = 9.5.sp,
+                        color = secondaryText.copy(alpha = 0.55f), maxLines = 1)
+                }
+            }
+            // backspace only when there is something to delete; long-press clears everything
+            if (number.isEmpty()) Box(Modifier.size(44.dp)) else IconAction(
+                Icons.Filled.Backspace, "Delete number", secondaryText,
+                onTap = onDelete, onLongPress = onClear
+            )
         }
     }
 }

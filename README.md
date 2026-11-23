@@ -41,13 +41,24 @@ The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow files runs the **Build CallerX APK** GitHub Actions workflow. It builds the debug APK, uploads it as a workflow artifact, and publishes it to the rolling GitHub release:
 
-**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.12>**
+**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.13>**
 
 ## Notes
 
 - This is a debug build, signed with the default debug key. For Play Store distribution a release keystore is required.
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
+
+## v1.5.13 — dialpad number box above the keypad
+
+- The typed number lives in a rounded box **just above the keypad** (copy left, backspace
+  right) instead of at the very top of the screen; long-press the box to paste a copied
+  number, and the extra Paste button in the top bar is gone.
+- A light "CallerX" heading stays visible at the top next to the back arrow.
+- Contact suggestions keep listing matching numbers between the heading and the number box.
+- Status bar icons follow the screen colour (dark icons on the light dialer, white on the
+  coloured header), and the legacy `systemUiVisibility` flags no longer fight the modern
+  insets controller.
 
 ## v1.5.12 — header, status bar and Truecaller-style dialpad
 
