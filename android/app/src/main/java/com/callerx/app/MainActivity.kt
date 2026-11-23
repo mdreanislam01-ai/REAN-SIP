@@ -1180,7 +1180,7 @@ class MainActivity : ComponentActivity() {
                 .putString("backup:googleAccount", accountName)
                 .putLong("backup:lastGoogle", System.currentTimeMillis())
                 .apply()
-            try { (getSystemService(Context.BACKUP_SERVICE) as? android.app.backup.BackupManager)?.dataChanged() } catch (_: Exception) { }
+            try { android.app.backup.BackupManager(this).dataChanged() } catch (_: Exception) { }
             resumeTick++
             errorMessage = "Backup ready for $accountName.\n\nA copy is kept inside CallerX and Android will sync it with that Google account when Google backup is on (Settings → System → Backup)."
         } catch (e: Exception) {
@@ -1923,14 +1923,15 @@ private fun SearchField(query: String, onQuery: (String) -> Unit, focus: FocusRe
    call rows, which made it hard to stop on the number you were looking for. */
 @Composable
 private fun rememberSlowFling(): FlingBehavior {
-    val decay = remember { exponentialDecay<Float>(frictionMultiplier = 3.2f, absVelocityThreshold = 60f) }
-    return remember(decay) {
+    return remember {
         object : FlingBehavior {
             override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
-                var last = 0f
-                animate(0f, 1f, initialVelocity * 0.55f, decay) { value, _ ->
-                    scrollBy(value - last)
-                    last = value
+                var velocity = initialVelocity * 0.55f          // start calmer than the default
+                while (kotlin.math.abs(velocity) > 90f) {
+                    val consumed = scrollBy(velocity * 0.016f)   // ~one frame
+                    if (kotlin.math.abs(consumed) < 0.5f) break  // hit the end of the list
+                    velocity *= 0.90f                            // damp every frame
+                    delay(16)
                 }
                 return 0f
             }
