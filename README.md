@@ -49,6 +49,24 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.16 — polish pack
+
+- Contact photos in recents and contacts (initials as fallback), missed-call badge (24 h)
+  on the Calls tab, live mm:ss timer in the ongoing-call notification.
+- Tap the header chip for a SIP status popup (account, server:port, transport, state).
+- Speed dial: ⋮ → **Speed dial** on a recent call, then hold that key in the dial pad.
+- Recent searches appear as chips under the search bar.
+- Dark mode uses a darker shade of the accent for the header.
+- Registration retries back off 10 s → 20 s → 40 s → 80 s (max 120 s), resetting after success.
+- Silent weekly backup to phone storage.
+
+### Release signing (optional)
+
+Copy `keystore.properties.example` to `keystore.properties` in the repo root and point it at
+your keystore; `./gradlew assembleRelease` then produces a properly signed APK. Both the
+properties file and `*.jks` are git-ignored. Without it, release builds fall back to the
+debug key.
+
 ## v1.5.15 — SIP account chip, Profile & Backup, calmer scrolling
 
 - Header chip shows the SIP account name (green dot = registered, amber = connecting) and
