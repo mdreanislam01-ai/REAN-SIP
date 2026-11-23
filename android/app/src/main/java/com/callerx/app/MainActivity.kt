@@ -12,7 +12,6 @@ import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.app.PendingIntent
 import android.media.AudioAttributes
-import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.ToneGenerator
@@ -557,7 +556,7 @@ object SipEngine {
                 if (Build.VERSION.SDK_INT >= 26) {
                     val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
                         .setOnAudioFocusChangeListener(audioFocusListener).build()
-                    am.abandonAudioFocus(request)
+                    am.abandonAudioFocusRequest(request)
                 } else {
                     @Suppress("DEPRECATION")
                     am.abandonAudioFocus(audioFocusListener)
@@ -577,18 +576,13 @@ object SipEngine {
             val am = ctx.getSystemService(AudioManager::class.java) ?: return
             am.mode = AudioManager.MODE_IN_COMMUNICATION
             val devices = c.audioDevices
-            val headsetConnected = try {
-                am.getConnectedDevices(AudioDeviceInfo.GET_DEVICES_OUTPUTS).any {
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                        it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET || it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-                        it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-                }
-            } catch (_: Exception) { false }
+            /* Linphone only lists devices that are actually available, so a
+               Bluetooth/wired entry here means a headset is connected. */
             val headset = devices.firstOrNull {
                 val n = it.type.toString().lowercase()
                 n.contains("bluetooth") || n.contains("wired") || n.contains("headset")
             }
-            if (headsetConnected && headset != null) {
+            if (headset != null) {
                 c.outputAudioDevice = headset
                 try { c.inputAudioDevice = headset } catch (_: Exception) { }
                 return
@@ -630,7 +624,6 @@ object SipEngine {
                 params.setServerAddress(server)
                 params.setRegisterEnabled(a.autoBoot)
                 try { params.setExpires(300) } catch (_: Exception) { }
-                try { params.setPingWithOptions(true) } catch (_: Exception) { }
                 val account = c.createAccount(params) ?: continue
                 c.addAuthInfo(auth)
                 c.addAccount(account)
@@ -879,7 +872,6 @@ object SipEngine {
                 .setShowWhen(true)
                 .setCategory(Notification.CATEGORY_CALL)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
-                .setLockscreenVisibility(Notification.VISIBILITY_PUBLIC)
             val openIntent = Intent(ctx, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 .putExtra("callerx_open_call", true)
@@ -1487,10 +1479,8 @@ private fun CallerXApp(activity: MainActivity) {
                otherwise locking the phone kills the visible call UI / mic. */
             if (screen == "call") {
                 win.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                if (Build.VERSION.SDK_INT >= 27) { win.setShowWhenLocked(true); win.setTurnScreenOn(true) }
             } else {
                 win.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                if (Build.VERSION.SDK_INT >= 27) { win.setShowWhenLocked(false); win.setTurnScreenOn(false) }
             }
         }
     }
