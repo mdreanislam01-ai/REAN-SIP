@@ -12,8 +12,8 @@ android {
         applicationId = "com.callerx.app"
         minSdk = 23
         targetSdk = 35
-        versionCode = 33
-        versionName = "1.5.14"
+        versionCode = 34
+        versionName = "1.5.15"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 

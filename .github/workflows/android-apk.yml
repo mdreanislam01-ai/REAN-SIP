@@ -52,11 +52,23 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.14
-          name: CallerX Android APK v1.5.14
+          tag_name: callerx-v1.5.15
+          name: CallerX Android APK v1.5.15
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.15 — SIP account chip, Profile & Backup, calmer scrolling:
+            - The chip on the right of the header shows the SIP account's own name (green dot
+              when registered, amber while it is still connecting) and "Offline" when no SIP
+              account has been added, instead of the generic "Online".
+            - Settings → "Profile & Backup Account" (was "My Profile & User Account") now has real
+              backup: "Backup with Google account" opens the phone's Google account picker and
+              registers the backup with Android's Google Drive backup; "Backup to phone storage"
+              writes a readable JSON file in Downloads/CallerX. "Restore" brings SIP accounts,
+              blocked numbers, favourites, theme and profile back.
+            - Call history, contacts and messages scroll with calmer fling physics, so a flick no
+              longer races past the number you are looking for.
 
             v1.5.14 — Dialpad header uses the app theme colour:
             - The white strip at the top of the dial pad (status bar + CallerX row) is now

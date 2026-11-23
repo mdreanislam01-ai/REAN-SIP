@@ -20,6 +20,7 @@ import android.net.Network
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.PowerManager
 import android.os.Handler
 import android.os.Looper
@@ -27,6 +28,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.CallLog
 import android.provider.ContactsContract
+import android.provider.MediaStore
 import android.provider.Settings
 import android.provider.Telephony
 import android.telecom.PhoneAccount
@@ -50,6 +52,8 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.exponentialDecay
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -59,6 +63,8 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.foundation.gestures.FlingBehavior
+import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -969,6 +975,16 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) { errorMessage = "Could not load the selected photo: ${e.message ?: "unknown error"}" }
         }
     }
+    /* Google account picker for the cloud backup: the system picker lists the
+       Google accounts already signed in on the phone, no account permission
+       needed and no credentials are ever stored by CallerX. */
+    private val googleAccountPicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == RESULT_OK) {
+            val name = result.data?.getStringExtra(android.accounts.AccountManager.KEY_ACCOUNT_NAME)
+            if (!name.isNullOrBlank()) finishGoogleBackup(name)
+        }
+    }
+
     var resumeTick by mutableIntStateOf(0)
     var accountsTick by mutableIntStateOf(0)
     private var pendingCellNumber = ""
@@ -1056,6 +1072,153 @@ class MainActivity : ComponentActivity() {
     fun clearProfilePhoto() {
         try { File(filesDir, "profile_photo.jpg").delete() } catch (_: Exception) { }
         profileTick++
+    }
+
+    /* ---------- Backup & restore (Google account or phone storage) ---------- */
+    private fun callerxPrefs() = getSharedPreferences("callerx", Context.MODE_PRIVATE)
+
+    fun googleBackupAccount(): String = callerxPrefs().getString("backup:googleAccount", "") ?: ""
+
+    fun lastBackupLabel(): String {
+        val dir = File(filesDir, "backups")
+        val newest = try { dir.listFiles()?.filter { it.isFile }?.maxByOrNull { it.lastModified() } } catch (_: Exception) { null }
+        if (newest == null) return "No backup yet"
+        val when_ = android.text.format.DateFormat.getMediumDateFormat(this).format(Date(newest.lastModified())) +
+            " " + android.text.format.DateFormat.getTimeFormat(this).format(Date(newest.lastModified()))
+        return "Last backup: $when_ · ${newest.length() / 1024} KB"
+    }
+
+    /* Everything CallerX stores itself lives in one SharedPreferences file plus
+       the profile photo, so the backup is a readable JSON snapshot of it. */
+    private fun createBackupJson(): String {
+        val prefs = callerxPrefs()
+        val root = JSONObject()
+        root.put("app", "CallerX")
+        root.put("created", System.currentTimeMillis())
+        root.put("version", try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "" })
+        val values = JSONObject()
+        for (key in prefs.all.keys) {
+            val raw = prefs.all[key] ?: continue
+            val entry = JSONObject()
+            when (raw) {
+                is Boolean -> { entry.put("t", "b"); entry.put("v", raw) }
+                is Int -> { entry.put("t", "i"); entry.put("v", raw) }
+                is Long -> { entry.put("t", "l"); entry.put("v", raw) }
+                is Float -> { entry.put("t", "f"); entry.put("v", raw.toDouble()) }
+                is String -> { entry.put("t", "s"); entry.put("v", raw) }
+                is Set<*> -> { entry.put("t", "ss"); entry.put("v", JSONArray(raw.map { it.toString() })) }
+                else -> continue
+            }
+            values.put(key, entry)
+        }
+        root.put("prefs", values)
+        return root.toString(2)
+    }
+
+    /* Always keeps a local copy (used by Restore and by Android's own backup),
+       and on Android 10+ also drops a readable file in Downloads/CallerX. */
+    fun backupToPhoneStorage(): Boolean {
+        return try {
+            val json = createBackupJson()
+            val stamp = android.text.format.DateFormat.format("yyyyMMdd-HHmm", Date()).toString()
+            val name = "callerx-backup-$stamp.json"
+            val dir = File(filesDir, "backups").apply { mkdirs() }
+            File(dir, name).writeText(json)
+            var publicPath = ""
+            if (Build.VERSION.SDK_INT >= 29) {
+                try {
+                    val values = android.content.ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                        put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/CallerX")
+                    }
+                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    if (uri != null) {
+                        contentResolver.openOutputStream(uri)?.use { out -> out.write(json.toByteArray()) }
+                        publicPath = "Downloads/CallerX/$name"
+                    }
+                } catch (_: Exception) { }
+            }
+            if (publicPath.isBlank()) {
+                try {
+                    val ext = File(getExternalFilesDir(null) ?: filesDir, "CallerX").apply { mkdirs() }
+                    File(ext, name).writeText(json)
+                    publicPath = ext.absolutePath
+                } catch (_: Exception) { }
+            }
+            callerxPrefs().edit().putLong("backup:lastPhone", System.currentTimeMillis()).apply()
+            resumeTick++
+            errorMessage = if (publicPath.isBlank()) "Backup saved inside the app: $name" else "Backup saved to $publicPath"
+            true
+        } catch (e: Exception) {
+            errorMessage = "Backup failed: ${e.message ?: "unknown error"}"
+            false
+        }
+    }
+
+    fun chooseGoogleBackupAccount() {
+        try {
+            val intent = android.accounts.AccountManager.newChooseAccountIntent(
+                null, null, arrayOf("com.google"), true,
+                "Choose the Google account to back up your CallerX data", null, null, null
+            )
+            googleAccountPicker.launch(intent)
+        } catch (e: Exception) {
+            errorMessage = "This phone has no Google account picker. Use \"Backup to phone storage\" instead."
+        }
+    }
+
+    /* Saves the same snapshot locally, remembers the chosen Google account and
+       asks Android to include CallerX in the Google Drive backup of this phone. */
+    private fun finishGoogleBackup(accountName: String) {
+        try {
+            val json = createBackupJson()
+            val dir = File(filesDir, "backups").apply { mkdirs() }
+            val stamp = android.text.format.DateFormat.format("yyyyMMdd-HHmm", Date()).toString()
+            File(dir, "callerx-google-$stamp.json").writeText(json)
+            callerxPrefs().edit()
+                .putString("backup:googleAccount", accountName)
+                .putLong("backup:lastGoogle", System.currentTimeMillis())
+                .apply()
+            try { (getSystemService(Context.BACKUP_SERVICE) as? android.app.backup.BackupManager)?.dataChanged() } catch (_: Exception) { }
+            resumeTick++
+            errorMessage = "Backup ready for $accountName.\n\nA copy is kept inside CallerX and Android will sync it with that Google account when Google backup is on (Settings → System → Backup)."
+        } catch (e: Exception) {
+            errorMessage = "Google backup failed: ${e.message ?: "unknown error"}"
+        }
+    }
+
+    fun restoreFromBackup(): Boolean {
+        return try {
+            val dir = File(filesDir, "backups")
+            val newest = dir.listFiles()?.filter { it.extension == "json" }?.maxByOrNull { it.lastModified() }
+                ?: run { errorMessage = "No backup file found on this phone yet."; return false }
+            val root = JSONObject(newest.readText())
+            val values = root.optJSONObject("prefs") ?: JSONObject()
+            val editor = callerxPrefs().edit()
+            for (key in values.keys()) {
+                val entry = values.optJSONObject(key) ?: continue
+                when (entry.optString("t")) {
+                    "b" -> editor.putBoolean(key, entry.optBoolean("v"))
+                    "i" -> editor.putInt(key, entry.optInt("v"))
+                    "l" -> editor.putLong(key, entry.optLong("v"))
+                    "f" -> editor.putFloat(key, entry.optDouble("v").toFloat())
+                    "s" -> editor.putString(key, entry.optString("v"))
+                    "ss" -> {
+                        val arr = entry.optJSONArray("v")
+                        editor.putStringSet(key, (0 until (arr?.length() ?: 0)).map { arr!!.optString(it) }.toSet())
+                    }
+                }
+            }
+            editor.apply()
+            SipEngine.applyAccounts(this)
+            resumeTick++
+            errorMessage = "Restored ${values.length()} settings from ${newest.name}."
+            true
+        } catch (e: Exception) {
+            errorMessage = "Restore failed: ${e.message ?: "the file is damaged"}"
+            false
+        }
     }
 
     fun requestSmsPermission() {
@@ -1574,6 +1737,13 @@ private fun CallerXApp(activity: MainActivity) {
                     if (tab != "Settings") {
                         /* Header = CallerX / SIM 1 · SIM 2 · SIP / full-width search bar,
                            with only "Online" on the right (see HomeHeader). */
+                        /* Label under the accent header: the SIP account's own name,
+                           "Offline" when no account has been added. */
+                        val sipAccountLabel = remember(activity.accountsTick, activity.resumeTick) {
+                            val list = activity.accountsList()
+                            val acc = list.firstOrNull { it.isDefault } ?: list.firstOrNull { it.enabled } ?: list.firstOrNull()
+                            acc?.let { a -> listOf(a.displayName, a.name, a.user).firstOrNull { it.isNotBlank() } } ?: ""
+                        }
                         val hits = when (tab) {
                             "Contacts" -> contacts.count { matchesQuery(it.name, it.number, debouncedQuery) }
                             "Messages" -> messages.count { matchesQuery(it.first, it.first, debouncedQuery) || it.second.contains(debouncedQuery, true) }
@@ -1582,6 +1752,7 @@ private fun CallerXApp(activity: MainActivity) {
                         HomeHeader(
                             tab = tab,
                             online = activity.registered,
+                            accountLabel = sipAccountLabel,
                             query = query,
                             onQuery = { query = it },
                             focus = searchFocus,
@@ -1667,6 +1838,7 @@ private fun CallerXApp(activity: MainActivity) {
 private fun HomeHeader(
     tab: String,
     online: Boolean,
+    accountLabel: String,
     query: String,
     onQuery: (String) -> Unit,
     focus: FocusRequester,
@@ -1696,7 +1868,7 @@ private fun HomeHeader(
                 Text(subtitle, fontSize = 11.sp, color = headerText.copy(alpha = 0.85f), maxLines = 1,
                     overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 1.dp))
             }
-            OnlinePill(online, onSip)
+            OnlinePill(online, accountLabel, onSip)
         }
         Spacer(Modifier.height(9.dp))
         SearchField(query, onQuery, focus, onSearchDone, headerColor)
@@ -1747,17 +1919,45 @@ private fun SearchField(query: String, onQuery: (String) -> Unit, focus: FocusRe
     }
 }
 
+/* A calmer fling: with the default physics one flick raced through dozens of
+   call rows, which made it hard to stop on the number you were looking for. */
 @Composable
-private fun OnlinePill(online: Boolean, onClick: () -> Unit) {
-    // only "Online" / "Offline" on the right of the heading, like a status chip
+private fun rememberSlowFling(): FlingBehavior {
+    val decay = remember { exponentialDecay<Float>(frictionMultiplier = 3.2f, absVelocityThreshold = 60f) }
+    return remember(decay) {
+        object : FlingBehavior {
+            override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
+                var last = 0f
+                animate(0f, 1f, initialVelocity * 0.55f, decay) { value, _ ->
+                    scrollBy(value - last)
+                    last = value
+                }
+                return 0f
+            }
+        }
+    }
+}
+
+@Composable
+private fun OnlinePill(online: Boolean, accountLabel: String, onClick: () -> Unit) {
+    /* Shows the SIP account's own name (green dot while it is registered) and
+       falls back to "Offline" when no SIP account has been added yet. */
+    val label = accountLabel.trim()
+    val text = if (label.isBlank()) "Offline" else label
+    val dot = when {
+        label.isBlank() -> Color(0xFFFF9B9B)          // no account at all
+        online -> Color(0xFF6EE7A8)                   // registered
+        else -> Color(0xFFFFC46B)                     // added but not registered yet
+    }
     Surface(onClick = onClick, shape = RoundedCornerShape(50), color = Color.White.copy(alpha = 0.18f)) {
         Row(
             Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            Box(Modifier.size(7.dp).clip(CircleShape).background(if (online) Color(0xFF6EE7A8) else Color(0xFFFF9B9B)))
-            Text(if (online) "Online" else "Offline", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 1)
+            Box(Modifier.size(7.dp).clip(CircleShape).background(dot))
+            Text(text, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 1,
+                overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 116.dp))
         }
     }
 }
@@ -1783,7 +1983,7 @@ private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -
                     ok && matchesQuery(p.name, p.number, query)
                 }
             }
-            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 90.dp)) {
+            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 90.dp), flingBehavior = rememberSlowFling()) {
                 if (filtered.isEmpty()) item { Text(if (query.isBlank()) "No recent calls found on this device." else "No calls match “$query”.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 itemsIndexed(filtered, key = { i, p -> "call-$i-${p.number}-${p.ts}" }) { _, p -> CallRow(p, onAvatar = { onAvatar(p) }, onCall = { onCall(p) }, onMessage = { onMessage(p) }) }
             }
@@ -1844,7 +2044,7 @@ private fun ContactsTab(contacts: List<Person>, query: String, favorites: Set<St
     val visible = remember(contacts, query) { contacts.filter { matchesQuery(it.name, it.number, query) } }
     /* Real favorites (starred in contact details), not just the first five. */
     val favs = remember(visible, favorites) { visible.filter { it.number in favorites } }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 90.dp)) {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 90.dp), flingBehavior = rememberSlowFling()) {
         if (query.isBlank()) {
             item { SectionTitle("FAVORITES") }
             if (favs.isEmpty()) item { Text("No favorites yet. Star a contact in its details page.", Modifier.padding(horizontal = 16.dp, vertical = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp) }
@@ -1892,7 +2092,7 @@ private fun MessagesTab(activity: MainActivity, messages: List<Pair<String,Strin
         if (query.isBlank()) messages
         else messages.filter { matchesQuery(it.first, it.first, query) || it.second.contains(query.trim(), true) }
     }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 90.dp)) {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 90.dp), flingBehavior = rememberSlowFling()) {
         item {
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(if (query.isBlank()) "${messages.size} messages" else "${visible.size} of ${messages.size} messages", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -2370,12 +2570,16 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                     Text("Settings", fontSize = 26.sp, fontWeight = FontWeight.Bold, letterSpacing = (-0.5).sp, color = MaterialTheme.colorScheme.onPrimary)
                     Text("CallerX VoIP & Dual-SIM Preferences", fontSize = 11.sp, color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.78f), modifier = Modifier.padding(top = 2.dp))
                 }
-                OnlinePill(activity.registered, onSip)
+                OnlinePill(activity.registered, remember(activity.accountsTick, activity.resumeTick) {
+                    val list = activity.accountsList()
+                    val acc = list.firstOrNull { it.isDefault } ?: list.firstOrNull { it.enabled } ?: list.firstOrNull()
+                    acc?.let { a -> listOf(a.displayName, a.name, a.user).firstOrNull { it.isNotBlank() } } ?: ""
+                }, onSip)
             }
         }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
             SectionTitle("ACCOUNT")
-            SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "My Profile & User Account", "CallerX profile · auto backup on", onProfile)
+            SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "Profile & Backup Account", if (activity.googleBackupAccount().isNotBlank()) "Google · ${activity.googleBackupAccount()}" else "Profile, Google account backup & phone storage", onProfile)
             SectionTitle("VOIP & SIP")
             SettingRow(Icons.Filled.Cloud, MaterialTheme.colorScheme.primary, "SIP Account", if (defaultAcc != null) "${defaultAcc.domain} · ${activity.registrationMessage}" else "No account added", onSip)
             SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio & Codec", "Opus 16 kHz mono, G.722 · echo cancellation on", onRoute = null, onClick = { activity.errorMessage = "Codecs in use: Opus 16 kHz mono (low bandwidth, stable on 4G), G.722, PCMA, PCMU and DTMF events. Echo cancellation is always on." })
@@ -2752,7 +2956,7 @@ private fun ProfileScreen(activity: MainActivity, onBack: () -> Unit, onTheme: (
     }
     val primary = MaterialTheme.colorScheme.primary
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        TopBar("My Profile", onBack)
+        TopBar("Profile & Backup", onBack)
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Box(Modifier.size(96.dp).clip(CircleShape).background(primary), contentAlignment = Alignment.Center) {
                 val bmp = photo
@@ -2776,6 +2980,47 @@ private fun ProfileScreen(activity: MainActivity, onBack: () -> Unit, onTheme: (
                     OutlinedTextField(email, { email = it; prefs.edit().putString("profile:email", it).apply() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Gmail / email", fontSize = 13.sp) }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), shape = RoundedCornerShape(14.dp))
                     OutlinedTextField(status, { status = it; prefs.edit().putString("profile:status", it).apply() }, Modifier.fillMaxWidth(), singleLine = true, label = { Text("Status", fontSize = 13.sp) }, shape = RoundedCornerShape(14.dp))
                     Text("Changes are saved automatically on this device.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+            /* Backup: Google account first (system account picker), then a plain
+               file in phone storage, and a restore action for the newest copy. */
+            Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Backup", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                    Text(activity.lastBackupLabel(), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Surface(onClick = { activity.chooseGoogleBackupAccount() }, shape = RoundedCornerShape(14.dp),
+                        color = primary.copy(alpha = 0.08f), modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.CloudUpload, null, tint = primary, modifier = Modifier.size(19.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("Backup with Google account", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                                Text(
+                                    activity.googleBackupAccount().ifBlank { "Pick a Google account already on this phone" },
+                                    fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                    Surface(onClick = { activity.backupToPhoneStorage() }, shape = RoundedCornerShape(14.dp),
+                        color = primary.copy(alpha = 0.08f), modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.Save, null, tint = primary, modifier = Modifier.size(19.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("Backup to phone storage", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                                Text("Saved in Downloads/CallerX as a read-able file", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Restores SIP accounts, blocked numbers, favourites, theme and profile from the newest backup.", fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { activity.restoreFromBackup() }) { Text("Restore", fontSize = 12.sp, maxLines = 1, softWrap = false) }
+                    }
                 }
             }
             Spacer(Modifier.height(14.dp))

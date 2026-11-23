@@ -41,13 +41,22 @@ The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow files runs the **Build CallerX APK** GitHub Actions workflow. It builds the debug APK, uploads it as a workflow artifact, and publishes it to the rolling GitHub release:
 
-**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.14>**
+**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.15>**
 
 ## Notes
 
 - This is a debug build, signed with the default debug key. For Play Store distribution a release keystore is required.
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
+
+## v1.5.15 — SIP account chip, Profile & Backup, calmer scrolling
+
+- Header chip shows the SIP account name (green dot = registered, amber = connecting) and
+  "Offline" when no account is added.
+- Settings → **Profile & Backup Account** with real backup: Google account picker (registered
+  with Android's Google Drive backup) and a JSON file in `Downloads/CallerX`, plus Restore.
+- Calmer fling physics on call history / contacts / messages so scrolling stops where you
+  want it.
 
 ## v1.5.14 — dialpad header in the app theme colour
 
