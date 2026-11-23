@@ -1,8 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+/* Release signing: drop a keystore.properties (git-ignored) in the repo root to
+   sign release builds with your own key; without it release uses the debug key. */
+val keystorePropsFile = rootProject.file("keystore.properties")
+val hasKeystore = keystorePropsFile.exists()
+val keystoreProps = Properties().apply { if (hasKeystore) keystorePropsFile.inputStream().use { load(it) } }
 
 android {
     namespace = "com.callerx.app"
@@ -17,14 +25,6 @@ android {
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
-    /* Release signing: drop a keystore.properties (not committed) next to
-       settings.gradle.kts to sign release builds with your own key.
-       Without it, release builds fall back to the debug key. */
-    val keystorePropsFile = rootProject.file("keystore.properties")
-    val hasKeystore = keystorePropsFile.exists()
-    val keystoreProps = java.util.Properties().apply {
-        if (hasKeystore) keystorePropsFile.inputStream().use { load(it) }
-    }
     signingConfigs {
         if (hasKeystore) {
             create("release") {
