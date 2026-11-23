@@ -922,8 +922,8 @@ object SipEngine {
                 .setOnlyAlertOnce(true)
                 .setShowWhen(true)
                 .setCategory(Notification.CATEGORY_CALL)
-            if (inCall && startedAt > 0L) { builder.setWhen(startedAt); builder.setUsesChronometer(true) }
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
+            if (inCall && startedAt > 0L) { builder.setWhen(startedAt); builder.setUsesChronometer(true) }
             val openIntent = Intent(ctx, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 .putExtra("callerx_open_call", true)
