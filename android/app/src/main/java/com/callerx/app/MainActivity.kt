@@ -10,7 +10,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.database.ContentObserver
+import android.app.PendingIntent
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
@@ -29,6 +34,7 @@ import android.telecom.PhoneAccount
 import android.telecom.TelecomManager
 import android.telephony.SubscriptionManager
 import android.view.View
+import android.view.WindowManager
 import java.io.File
 import java.text.DateFormat
 import java.util.Date
@@ -60,6 +66,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -75,14 +82,19 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -187,22 +199,89 @@ private fun relDay(ts: Long): String {
     }
 }
 
+/* Canonical digits for forgiving number search: +8801712345678, 8801712345678,
+   01712345678 and 1712345678 all become the same key, so any of them finds the others. */
+private fun canonicalDigits(s: String): String {
+    var d = digitsOnly(s)
+    if (d.startsWith("00")) d = d.drop(2)
+    if (d.startsWith("880")) d = d.drop(3)
+    else if (d.startsWith("88") && d.length > 10) d = d.drop(2)
+    if (d.startsWith("0")) d = d.drop(1)
+    return d
+}
+
+private fun nameInitials(name: String): String =
+    name.split(" ", ",", ";").filter { it.isNotBlank() }.mapNotNull { it.firstOrNull()?.lowercaseChar() }.joinToString("")
+
 private fun matchesQuery(name: String, number: String, rawQuery: String): Boolean {
     val q = rawQuery.trim()
     if (q.isEmpty()) return true
+    val lq = q.lowercase()
     if (name.contains(q, true)) return true
+    // multi-word name search: every typed word must appear ("rakib has" -> Rakib Hasan)
+    val words = lq.split(" ", ",", ";").filter { it.isNotBlank() }
+    if (words.size > 1 && words.all { name.lowercase().contains(it) }) return true
     val digits = digitsOnly(number)
     val qDigits = digitsOnly(q)
-    if (qDigits.isNotEmpty() && digits.contains(qDigits)) return true
-    if (qDigits.length >= 4 && digits.endsWith(qDigits)) return true      // 01717… finds +8801717…
+    if (qDigits.isNotEmpty()) {
+        if (digits.contains(qDigits)) return true
+        val canon = canonicalDigits(number)
+        val qCanon = canonicalDigits(q)
+        if (qCanon.isNotEmpty() && canon.contains(qCanon)) return true
+        if (qCanon.length >= 4 && canon.endsWith(qCanon)) return true
+        // true T9: typed digits find a contact by name (72446 -> "rahi…")
+        if (q.all { it.isDigit() } && q.length >= 2) {
+            val nameT9 = toT9(name)
+            if (nameT9.isNotEmpty() && nameT9.contains(qDigits)) return true
+        }
+    }
     if (q.any { it.isLetter() }) {
         val t9 = toT9(q)
-        if (t9.isNotEmpty() && digits.contains(t9)) return true           // type "rahi" -> numbers
-        val initials = name.split(" ").filter { it.isNotBlank() }.mapNotNull { it.firstOrNull()?.lowercaseChar() }.joinToString("")
-        val lq = q.lowercase().filter { it.isLetter() }
-        if (lq.length > 1 && initials.contains(lq)) return true           // "rh" -> Rakib Hasan
+        if (t9.isNotEmpty() && digits.contains(t9)) return true           // typed letters -> number digits
+        val initials = nameInitials(name)
+        val lettersOnly = lq.filter { it.isLetter() }
+        if (lettersOnly.length > 1 && initials.contains(lettersOnly)) return true   // "rh" -> Rakib Hasan
     }
     return false
+}
+
+/* ---------- SIP accounts + blocked numbers: shared by Activity, engine and boot receiver ---------- */
+private fun loadSipAccounts(context: Context): List<SipAccount> {
+    return try {
+        val arr = JSONArray(context.getSharedPreferences("callerx", Context.MODE_PRIVATE).getString("sip_accounts", "[]") ?: "[]")
+        (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            SipAccount(o.optString("name"), o.optString("user"), o.optString("pass"), o.optString("domain"),
+                o.optString("port", "5060"), o.optString("transport", "UDP"), o.optString("proxy"), o.optString("displayName"),
+                o.optBoolean("autoBoot", true), o.optBoolean("enabled", true), o.optBoolean("default", false))
+        }
+    } catch (_: Exception) { emptyList() }
+}
+
+private fun saveSipAccounts(context: Context, list: List<SipAccount>) {
+    val arr = JSONArray()
+    list.forEach { a ->
+        arr.put(JSONObject().put("name", a.name).put("user", a.user).put("pass", a.pass).put("domain", a.domain)
+            .put("port", a.port).put("transport", a.transport).put("proxy", a.proxy).put("displayName", a.displayName)
+            .put("autoBoot", a.autoBoot).put("enabled", a.enabled).put("default", a.isDefault))
+    }
+    context.getSharedPreferences("callerx", Context.MODE_PRIVATE).edit().putString("sip_accounts", arr.toString()).apply()
+}
+
+private fun loadBlockedNumbers(context: Context): List<String> {
+    return try {
+        val arr = JSONArray(context.getSharedPreferences("callerx", Context.MODE_PRIVATE).getString("blocked", "[]") ?: "[]")
+        (0 until arr.length()).map { arr.getString(it) }.toMutableList()
+    } catch (_: Exception) { mutableListOf() }
+}
+
+private fun isBlockedNumber(context: Context, number: String): Boolean {
+    val norm = number.filter { it.isDigit() || it == '+' }
+    val canon = canonicalDigits(norm)
+    return loadBlockedNumbers(context).any {
+        val b = it.filter { c -> c.isDigit() }
+        it.isNotEmpty() && b.isNotEmpty() && (norm.endsWith(b) || norm == it || (canon.isNotEmpty() && canon == canonicalDigits(it)))
+    }
 }
 
 object CallBridge { var activity: MainActivity? = null }
@@ -212,16 +291,612 @@ class CallNotificationReceiver : BroadcastReceiver() {
         val a = CallBridge.activity
         val cell = TelecomCallBridge.currentCall != null
         when (intent.action) {
-            "callerx.call.end" -> { if (cell) TelecomCallBridge.currentCall?.disconnect() else a?.endCall() }
+            "callerx.call.end" -> { if (cell) TelecomCallBridge.currentCall?.disconnect() else SipEngine.endCall() }
             "callerx.call.speaker" -> {
                 val on = !(a?.speaker ?: false)
-                if (cell) TelecomCallBridge.service?.setSpeakerRoute(on) else a?.setSpeakerOn(on)
+                if (cell) TelecomCallBridge.service?.setSpeakerRoute(on) else SipEngine.setSpeakerOn(on)
             }
             "callerx.call.mute" -> {
                 val on = !(a?.muted ?: false)
-                if (cell) TelecomCallBridge.service?.setMuted(on) else a?.toggleMute(on)
+                if (cell) TelecomCallBridge.service?.setMuted(on) else SipEngine.toggleMute(on)
             }
         }
+    }
+}
+
+/* Restarts the SIP engine after a reboot / app update so the line is online
+   without the user having to open CallerX first. */
+class SipBootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        try {
+            if (loadSipAccounts(context).none { it.enabled }) return
+            val i = Intent(context, SipKeepAliveService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(i) else context.startService(i)
+        } catch (_: Exception) { }
+    }
+}
+
+/* The SIP engine lives here, NOT in the Activity. The Activity can be paused,
+   minimised or destroyed when the phone is locked — the engine (and therefore
+   the microphone, the registration and any ongoing call) keeps running inside
+   the foreground service. The Activity only observes state through CallBridge. */
+object SipEngine {
+    private var core: Core? = null
+    private var appContext: Context? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var activeCall: Call? = null
+    private var sipCallIncoming = false
+    private var sipCallLogged = true
+    private var regFailCount = 0
+    private var regRetryPending = false
+    private var incomingVibrationOn = false
+    private var audioFocusHeld = false
+    private var callWakeLock: PowerManager.WakeLock? = null
+    private var callWifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    /* Mirrors of the Activity UI state, so a recreated Activity (e.g. after the
+       system killed it while locked) immediately shows the right call screen. */
+    var isRegistered by mutableStateOf(false)
+    var lastRegistrationMessage by mutableStateOf("SIP Offline")
+    var lastCallState by mutableStateOf("")
+    var callActive by mutableStateOf(false)
+
+    private val refreshRunnable = Runnable { try { core?.refreshRegisters() } catch (_: Exception) { } }
+    private fun scheduleRefresh(delayMs: Long) {
+        mainHandler.removeCallbacks(refreshRunnable)
+        mainHandler.postDelayed(refreshRunnable, delayMs)
+    }
+
+    private val netCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) { scheduleRefresh(800) }
+        /* onLost intentionally does nothing: refreshing on lost only causes
+           register flapping when switching between Wi-Fi and mobile data. */
+    }
+
+    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { }
+
+    @Synchronized
+    fun ensureStarted(context: Context) {
+        appContext = context.applicationContext
+        if (core != null) return
+        try {
+            val ctx = context.applicationContext
+            val soundsDir = prepareSounds(ctx)
+            val c = Factory.instance().createCore(buildCoreConfig(soundsDir), null, ctx)
+            core = c
+            c.addListener(object : CoreListenerStub() {
+                override fun onAccountRegistrationStateChanged(core: Core, account: Account, state: RegistrationState, message: String) {
+                    mainHandler.post {
+                        val a = CallBridge.activity
+                        val isDefault = core.defaultAccount == account
+                        if (isDefault || !isRegistered) isRegistered = state == RegistrationState.Ok
+                        if (isDefault || state == RegistrationState.Ok) {
+                            lastRegistrationMessage = when (state) {
+                                RegistrationState.Ok -> "SIP Online"
+                                RegistrationState.Progress -> "Registering…"
+                                RegistrationState.Failed -> "SIP Registration Failed"
+                                else -> "SIP Offline"
+                            }
+                        }
+                        a?.registered = isRegistered
+                        a?.registrationMessage = lastRegistrationMessage
+                        if (state == RegistrationState.Ok) regFailCount = 0
+                        if (state == RegistrationState.Failed && isDefault) {
+                            regFailCount++
+                            scheduleRegRetry()
+                            if (regFailCount >= 3 && a != null) {
+                                a.errorMessage = "SIP registration failed: $message — CallerX keeps retrying automatically. If it stays offline, check username, password, server domain, port and transport (UDP/TCP/TLS) with your SIP provider."
+                            }
+                        }
+                    }
+                }
+                override fun onCallStateChanged(core: Core, call: Call, state: Call.State, message: String) {
+                    mainHandler.post {
+                        val a = CallBridge.activity
+                        activeCall = if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) null else call
+                        when (state) {
+                            Call.State.IncomingReceived -> {
+                                val remoteName = call.remoteAddress?.displayName?.takeIf { it.isNotBlank() } ?: "Incoming caller"
+                                val remoteNumber = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
+                                if (a != null) {
+                                    a.activeCallName = remoteName
+                                    a.activeNumber = remoteNumber
+                                    a.callConnected = false
+                                    a.muted = false; a.speaker = false
+                                    a.callStartedAt = 0L; a.recording = false
+                                }
+                                sipCallIncoming = true; sipCallLogged = false
+                                acquireCallLocks()
+                                acquireAudioFocus()
+                                routeAudio(false)
+                                val ctx = appContext
+                                if (ctx != null && isBlockedNumber(ctx, remoteNumber)) {
+                                    try { call.decline(Reason.Busy) } catch (_: Exception) { }
+                                } else startIncomingVibration()
+                            }
+                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> {
+                                if (a != null) { a.callConnected = false; a.muted = false; a.speaker = false; a.callStartedAt = 0L; a.recording = false }
+                                sipCallIncoming = false; sipCallLogged = false
+                                acquireCallLocks()
+                                acquireAudioFocus()
+                                routeAudio(a?.speaker ?: false)
+                            }
+                            Call.State.Connected -> {
+                                if (a != null) { a.callConnected = true; if (a.callStartedAt == 0L) a.callStartedAt = System.currentTimeMillis() }
+                                stopIncomingVibration()
+                            }
+                            Call.State.StreamsRunning -> {
+                                if (a != null) { a.callConnected = true; if (a.callStartedAt == 0L) a.callStartedAt = System.currentTimeMillis() }
+                                stopIncomingVibration()
+                                acquireCallLocks()
+                                acquireAudioFocus()
+                                maybeAutoRecord()
+                            }
+                            Call.State.End, Call.State.Released, Call.State.Error -> {
+                                stopIncomingVibration()
+                                if (!sipCallLogged && a != null) {
+                                    val dur = if (a.callStartedAt > 0L) ((System.currentTimeMillis() - a.callStartedAt) / 1000L).coerceAtLeast(0L) else 0L
+                                    a.logSipCall(a.activeNumber, a.activeCallName, sipCallIncoming, a.callConnected, dur)
+                                    sipCallLogged = true
+                                }
+                                if (a != null) { a.callStartedAt = 0L; a.recording = false; a.callConnected = false }
+                                releaseCallLocks()
+                                releaseAudioFocus()
+                            }
+                            else -> { }
+                        }
+                        lastCallState = when (state) {
+                            Call.State.IncomingReceived -> "Incoming SIP call"
+                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> "Calling…"
+                            Call.State.OutgoingRinging -> "Ringing…"
+                            Call.State.OutgoingEarlyMedia -> "Connecting audio…"
+                            Call.State.Connected -> "Connected"
+                            Call.State.StreamsRunning -> "In call"
+                            Call.State.Paused -> "On hold"
+                            Call.State.Resuming -> "Resuming…"
+                            Call.State.End, Call.State.Released -> "Call ended"
+                            Call.State.Error -> "Call failed: $message"
+                            else -> lastCallState
+                        }
+                        a?.callState = lastCallState
+                        val active = state == Call.State.IncomingReceived || state == Call.State.OutgoingInit ||
+                            state == Call.State.OutgoingProgress || state == Call.State.OutgoingRinging ||
+                            state == Call.State.OutgoingEarlyMedia || state == Call.State.Connected ||
+                            state == Call.State.StreamsRunning || state == Call.State.Paused || state == Call.State.Resuming
+                        callActive = active
+                        if (active) showCallNotification() else cancelCallNotification()
+                    }
+                }
+            })
+            c.start()
+            try { ctx.getSystemService(ConnectivityManager::class.java)?.registerDefaultNetworkCallback(netCallback) } catch (_: Exception) { }
+            applyAccounts(ctx)
+        } catch (e: Exception) {
+            CallBridge.activity?.errorMessage = "VoIP engine couldn't start: ${e.message ?: "unknown error"}"
+        }
+    }
+
+    fun shutdown() {
+        try { appContext?.getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(netCallback) } catch (_: Exception) { }
+        releaseCallLocks()
+        releaseAudioFocus()
+        try { core?.stop() } catch (_: Exception) { }
+        core = null
+        activeCall = null
+        callActive = false
+    }
+
+    fun refreshRegisters() { scheduleRefresh(800) }
+
+    fun startService(context: Context) {
+        try {
+            val i = Intent(context, SipKeepAliveService::class.java)
+            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(i) else context.startService(i)
+        } catch (_: Exception) { }
+    }
+
+    private fun scheduleRegRetry() {
+        if (regRetryPending) return
+        regRetryPending = true
+        mainHandler.postDelayed({
+            regRetryPending = false
+            if (!isRegistered) { try { core?.refreshRegisters() } catch (_: Exception) { } ; scheduleRegRetry() }
+        }, 20000)
+    }
+
+    private fun acquireCallLocks() {
+        val ctx = appContext ?: return
+        try {
+            if (callWakeLock == null) {
+                val pm = ctx.getSystemService(PowerManager::class.java)
+                callWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "callerx:call")
+                callWakeLock?.setReferenceCounted(false)
+                callWakeLock?.acquire(3600000L)
+            }
+        } catch (_: Exception) { }
+        try {
+            if (callWifiLock == null) {
+                val wm = ctx.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                @Suppress("DEPRECATION")
+                val wl = wm?.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "callerx:wifi")
+                callWifiLock = wl
+                wl?.setReferenceCounted(false)
+                wl?.acquire()
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun releaseCallLocks() {
+        try { callWakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
+        callWakeLock = null
+        try { callWifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
+        callWifiLock = null
+    }
+
+    private fun acquireAudioFocus() {
+        val ctx = appContext ?: return
+        try {
+            val am = ctx.getSystemService(AudioManager::class.java) ?: return
+            am.mode = AudioManager.MODE_IN_COMMUNICATION
+            if (Build.VERSION.SDK_INT >= 26) {
+                val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                    .setOnAudioFocusChangeListener(audioFocusListener).build()
+                audioFocusHeld = am.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            } else {
+                @Suppress("DEPRECATION")
+                audioFocusHeld = am.requestAudioFocus(audioFocusListener, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun releaseAudioFocus() {
+        val ctx = appContext ?: return
+        try {
+            val am = ctx.getSystemService(AudioManager::class.java) ?: return
+            am.mode = AudioManager.MODE_NORMAL
+            if (audioFocusHeld) {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                        .setOnAudioFocusChangeListener(audioFocusListener).build()
+                    am.abandonAudioFocus(request)
+                } else {
+                    @Suppress("DEPRECATION")
+                    am.abandonAudioFocus(audioFocusListener)
+                }
+                audioFocusHeld = false
+            }
+        } catch (_: Exception) { }
+    }
+
+    /* Route to a Bluetooth / wired headset when one is connected, otherwise
+       honour the speaker toggle. This is what makes the mic work with a
+       headset in a pocket / on a locked phone instead of the earpiece. */
+    private fun routeAudio(preferSpeaker: Boolean) {
+        val ctx = appContext ?: return
+        val c = core ?: return
+        try {
+            val am = ctx.getSystemService(AudioManager::class.java) ?: return
+            am.mode = AudioManager.MODE_IN_COMMUNICATION
+            val devices = c.audioDevices
+            val headsetConnected = try {
+                am.getConnectedDevices(AudioDeviceInfo.GET_DEVICES_OUTPUTS).any {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                        it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET || it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                        it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+                }
+            } catch (_: Exception) { false }
+            val headset = devices.firstOrNull {
+                val n = it.type.toString().lowercase()
+                n.contains("bluetooth") || n.contains("wired") || n.contains("headset")
+            }
+            if (headsetConnected && headset != null) {
+                c.outputAudioDevice = headset
+                try { c.inputAudioDevice = headset } catch (_: Exception) { }
+                return
+            }
+            val target = if (preferSpeaker) {
+                devices.firstOrNull { it.type == AudioDevice.Type.Speaker }
+            } else {
+                devices.firstOrNull { it.type == AudioDevice.Type.Earpiece }
+                    ?: devices.firstOrNull { it.type == AudioDevice.Type.Speaker }
+            } ?: devices.firstOrNull()
+            if (target != null) c.outputAudioDevice = target
+        } catch (_: Exception) { }
+    }
+
+    fun applyAccounts(context: Context) {
+        ensureStarted(context)
+        val c = core ?: return
+        try {
+            c.clearAccounts()
+            c.clearAllAuthInfo()
+            val list = loadSipAccounts(context).filter { it.enabled }
+            var default: Account? = null
+            for (a in list) {
+                if (a.user.isBlank() || a.domain.isBlank()) continue
+                val auth = Factory.instance().createAuthInfo(a.user, null, a.pass, null, null, a.domain)
+                val params = c.createAccountParams()
+                val identity = Factory.instance().createAddress("sip:${a.user}@${a.domain}") ?: continue
+                val transport = a.transport.lowercase().ifBlank { "udp" }
+                val port = a.port.trim().ifBlank { if (transport == "tls") "5061" else "5060" }
+                val serverStr = when {
+                    a.proxy.isNotBlank() -> {
+                        val px = a.proxy.trim()
+                        if (px.startsWith("sip:")) px else "sip:$px" + if (px.contains(";transport=")) "" else ";transport=$transport"
+                    }
+                    else -> "sip:${a.domain}:$port;transport=$transport"
+                }
+                val server = Factory.instance().createAddress(serverStr) ?: continue
+                params.setIdentityAddress(identity)
+                params.setServerAddress(server)
+                params.setRegisterEnabled(a.autoBoot)
+                try { params.setExpires(300) } catch (_: Exception) { }
+                try { params.setPingWithOptions(true) } catch (_: Exception) { }
+                val account = c.createAccount(params) ?: continue
+                c.addAuthInfo(auth)
+                c.addAccount(account)
+                if (a.isDefault && default == null) default = account
+            }
+            c.defaultAccount = default ?: c.accountList.firstOrNull()
+            isRegistered = false
+            regFailCount = 0
+            lastRegistrationMessage = if (c.accountList.isNotEmpty()) "Registering…" else "SIP Offline"
+            CallBridge.activity?.registered = false
+            CallBridge.activity?.registrationMessage = lastRegistrationMessage
+            if (c.accountList.isNotEmpty()) startService(context)
+        } catch (e: Exception) {
+            isRegistered = false
+            lastRegistrationMessage = "SIP Offline"
+            CallBridge.activity?.registered = false
+            CallBridge.activity?.registrationMessage = "SIP Offline"
+            CallBridge.activity?.errorMessage = "SIP setup failed: ${e.message ?: "check the account details"}"
+        }
+    }
+
+    private fun prepareSounds(ctx: Context): File {
+        val dir = File(ctx.filesDir, "sounds")
+        try {
+            if (!dir.exists()) dir.mkdirs()
+            for (name in listOf("ring.wav", "ringback.wav")) {
+                val out = File(dir, name)
+                if (!out.exists() || out.length() < 1024) {
+                    ctx.assets.open("sounds/$name").use { input -> out.outputStream().use { input.copyTo(it) } }
+                }
+            }
+        } catch (_: Exception) { }
+        return dir
+    }
+
+    private fun buildCoreConfig(soundsDir: File): String? {
+        return try {
+            val ctx = appContext ?: return null
+            val cfg = File(ctx.filesDir, "linphonerc")
+            val ring = File(soundsDir, "ring.wav").absolutePath
+            val ringback = File(soundsDir, "ringback.wav").absolutePath
+            val lines = listOf(
+                "[net]",
+                "download_bw=0",
+                "upload_bw=0",
+                "mtu=1300",
+                "stun_server=stun.l.google.com:19302",
+                "protocols=stun,ice",
+                "nat_policy_ref=default_nat_policy",
+                "",
+                "[default_nat_policy]",
+                "protocols=stun,ice",
+                "stun_server=stun.l.google.com:19302",
+                "",
+                "[sound]",
+                "ring=$ring",
+                "ringback=$ringback",
+                "remote_ring=$ring",
+                "echocancellation=1",
+                "echocancellation_tail_len=250",
+                "",
+                "[rtp]",
+                "audio_rtp_port=7078",
+                "video_rtp_port=0",
+                "",
+                "[video]",
+                "enabled=0",
+                "",
+                "[audio_codec_0]",
+                "mime=opus",
+                "rate=16000",
+                "channels=1",
+                "enabled=1",
+                "",
+                "[audio_codec_1]",
+                "mime=G722",
+                "rate=8000",
+                "channels=1",
+                "enabled=1",
+                "",
+                "[audio_codec_2]",
+                "mime=PCMA",
+                "rate=8000",
+                "channels=1",
+                "enabled=1",
+                "",
+                "[audio_codec_3]",
+                "mime=PCMU",
+                "rate=8000",
+                "channels=1",
+                "enabled=1",
+                "",
+                "[audio_codec_4]",
+                "mime=telephone-event",
+                "rate=8000",
+                "channels=1",
+                "enabled=1",
+                "",
+                "[sip]",
+                "guess_hostname=0",
+                "use_ipv6=0",
+                "inc_timeout=60",
+                "register_only_when_network_is_up=1",
+                "ping_with_options=1",
+                "keepalive_period=15000"
+            )
+            cfg.writeText(lines.joinToString("\n"))
+            cfg.absolutePath
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun startIncomingVibration() {
+        if (incomingVibrationOn) return
+        val ctx = appContext ?: return
+        try {
+            val vibrator = ctx.getSystemService(Vibrator::class.java) ?: return
+            if (!vibrator.hasVibrator()) return
+            val pattern = longArrayOf(0, 800, 600)
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0), attrs)
+            } else {
+                @Suppress("DEPRECATION") vibrator.vibrate(pattern, 0)
+            }
+            incomingVibrationOn = true
+        } catch (_: Exception) { }
+    }
+
+    private fun stopIncomingVibration() {
+        if (!incomingVibrationOn) return
+        try { appContext?.getSystemService(Vibrator::class.java)?.cancel() } catch (_: Exception) { }
+        incomingVibrationOn = false
+    }
+
+    /* ---------- SIP calls ---------- */
+    fun startSipCall(number: String, name: String): Boolean {
+        val a = CallBridge.activity
+        a?.activeCallSource = "SIP VOIP · HD AUDIO"
+        val clean = number.trim().replace(" ", "").replace("-", "")
+        if (clean.isEmpty()) { a?.errorMessage = "Enter a phone number or SIP address first."; return false }
+        if (a != null && !a.registered) {
+            a.errorMessage = "SIP account is not registered yet. Open Settings → SIP Account, add your account and wait until the status shows “SIP Online”, then call again."
+            return false
+        }
+        val c = core ?: run { a?.errorMessage = "VoIP engine is not ready yet. Restart CallerX and try again."; return false }
+        return try {
+            val domain = c.defaultAccount?.params?.identityAddress?.domain.orEmpty()
+            val target = if (clean.startsWith("sip:") || clean.contains("@")) clean else "sip:$clean@$domain"
+            val address = c.interpretUrl(target)
+            if (address == null) { a?.errorMessage = "“$number” is not a valid SIP address. Dial the number your SIP provider expects (with or without +/00 prefix)."; return false }
+            if (a != null) { a.activeCallName = name; a.activeNumber = clean; a.callConnected = false }
+            val call = c.inviteAddress(address)
+            if (call == null) { a?.errorMessage = "The call could not be started. Check your network connection and SIP account, then try again."; return false }
+            activeCall = call
+            lastCallState = "Calling…"
+            a?.callState = lastCallState
+            true
+        } catch (e: Exception) { a?.errorMessage = "Call could not start: ${e.message ?: "network unavailable"}"; false }
+    }
+
+    fun answerCall() { stopIncomingVibration(); try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { CallBridge.activity?.errorMessage = "Could not answer call: ${e.message}" } }
+    fun endCall() { stopIncomingVibration(); try { core?.currentCall?.terminate() ?: core?.terminateAllCalls() } catch (_: Exception) { core?.terminateAllCalls() } }
+    fun toggleMute(muted: Boolean) {
+        CallBridge.activity?.muted = muted
+        if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setMuted(muted); showCallNotification(); return }
+        core?.currentCall?.microphoneMuted = muted
+        showCallNotification()
+    }
+    fun toggleHold(held: Boolean) {
+        try {
+            if (TelecomCallBridge.currentCall != null) { if (held) TelecomCallBridge.currentCall?.hold() else TelecomCallBridge.currentCall?.unhold() }
+            else core?.currentCall?.let { if (held) it.pause() else it.resume() }
+        } catch (e: Exception) { CallBridge.activity?.errorMessage = "Could not ${if (held) "hold" else "resume"} call: ${e.message}" }
+    }
+    fun setSpeakerOn(enabled: Boolean) {
+        CallBridge.activity?.speaker = enabled
+        if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setSpeakerRoute(enabled); showCallNotification(); return }
+        routeAudio(enabled)
+        showCallNotification()
+    }
+    fun callQuality(): Float = try { core?.currentCall?.currentQuality ?: -1f } catch (_: Exception) { -1f }
+
+    fun toggleCallRecording() {
+        val a = CallBridge.activity
+        val call = core?.currentCall
+        if (call == null) { a?.recording = false; return }
+        try {
+            if (a?.recording == true) {
+                call.stopRecording()
+                a.recording = false
+                return
+            }
+            val ctx = appContext ?: return
+            val dir = File(ctx.filesDir, "recordings")
+            if (!dir.exists()) dir.mkdirs()
+            val safe = (a?.activeCallName ?: "call").filter { it.isLetterOrDigit() }.ifBlank { "call" }
+            val path = File(dir, "${safe}_${System.currentTimeMillis()}.mkv").absolutePath
+            try {
+                call.params?.let { p -> p.recordFile = path; call.update(p) }
+            } catch (_: Exception) { }
+            call.startRecording()
+            if (a != null) a.recording = true
+        } catch (e: Exception) {
+            a?.errorMessage = "Recording failed: ${e.message ?: "unknown error"}"
+        }
+    }
+
+    private fun maybeAutoRecord() {
+        val a = CallBridge.activity ?: return
+        if (a.recording) return
+        val ctx = appContext ?: return
+        if (!ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getBoolean("setting:autoRecord", false)) return
+        toggleCallRecording()
+    }
+
+    /* ---------- Ongoing-call notification (full-screen over the lock screen) ---------- */
+    private fun callPendingIntent(context: Context, action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(context, CallNotificationReceiver::class.java).setAction(action)
+        return PendingIntent.getBroadcast(context, requestCode, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    }
+
+    fun showCallNotification() {
+        val ctx = appContext ?: return
+        val a = CallBridge.activity
+        try {
+            val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel("callerx_call_v2") == null) {
+                val ch = NotificationChannel("callerx_call_v2", "Ongoing calls", NotificationManager.IMPORTANCE_HIGH)
+                ch.setShowBadge(false)
+                ch.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                nm.createNotificationChannel(ch)
+            }
+            @Suppress("DEPRECATION")
+            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(ctx, "callerx_call_v2") else Notification.Builder(ctx)
+            val title = (a?.activeCallName ?: "").ifBlank { a?.activeNumber ?: "" }.ifBlank { "CallerX call" }
+            builder.setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle(title)
+                .setContentText("${a?.callState ?: lastCallState} · ${a?.activeCallSource ?: "SIP VOIP · HD AUDIO"}")
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setShowWhen(true)
+                .setCategory(Notification.CATEGORY_CALL)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setLockscreenVisibility(Notification.VISIBILITY_PUBLIC)
+            val openIntent = Intent(ctx, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                .putExtra("callerx_open_call", true)
+            val openPending = PendingIntent.getActivity(ctx, 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            builder.setContentIntent(openPending)
+            if (lastCallState == "Incoming SIP call") {
+                try { builder.setFullScreenIntent(openPending, true) } catch (_: Exception) { }
+            }
+            builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, if (a?.muted == true) "Unmute" else "Mute", callPendingIntent(ctx, "callerx.call.mute", 11)).build())
+            builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, if (a?.speaker == true) "Earpiece" else "Speaker", callPendingIntent(ctx, "callerx.call.speaker", 12)).build())
+            builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, "End call", callPendingIntent(ctx, "callerx.call.end", 13)).build())
+            nm.notify(4711, builder.build())
+        } catch (_: Exception) { }
+    }
+
+    fun cancelCallNotification() {
+        try { appContext?.getSystemService(NotificationManager::class.java)?.cancel(4711) } catch (_: Exception) { }
     }
 }
 
@@ -239,22 +914,27 @@ class SipKeepAliveService : android.app.Service() {
                 .setContentText("Keeping your SIP line online for calls")
                 .setOngoing(true)
                 .build()
-            if (Build.VERSION.SDK_INT >= 34) startForeground(4712, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            if (Build.VERSION.SDK_INT >= 34) startForeground(4712, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            else if (Build.VERSION.SDK_INT >= 29) startForeground(4712, notif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
             else startForeground(4712, notif)
         } catch (_: Exception) { }
+        try { SipEngine.ensureStarted(this) } catch (_: Exception) { }
         return START_STICKY
     }
+    override fun onDestroy() {
+        try { SipEngine.shutdown() } catch (_: Exception) { }
+        super.onDestroy()
+    }
 }
-
 class MainActivity : ComponentActivity() {
-    private var core: Core? = null
+    /* SIP engine state lives in SipEngine (foreground service). These fields are
+       the UI mirror that the engine updates through CallBridge. */
     var registered by mutableStateOf(false)
     var registrationMessage by mutableStateOf("SIP Offline")
     var callState by mutableStateOf("")
     var activeNumber by mutableStateOf("")
     var activeCallName by mutableStateOf("")
     var activeCallSource by mutableStateOf("SIP VOIP · HD AUDIO")
-    private var activeCall: Call? = null
     var errorMessage by mutableStateOf("")
     var callConnected by mutableStateOf(false)
     var muted by mutableStateOf(false)
@@ -273,17 +953,6 @@ class MainActivity : ComponentActivity() {
     private val dataObserver = object : ContentObserver(mainHandler) {
         override fun onChange(selfChange: Boolean) { scheduleDataRefresh(350) }
     }
-    private var sipCallIncoming = false
-    private var sipCallLogged = true
-    private var regFailCount = 0
-    private var regRetryPending = false
-    private var callWakeLock: PowerManager.WakeLock? = null
-    private var callWifiLock: android.net.wifi.WifiManager.WifiLock? = null
-    private val netCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) { mainHandler.post { try { core?.refreshRegisters() } catch (_: Exception) { } } }
-        override fun onLost(network: Network) { mainHandler.post { try { core?.refreshRegisters() } catch (_: Exception) { } } }
-    }
-    private var incomingVibrationOn = false
     var dialIntentNumber by mutableStateOf("")
     var callUiRequested by mutableStateOf(false)
     var dialerRoleTick by mutableIntStateOf(0)
@@ -368,53 +1037,13 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) { }
     }
 
-    /* ---------- SIP reliability: keep-alive service, locks, auto retry ---------- */
+    /* ---------- SIP reliability: engine runs in the foreground service ---------- */
     fun startKeepAliveService() {
-        try {
-            val i = Intent(this, SipKeepAliveService::class.java)
-            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
-        } catch (_: Exception) { }
+        SipEngine.startService(this)
     }
 
     fun stopKeepAliveService() {
         try { stopService(Intent(this, SipKeepAliveService::class.java)) } catch (_: Exception) { }
-    }
-
-    private fun scheduleRegRetry() {
-        if (regRetryPending) return
-        regRetryPending = true
-        mainHandler.postDelayed({
-            regRetryPending = false
-            if (!registered) { try { core?.refreshRegisters() } catch (_: Exception) { } ; scheduleRegRetry() }
-        }, 20000)
-    }
-
-    private fun acquireCallLocks() {
-        try {
-            if (callWakeLock == null) {
-                val pm = getSystemService(PowerManager::class.java)
-                callWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "callerx:call")
-                callWakeLock?.setReferenceCounted(false)
-                callWakeLock?.acquire(3600000L)
-            }
-        } catch (_: Exception) { }
-        try {
-            if (callWifiLock == null) {
-                val wm = applicationContext.getSystemService(WIFI_SERVICE) as? android.net.wifi.WifiManager
-                @Suppress("DEPRECATION")
-                val wl = wm?.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "callerx:wifi")
-                callWifiLock = wl
-                wl?.setReferenceCounted(false)
-                wl?.acquire()
-            }
-        } catch (_: Exception) { }
-    }
-
-    private fun releaseCallLocks() {
-        try { callWakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
-        callWakeLock = null
-        try { callWifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
-        callWifiLock = null
     }
 
     fun pickProfilePhoto() {
@@ -446,8 +1075,22 @@ class MainActivity : ComponentActivity() {
         val permissions = mutableListOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_CONTACTS, Manifest.permission.READ_SMS, Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= 33) permissions += Manifest.permission.POST_NOTIFICATIONS
+        if (Build.VERSION.SDK_INT >= 31) permissions += Manifest.permission.BLUETOOTH_CONNECT
         val missing = permissions.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) runtimePermissionLauncher.launch(missing.toTypedArray())
+    }
+
+    /* Clear the system call history (Google-Dialer style "Clear history"). */
+    fun clearCallHistory() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            runtimePermissionLauncher.launch(arrayOf(Manifest.permission.WRITE_CALL_LOG))
+            return
+        }
+        try {
+            contentResolver.delete(CallLog.Calls.CONTENT_URI, null, null)
+            errorMessage = "Call history cleared."
+        } catch (e: Exception) { errorMessage = "Could not clear call history: ${e.message}" }
+        scheduleDataRefresh(80)
     }
 
     fun isDefaultDialer(): Boolean {
@@ -512,12 +1155,7 @@ class MainActivity : ComponentActivity() {
     fun simShown(slot: Int) = prefs().getBoolean("setting:SIM ${slot + 1}", true)
 
     /* ---------- Blocked numbers ---------- */
-    fun blockedNumbers(): List<String> {
-        return try {
-            val arr = JSONArray(prefs().getString("blocked", "[]") ?: "[]")
-            (0 until arr.length()).map { arr.getString(it) }.toMutableList()
-        } catch (_: Exception) { mutableListOf() }
-    }
+    fun blockedNumbers(): List<String> = loadBlockedNumbers(this)
     fun setBlocked(number: String, blocked: Boolean) {
         val list = blockedNumbers().toMutableList()
         val norm = number.filter { it.isDigit() || it == '+' }
@@ -526,10 +1164,7 @@ class MainActivity : ComponentActivity() {
         prefs().edit().putString("blocked", JSONArray(list.toList()).toString()).apply()
         resumeTick++
     }
-    fun isBlockedNumber(number: String): Boolean {
-        val norm = number.filter { it.isDigit() || it == '+' }
-        return blockedNumbers().any { it.isNotEmpty() && (norm.endsWith(it.filter { c -> c.isDigit() }) || norm == it) }
-    }
+    fun isBlockedNumber(number: String): Boolean = isBlockedNumber(this, number)
 
     /* ---------- Call routing defaults ---------- */
     fun routeAvailable(route: String): Boolean = when (route) {
@@ -555,25 +1190,9 @@ class MainActivity : ComponentActivity() {
     fun clearDefaultRoute() { prefs().edit().remove("route:default").apply() }
 
     /* ---------- SIP accounts store ---------- */
-    fun accountsList(): List<SipAccount> {
-        return try {
-            val arr = JSONArray(prefs().getString("sip_accounts", "[]") ?: "[]")
-            (0 until arr.length()).map { i ->
-                val o = arr.getJSONObject(i)
-                SipAccount(o.optString("name"), o.optString("user"), o.optString("pass"), o.optString("domain"),
-                    o.optString("port", "5060"), o.optString("transport", "UDP"), o.optString("proxy"), o.optString("displayName"),
-                    o.optBoolean("autoBoot", true), o.optBoolean("enabled", true), o.optBoolean("default", false))
-            }
-        } catch (_: Exception) { emptyList() }
-    }
+    fun accountsList(): List<SipAccount> = loadSipAccounts(this)
     private fun saveAccounts(list: List<SipAccount>) {
-        val arr = JSONArray()
-        list.forEach { a ->
-            arr.put(JSONObject().put("name", a.name).put("user", a.user).put("pass", a.pass).put("domain", a.domain)
-                .put("port", a.port).put("transport", a.transport).put("proxy", a.proxy).put("displayName", a.displayName)
-                .put("autoBoot", a.autoBoot).put("enabled", a.enabled).put("default", a.isDefault))
-        }
-        prefs().edit().putString("sip_accounts", arr.toString()).apply()
+        saveSipAccounts(this, list)
         accountsTick++
     }
     fun upsertAccount(entry: SipAccount, editIndex: Int) {
@@ -610,37 +1229,7 @@ class MainActivity : ComponentActivity() {
         applyAccounts()
     }
     fun applyAccounts() {
-        val c = core ?: return
-        try {
-            c.clearAccounts()
-            c.clearAllAuthInfo()
-            val list = accountsList().filter { it.enabled }
-            var default: Account? = null
-            for (a in list) {
-                if (a.user.isBlank() || a.domain.isBlank()) continue
-                val auth = Factory.instance().createAuthInfo(a.user, null, a.pass, null, null, a.domain)
-                val params = c.createAccountParams()
-                val identity = Factory.instance().createAddress("sip:${a.user}@${a.domain}") ?: continue
-                val serverStr = if (a.proxy.isNotBlank()) a.proxy else "sip:${a.domain}:${a.port.trim()};transport=${a.transport.lowercase()}"
-                val server = Factory.instance().createAddress(serverStr) ?: continue
-                params.setIdentityAddress(identity)
-                params.setServerAddress(server)
-                params.setRegisterEnabled(a.autoBoot)
-                val account = c.createAccount(params) ?: continue
-                c.addAuthInfo(auth)
-                c.addAccount(account)
-                if (a.isDefault && default == null) default = account
-            }
-            c.defaultAccount = default ?: c.accountList.firstOrNull()
-            registered = false
-            regFailCount = 0
-            registrationMessage = if (c.accountList.isNotEmpty()) "Registering…" else "SIP Offline"
-            if (c.accountList.isNotEmpty()) startKeepAliveService() else stopKeepAliveService()
-        } catch (e: Exception) {
-            registered = false
-            registrationMessage = "SIP Offline"
-            errorMessage = "SIP setup failed: ${e.message ?: "check the account details"}"
-        }
+        SipEngine.applyAccounts(this)
     }
 
     /* ---------- Cellular calls ---------- */
@@ -681,14 +1270,23 @@ class MainActivity : ComponentActivity() {
         intent?.data?.schemeSpecificPart?.let { dialIntentNumber = it }
         callUiRequested = intent?.getBooleanExtra("callerx_open_call", false) == true
         CallBridge.activity = this
-        initializeLinphone()
+        /* Restore the engine mirror so a recreated Activity (after the system
+           killed it while the phone was locked) shows the live call at once. */
+        registered = SipEngine.isRegistered
+        registrationMessage = SipEngine.lastRegistrationMessage
+        if (SipEngine.callActive) {
+            callState = SipEngine.lastCallState
+            callUiRequested = true
+        }
+        /* The engine runs in the foreground service, not here: locking the
+           phone or destroying this Activity must never stop the mic/call. */
+        startKeepAliveService()
         registerDataObservers()
         refreshData()
-        try { (getSystemService(ConnectivityManager::class.java))?.registerDefaultNetworkCallback(netCallback) } catch (_: Exception) { }
         setContent { CallerXApp(this) }
     }
 
-    override fun onResume() { super.onResume(); resumeTick++; CallBridge.activity = this; scheduleDataRefresh(150); try { core?.refreshRegisters() } catch (_: Exception) { } }
+    override fun onResume() { super.onResume(); resumeTick++; CallBridge.activity = this; scheduleDataRefresh(150); SipEngine.refreshRegisters() }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -698,291 +1296,37 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        cancelCallNotification()
-        try { (getSystemService(ConnectivityManager::class.java))?.unregisterNetworkCallback(netCallback) } catch (_: Exception) { }
-        releaseCallLocks()
+        /* Deliberately do NOT stop the SIP engine, the call notification or the
+           call locks here: an ongoing SIP call must survive this Activity being
+           destroyed (lock screen, task swipe, system reclaim). The foreground
+           service owns all of that and cleans up when the call ends. */
         try { contentResolver.unregisterContentObserver(dataObserver) } catch (_: Exception) { }
         mainHandler.removeCallbacks(refreshRunnable)
         refreshJob?.cancel()
-        CallBridge.activity = null
-        try { core?.stop() } catch (_: Exception) { }
-        core = null
+        if (CallBridge.activity == this) CallBridge.activity = null
         super.onDestroy()
     }
 
-    /* ---------- Linphone core ---------- */
-    private fun initializeLinphone() {
-        try {
-            val soundsDir = prepareSounds()
-            val c = Factory.instance().createCore(buildCoreConfig(soundsDir), null, applicationContext)
-            core = c
-            c.addListener(object : CoreListenerStub() {
-                override fun onAccountRegistrationStateChanged(core: Core, account: Account, state: RegistrationState, message: String) {
-                    runOnUiThread {
-                        val isDefault = core.defaultAccount == account
-                        if (isDefault || !registered) registered = state == RegistrationState.Ok
-                        if (isDefault || state == RegistrationState.Ok) {
-                            registrationMessage = when (state) {
-                                RegistrationState.Ok -> "SIP Online"
-                                RegistrationState.Progress -> "Registering…"
-                                RegistrationState.Failed -> "SIP Registration Failed"
-                                else -> "SIP Offline"
-                            }
-                        }
-                        if (state == RegistrationState.Ok) regFailCount = 0
-                        if (state == RegistrationState.Failed && isDefault) {
-                            regFailCount++
-                            scheduleRegRetry()
-                            if (regFailCount >= 3) {
-                                errorMessage = "SIP registration failed: $message — CallerX keeps retrying automatically. If it stays offline, check username, password, server domain, port and transport (UDP/TCP/TLS) with your SIP provider."
-                            }
-                        }
-                    }
-                }
-                override fun onCallStateChanged(core: Core, call: Call, state: Call.State, message: String) {
-                    runOnUiThread {
-                        activeCall = if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) null else call
-                        when (state) {
-                            Call.State.IncomingReceived -> {
-                                activeCallName = call.remoteAddress?.displayName?.takeIf { it.isNotBlank() } ?: "Incoming caller"
-                                activeNumber = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
-                                callConnected = false
-                                muted = false; speaker = false
-                                callStartedAt = 0L; recording = false
-                                sipCallIncoming = true; sipCallLogged = false
-                                if (isBlockedNumber(activeNumber)) {
-                                    try { call.decline(Reason.Busy) } catch (_: Exception) { }
-                                } else startIncomingVibration()
-                            }
-                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> { callConnected = false; muted = false; speaker = false; callStartedAt = 0L; recording = false; sipCallIncoming = false; sipCallLogged = false }
-                            Call.State.Connected -> { callConnected = true; stopIncomingVibration(); if (callStartedAt == 0L) callStartedAt = System.currentTimeMillis() }
-                            Call.State.StreamsRunning -> {
-                                callConnected = true; stopIncomingVibration()
-                                if (callStartedAt == 0L) callStartedAt = System.currentTimeMillis()
-                                acquireCallLocks()
-                                maybeAutoRecord()
-                            }
-                            Call.State.End, Call.State.Released, Call.State.Error -> {
-                                stopIncomingVibration()
-                                if (!sipCallLogged) {
-                                    val dur = if (callStartedAt > 0L) ((System.currentTimeMillis() - callStartedAt) / 1000L).coerceAtLeast(0L) else 0L
-                                    logSipCall(activeNumber, activeCallName, sipCallIncoming, callConnected, dur)
-                                    sipCallLogged = true
-                                }
-                                callStartedAt = 0L; recording = false; callConnected = false; releaseCallLocks()
-                            }
-                            else -> { }
-                        }
-                        callState = when (state) {
-                            Call.State.IncomingReceived -> "Incoming SIP call"
-                            Call.State.OutgoingInit, Call.State.OutgoingProgress -> "Calling…"
-                            Call.State.OutgoingRinging -> "Ringing…"
-                            Call.State.OutgoingEarlyMedia -> "Connecting audio…"
-                            Call.State.Connected -> "Connected"
-                            Call.State.StreamsRunning -> "In call"
-                            Call.State.Paused -> "On hold"
-                            Call.State.Resuming -> "Resuming…"
-                            Call.State.End, Call.State.Released -> "Call ended"
-                            Call.State.Error -> "Call failed: $message"
-                            else -> callState
-                        }
-                        val active = state == Call.State.IncomingReceived || state == Call.State.OutgoingInit ||
-                            state == Call.State.OutgoingProgress || state == Call.State.OutgoingRinging ||
-                            state == Call.State.OutgoingEarlyMedia || state == Call.State.Connected ||
-                            state == Call.State.StreamsRunning || state == Call.State.Paused || state == Call.State.Resuming
-                        if (active) showCallNotification() else cancelCallNotification()
-                    }
-                }
-            })
-            c.start()
-            applyAccounts()
-        } catch (e: Exception) {
-            errorMessage = "VoIP engine couldn't start: ${e.message ?: "unknown error"}"
-        }
-    }
-
-    private fun prepareSounds(): File {
-        val dir = File(filesDir, "sounds")
-        try {
-            if (!dir.exists()) dir.mkdirs()
-            for (name in listOf("ring.wav", "ringback.wav")) {
-                val out = File(dir, name)
-                if (!out.exists() || out.length() < 1024) {
-                    assets.open("sounds/$name").use { input -> out.outputStream().use { input.copyTo(it) } }
-                }
-            }
-        } catch (e: Exception) {
-            errorMessage = "Call tones could not be installed: ${e.message ?: "asset error"}"
-        }
-        return dir
-    }
-
-    private fun buildCoreConfig(soundsDir: File): String? {
-        return try {
-            val cfg = File(filesDir, "linphonerc")
-            val ring = File(soundsDir, "ring.wav").absolutePath
-            val ringback = File(soundsDir, "ringback.wav").absolutePath
-            cfg.writeText(
-                """
-                [net]
-                download_bw=0
-                upload_bw=0
-                mtu=1300
-                stun_server=stun.l.google.com:19302
-                protocols=stun,ice
-                nat_policy_ref=default_nat_policy
-
-                [default_nat_policy]
-                protocols=stun,ice
-                stun_server=stun.l.google.com:19302
-
-                [sound]
-                ring=$ring
-                ringback=$ringback
-                remote_ring=$ring
-                echocancellation=1
-                echocancellation_tail_len=250
-
-                [rtp]
-                audio_rtp_port=7078
-                video_rtp_port=0
-
-                [video]
-                enabled=0
-
-                [audio_codec_0]
-                mime=opus
-                rate=48000
-                channels=2
-                enabled=1
-
-                [audio_codec_1]
-                mime=PCMU
-                rate=8000
-                channels=1
-                enabled=1
-
-                [audio_codec_2]
-                mime=PCMA
-                rate=8000
-                channels=1
-                enabled=1
-
-                [audio_codec_3]
-                mime=G722
-                rate=8000
-                channels=1
-                enabled=1
-
-                [audio_codec_4]
-                mime=telephone-event
-                rate=8000
-                channels=1
-                enabled=1
-
-                [sip]
-                guess_hostname=0
-                use_ipv6=0
-                inc_timeout=60
-                register_only_when_network_is_up=1
-                ping_with_options=1
-                keepalive_period=30000
-                """.trimIndent()
-            )
-            cfg.absolutePath
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private fun startIncomingVibration() {
-        if (incomingVibrationOn) return
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.VIBRATE) != PackageManager.PERMISSION_GRANTED) return
-        try {
-            val vibrator = getSystemService(Vibrator::class.java)
-            vibrator ?: return
-            if (!vibrator.hasVibrator()) return
-            val pattern = longArrayOf(0, 800, 600)
-            val attrs = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0), attrs)
-            } else {
-                @Suppress("DEPRECATION") vibrator.vibrate(pattern, 0)
-            }
-            incomingVibrationOn = true
-        } catch (_: Exception) { }
-    }
-
-    private fun stopIncomingVibration() {
-        if (!incomingVibrationOn) return
-        try { getSystemService(Vibrator::class.java)?.cancel() } catch (_: Exception) { }
-        incomingVibrationOn = false
-    }
-
-    /* ---------- SIP calls ---------- */
+    /* ---------- SIP calls (delegated to SipEngine in the foreground service) ---------- */
     fun startSipCall(number: String, name: String): Boolean {
-        activeCallSource = "SIP VOIP · HD AUDIO"
-        val clean = number.trim().replace(" ", "").replace("-", "")
-        if (clean.isEmpty()) { errorMessage = "Enter a phone number or SIP address first."; return false }
-        if (!registered) {
-            errorMessage = "SIP account is not registered yet. Open Settings → SIP Account, add your account and wait until the status shows “SIP Online”, then call again."
-            return false
-        }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             activeNumber = number; activeCallName = name
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
             return true
         }
-        val c = core ?: run { errorMessage = "VoIP engine is not ready yet. Restart CallerX and try again."; return false }
-        return try {
-            val domain = c.defaultAccount?.params?.identityAddress?.domain.orEmpty()
-            val target = if (clean.startsWith("sip:") || clean.contains("@")) clean else "sip:$clean@$domain"
-            val address = c.interpretUrl(target)
-            if (address == null) { errorMessage = "“$number” is not a valid SIP address. Dial the number your SIP provider expects (with or without +/00 prefix)."; return false }
-            activeCallName = name
-            activeNumber = clean
-            callConnected = false
-            val call = c.inviteAddress(address)
-            if (call == null) { errorMessage = "The call could not be started. Check your network connection and SIP account, then try again."; return false }
-            activeCall = call
-            callState = "Calling…"
-            true
-        } catch (e: Exception) { errorMessage = "Call could not start: ${e.message ?: "network unavailable"}"; false }
+        return SipEngine.startSipCall(number, name)
     }
 
-    fun answerCall() { stopIncomingVibration(); try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
+    fun answerCall() { SipEngine.answerCall() }
     fun answerCellCall() { try { TelecomCallBridge.currentCall?.answer(0) } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
     fun endCellCall() { try { TelecomCallBridge.currentCall?.disconnect() } catch (e: Exception) { errorMessage = "Could not end call: ${e.message}" } }
-    fun endCall() { stopIncomingVibration(); try { core?.currentCall?.terminate() ?: core?.terminateAllCalls() } catch (_: Exception) { core?.terminateAllCalls() } }
-    fun toggleMute(muted: Boolean) {
-        this.muted = muted
-        if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setMuted(muted); showCallNotification(); return }
-        core?.currentCall?.microphoneMuted = muted
-        showCallNotification()
-    }
-    fun toggleHold(held: Boolean) {
-        try {
-            if (TelecomCallBridge.currentCall != null) { if (held) TelecomCallBridge.currentCall?.hold() else TelecomCallBridge.currentCall?.unhold() }
-            else core?.currentCall?.let { if (held) it.pause() else it.resume() }
-        } catch (e: Exception) { errorMessage = "Could not ${if (held) "hold" else "resume"} call: ${e.message}" }
-    }
-
-    fun setSpeakerOn(enabled: Boolean) {
-        this.speaker = enabled
-        if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setSpeakerRoute(enabled); showCallNotification(); return }
-        try {
-            val c = core ?: return
-            val target = c.audioDevices.firstOrNull { if (enabled) it.type == AudioDevice.Type.Speaker else it.type == AudioDevice.Type.Earpiece }
-            if (target != null) c.outputAudioDevice = target
-        } catch (_: Exception) { }
-        showCallNotification()
-    }
+    fun endCall() { SipEngine.endCall() }
+    fun toggleMute(muted: Boolean) { SipEngine.toggleMute(muted) }
+    fun toggleHold(held: Boolean) { SipEngine.toggleHold(held) }
+    fun setSpeakerOn(enabled: Boolean) { SipEngine.setSpeakerOn(enabled) }
 
     /* ---------- Call metrics: duration, quality, network, recording ---------- */
-    fun callQuality(): Float = try { core?.currentCall?.currentQuality ?: -1f } catch (_: Exception) { -1f }
+    fun callQuality(): Float = SipEngine.callQuality()
 
     fun qualityLabel(q: Float): String = when {
         q < 0f -> ""
@@ -1022,75 +1366,16 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) { "Mobile" }
     }
 
-    fun toggleCallRecording() {
-        val call = core?.currentCall
-        if (call == null) { recording = false; return }
-        try {
-            if (recording) {
-                call.stopRecording()
-                recording = false
-                return
-            }
-            val dir = File(filesDir, "recordings")
-            if (!dir.exists()) dir.mkdirs()
-            val safe = activeCallName.filter { it.isLetterOrDigit() }.ifBlank { "call" }
-            val path = File(dir, "${safe}_${System.currentTimeMillis()}.mkv").absolutePath
-            try {
-                call.params?.let { p -> p.recordFile = path; call.update(p) }
-            } catch (_: Exception) { }
-            call.startRecording()
-            recording = true
-        } catch (e: Exception) {
-            errorMessage = "Recording failed: ${e.message ?: "unknown error"}"
-        }
-    }
-
-    private fun maybeAutoRecord() {
-        if (recording) return
-        if (!prefs().getBoolean("setting:autoRecord", false)) return
-        toggleCallRecording()
-    }
+    fun toggleCallRecording() { SipEngine.toggleCallRecording() }
 
     fun recordingCount(): Int = try { File(filesDir, "recordings").listFiles()?.size ?: 0 } catch (_: Exception) { 0 }
 
-    /* ---------- Ongoing-call notification ---------- */
-    private fun callPendingIntent(action: String, requestCode: Int): android.app.PendingIntent {
-        val intent = Intent(this, CallNotificationReceiver::class.java).setAction(action)
-        return android.app.PendingIntent.getBroadcast(this, requestCode, intent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
-    }
+    /* ---------- Ongoing-call notification (owned by SipEngine) ---------- */
+    fun showCallNotification() { SipEngine.showCallNotification() }
 
-    fun showCallNotification() {
-        try {
-            val nm = getSystemService(NotificationManager::class.java) ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel("callerx_call") == null) {
-                val ch = NotificationChannel("callerx_call", "Ongoing calls", NotificationManager.IMPORTANCE_LOW)
-                ch.setShowBadge(false)
-                nm.createNotificationChannel(ch)
-            }
-            @Suppress("DEPRECATION")
-            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Notification.Builder(this, "callerx_call") else Notification.Builder(this)
-            val title = activeCallName.ifBlank { activeNumber }.ifBlank { "CallerX call" }
-            builder.setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle(title)
-                .setContentText("$callState · $activeCallSource")
-                .setOngoing(true)
-                .setOnlyAlertOnce(true)
-                .setShowWhen(true)
-            val openIntent = Intent(this, MainActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                .putExtra("callerx_open_call", true)
-            builder.setContentIntent(android.app.PendingIntent.getActivity(this, 0, openIntent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE))
-            builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, if (muted) "Unmute" else "Mute", callPendingIntent("callerx.call.mute", 11)).build())
-            builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, if (speaker) "Earpiece" else "Speaker", callPendingIntent("callerx.call.speaker", 12)).build())
-            builder.addAction(Notification.Action.Builder(R.mipmap.ic_launcher, "End call", callPendingIntent("callerx.call.end", 13)).build())
-            nm.notify(4711, builder.build())
-        } catch (_: Exception) { }
-    }
-
-    fun cancelCallNotification() {
-        try { getSystemService(NotificationManager::class.java)?.cancel(4711) } catch (_: Exception) { }
-    }
+    fun cancelCallNotification() { SipEngine.cancelCallNotification() }
 }
+
 
 /* =============================== Compose UI =============================== */
 
@@ -1102,6 +1387,9 @@ private fun CallerXApp(activity: MainActivity) {
     var filter by remember { mutableStateOf("All") }
     var query by remember { mutableStateOf("") }
     var searchOpen by remember { mutableStateOf(false) }
+    val searchFocus = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    LaunchedEffect(searchOpen) { if (searchOpen) searchFocus.requestFocus() }
     var selected by remember { mutableStateOf<Person?>(null) }
     // lists come from the activity cache: loaded on a background thread, kept fresh by ContentObservers
     val contacts = activity.contactsCache
@@ -1190,9 +1478,20 @@ private fun CallerXApp(activity: MainActivity) {
     // on Android 15+ (edge-to-edge) keep the status bar icons readable over the coloured heading
     val view = LocalView.current
     SideEffect {
-        if (Build.VERSION.SDK_INT >= 35) {
-            val win = (view.context as? android.app.Activity)?.window
-            if (win != null) androidx.core.view.WindowCompat.getInsetsController(win, view).isAppearanceLightStatusBars = !(dark || screen == "home")
+        val win = (view.context as? android.app.Activity)?.window
+        if (win != null) {
+            if (Build.VERSION.SDK_INT >= 35) {
+                androidx.core.view.WindowCompat.getInsetsController(win, view).isAppearanceLightStatusBars = !(dark || screen == "home")
+            }
+            /* Call screen must show over the lock screen and keep the screen on,
+               otherwise locking the phone kills the visible call UI / mic. */
+            if (screen == "call") {
+                win.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                if (Build.VERSION.SDK_INT >= 27) { win.setShowWhenLocked(true); win.setTurnScreenOn(true) }
+            } else {
+                win.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                if (Build.VERSION.SDK_INT >= 27) { win.setShowWhenLocked(false); win.setTurnScreenOn(false) }
+            }
         }
     }
 
@@ -1230,7 +1529,7 @@ private fun CallerXApp(activity: MainActivity) {
             SipFormScreen(activity, sipFormIndex, onBack = { screen = "sip" },
                 onSave = { entry, idx -> activity.upsertAccount(entry, idx); screen = "sip" })
         } else if (screen == "dialer") {
-            DialerScreen(number, { number = it }, onBack = { screen = "home" }, onCall = { requestCall(number, "Dialed number") })
+            DialerScreen(number, { number = it }, contacts, onBack = { screen = "home" }, onCall = { requestCall(number, "Dialed number") }, onCallPerson = { p -> requestCall(p.number, p.name) })
         } else if (screen == "contact" && selected != null) {
             ContactDetailScreen(activity, selected!!, recentCalls,
                 onBack = { selected = null; screen = "home" },
@@ -1260,10 +1559,13 @@ private fun CallerXApp(activity: MainActivity) {
                 Column(Modifier.fillMaxSize().padding(padding)) {
                     if (tab != "Settings") {
                         HomeHeader(tab, activity.registrationMessage, activity.registered, searchOpen, { searchOpen = !searchOpen; if (!searchOpen) query = "" }, query, { query = it }, onSip = { screen = "sip" })
-                        if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), singleLine = true,
+                        if (searchOpen) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).focusRequester(searchFocus), singleLine = true,
                             placeholder = { Text("Search by name, number or keypad letters") }, leadingIcon = { Icon(Icons.Filled.Search, null) },
                             trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = "" }) { Icon(Icons.Filled.Close, "Clear search", modifier = Modifier.size(18.dp)) } },
-                            keyboardOptions = KeyboardOptions(keyboardType = if (tab == "Contacts") KeyboardType.Text else KeyboardType.Phone),
+                            /* Always a text keyboard: a numeric keyboard on Calls made
+                               name search impossible, which is why search felt broken. */
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Search),
+                            keyboardActions = KeyboardActions(onSearch = { keyboardController?.hide() }),
                             shape = RoundedCornerShape(14.dp))
                         if (searchOpen && debouncedQuery.isNotBlank()) {
                             val hits = when (tab) { "Contacts" -> contacts.count { matchesQuery(it.name, it.number, debouncedQuery) }; "Messages" -> messages.count { matchesQuery(it.first, it.first, debouncedQuery) || it.second.contains(debouncedQuery, true) }; else -> recentCalls.count { matchesQuery(it.name, it.number, debouncedQuery) } }
@@ -1271,8 +1573,13 @@ private fun CallerXApp(activity: MainActivity) {
                         }
                     }
                     when (tab) {
-                        "Calls" -> CallsTab(recentCalls, filter, { filter = it }, debouncedQuery, onAvatar = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) }, onKeypad = { screen = "dialer" })
-                        "Contacts" -> ContactsTab(contacts, debouncedQuery, onOpen = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) })
+                        "Calls" -> CallsTab(recentCalls, filter, { filter = it }, debouncedQuery, onAvatar = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) }, onMessage = { p -> activity.openSms(p.number) }, onClearHistory = { activity.clearCallHistory() }, onKeypad = { screen = "dialer" })
+                        "Contacts" -> {
+                            val favoriteNumbers = remember(contacts, activity.resumeTick) {
+                                contacts.filter { c -> val norm = c.number.filter { it.isDigit() || it == '+' }; prefs.getBoolean("fav:$norm", false) }.map { it.number }.toSet()
+                            }
+                            ContactsTab(contacts, debouncedQuery, favoriteNumbers, onOpen = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) }, onMessage = { p -> activity.openSms(p.number) })
+                        }
                         "Messages" -> MessagesTab(activity, messages, debouncedQuery)
                         else -> SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() },
                             onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" },
@@ -1373,13 +1680,15 @@ private fun SipPill(sip: String, online: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -> Unit, query: String, onAvatar: (Person) -> Unit, onCall: (Person) -> Unit, onKeypad: () -> Unit) {
+private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -> Unit, query: String, onAvatar: (Person) -> Unit, onCall: (Person) -> Unit, onMessage: (Person) -> Unit, onClearHistory: () -> Unit, onKeypad: () -> Unit) {
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)).padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)).padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 listOf("All", "Missed", "Received", "Outgoing").forEach { label ->
                     FilterChip(selected = filter == label, onClick = { onFilter(label) }, label = { Text(label, maxLines = 1, fontSize = 12.sp) }, shape = RoundedCornerShape(18.dp))
                 }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onClearHistory) { Text("Clear", fontSize = 12.sp) }
             }
             val filtered = remember(recents, filter, query) {
                 recents.filter { p ->
@@ -1389,7 +1698,7 @@ private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -
             }
             LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 90.dp)) {
                 if (filtered.isEmpty()) item { Text(if (query.isBlank()) "No recent calls found on this device." else "No calls match “$query”.", Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                itemsIndexed(filtered, key = { i, p -> "call-$i-${p.number}-${p.ts}" }) { _, p -> CallRow(p, onAvatar = { onAvatar(p) }, onCall = { onCall(p) }) }
+                itemsIndexed(filtered, key = { i, p -> "call-$i-${p.number}-${p.ts}" }) { _, p -> CallRow(p, onAvatar = { onAvatar(p) }, onCall = { onCall(p) }, onMessage = { onMessage(p) }) }
             }
         }
         FloatingActionButton(onClick = onKeypad, modifier = Modifier.align(Alignment.BottomEnd).padding(end = 18.dp, bottom = 14.dp), shape = RoundedCornerShape(16.dp), containerColor = MaterialTheme.colorScheme.primary, contentColor = Color.White) { Icon(Icons.Filled.Dialpad, "Open keypad", modifier = Modifier.size(23.dp)) }
@@ -1397,11 +1706,14 @@ private fun CallsTab(recents: List<Person>, filter: String, onFilter: (String) -
 }
 
 @Composable
-private fun CallRow(person: Person, onAvatar: () -> Unit, onCall: () -> Unit) {
+private fun CallRow(person: Person, onAvatar: () -> Unit, onCall: () -> Unit, onMessage: () -> Unit) {
     val missed = person.callType == CallLog.Calls.MISSED_TYPE
     val outgoing = person.callType == CallLog.Calls.OUTGOING_TYPE
     val tint = if (missed) Color(0xFFD64545) else if (outgoing) MaterialTheme.colorScheme.primary else Color(0xFF22A06B)
     val icon = if (missed) Icons.Filled.CallReceived else if (outgoing) Icons.Filled.CallMade else Icons.Filled.CallReceived
+    var showMenu by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     Row(Modifier.fillMaxWidth().clickable(onClick = onCall).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(46.dp).clip(CircleShape).background(tint.copy(alpha = 0.13f)).clickable(onClick = onAvatar), contentAlignment = Alignment.Center) {
             Text(person.initials.take(1).uppercase(), color = tint, fontWeight = FontWeight.Bold, fontSize = 17.sp)
@@ -1425,26 +1737,43 @@ private fun CallRow(person: Person, onAvatar: () -> Unit, onCall: () -> Unit) {
         }
         Spacer(Modifier.width(6.dp))
         IconButton(onClick = onCall, modifier = Modifier.size(38.dp)) { Icon(Icons.Filled.Call, "Call", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp)) }
+        Box {
+            IconButton(onClick = { showMenu = true }, modifier = Modifier.size(38.dp)) { Icon(Icons.Filled.MoreVert, "More options", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(19.dp)) }
+            DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                DropdownMenuItem(text = { Text("Call") }, onClick = { showMenu = false; onCall() })
+                DropdownMenuItem(text = { Text("Message") }, onClick = { showMenu = false; onMessage() })
+                DropdownMenuItem(text = { Text("Copy number") }, onClick = {
+                    showMenu = false
+                    try { clipboard.setText(AnnotatedString(person.number)); Toast.makeText(context, "Copied ${person.number}", Toast.LENGTH_SHORT).show() } catch (_: Exception) { }
+                })
+            }
+        }
     }
     HorizontalDivider(Modifier.padding(start = 74.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
 }
 
 @Composable
-private fun ContactsTab(contacts: List<Person>, query: String, onOpen: (Person) -> Unit, onCall: (Person) -> Unit) {
+private fun ContactsTab(contacts: List<Person>, query: String, favorites: Set<String>, onOpen: (Person) -> Unit, onCall: (Person) -> Unit, onMessage: (Person) -> Unit) {
     val visible = remember(contacts, query) { contacts.filter { matchesQuery(it.name, it.number, query) } }
-    val favs = remember(visible) { visible.take(5) }
+    /* Real favorites (starred in contact details), not just the first five. */
+    val favs = remember(visible, favorites) { visible.filter { it.number in favorites } }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 90.dp)) {
-        item { SectionTitle("FAVORITES") }
-        if (favs.isEmpty()) item { Text("No favorites yet.", Modifier.padding(horizontal = 16.dp, vertical = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp) }
-        itemsIndexed(favs, key = { i, p -> "fav-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }) }
+        if (query.isBlank()) {
+            item { SectionTitle("FAVORITES") }
+            if (favs.isEmpty()) item { Text("No favorites yet. Star a contact in its details page.", Modifier.padding(horizontal = 16.dp, vertical = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp) }
+            itemsIndexed(favs, key = { i, p -> "fav-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }, { onMessage(p) }) }
+        }
         item { SectionTitle(if (query.isBlank()) "ALL CONTACTS · ${contacts.size}" else "SEARCH RESULTS · ${visible.size}") }
         if (visible.isEmpty()) item { Text(if (query.isBlank()) "No matching contacts. Grant Contacts permission or add contacts to your device." else "No contact matches “$query”.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        itemsIndexed(visible, key = { i, p -> "con-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }) }
+        itemsIndexed(visible, key = { i, p -> "con-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }, { onMessage(p) }) }
     }
 }
 
 @Composable
-private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit) {
+private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit, onMessage: () -> Unit) {
+    var showMenu by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     Row(Modifier.fillMaxWidth().clickable(onClick = onOpen).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(46.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)).clickable(onClick = onOpen), contentAlignment = Alignment.Center) {
             Text(person.initials.take(1).uppercase(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 17.sp)
@@ -1455,6 +1784,17 @@ private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit) {
             Text(person.number, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp, maxLines = 1)
         }
         IconButton(onClick = onCall, modifier = Modifier.size(38.dp)) { Icon(Icons.Filled.Call, "Call", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp)) }
+        Box {
+            IconButton(onClick = { showMenu = true }, modifier = Modifier.size(38.dp)) { Icon(Icons.Filled.MoreVert, "More options", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(19.dp)) }
+            DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                DropdownMenuItem(text = { Text("Call") }, onClick = { showMenu = false; onCall() })
+                DropdownMenuItem(text = { Text("Message") }, onClick = { showMenu = false; onMessage() })
+                DropdownMenuItem(text = { Text("Copy number") }, onClick = {
+                    showMenu = false
+                    try { clipboard.setText(AnnotatedString(person.number)); Toast.makeText(context, "Copied ${person.number}", Toast.LENGTH_SHORT).show() } catch (_: Exception) { }
+                })
+            }
+        }
     }
     HorizontalDivider(Modifier.padding(start = 74.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
 }
@@ -1951,7 +2291,7 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "My Profile & User Account", "CallerX profile · auto backup on", onProfile)
             SectionTitle("VOIP & SIP")
             SettingRow(Icons.Filled.Cloud, MaterialTheme.colorScheme.primary, "SIP Account", if (defaultAcc != null) "${defaultAcc.domain} · ${activity.registrationMessage}" else "No account added", onSip)
-            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio & Codec", "Opus HD, G.722 · noise suppression on", onRoute = null, onClick = { activity.errorMessage = "Codecs in use: Opus 48k HD, PCMU, PCMA, G.722 and DTMF events. Echo cancellation is always on." })
+            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio & Codec", "Opus 16 kHz mono, G.722 · echo cancellation on", onRoute = null, onClick = { activity.errorMessage = "Codecs in use: Opus 16 kHz mono (low bandwidth, stable on 4G), G.722, PCMA, PCMU and DTMF events. Echo cancellation is always on." })
             SectionTitle("SIM CALLING & RECORDING")
             SettingRow(Icons.Filled.SimCard, MaterialTheme.colorScheme.primary, "SIM 1", "Show SIM 1 as a call option", toggle = true, checked = sim1, onClick = { sim1 = !sim1; prefs.edit().putBoolean("setting:SIM 1", sim1).apply() })
             SettingRow(Icons.Filled.SimCard, MaterialTheme.colorScheme.primary, "SIM 2", "Show SIM 2 as a call option", toggle = true, checked = sim2, onClick = { sim2 = !sim2; prefs.edit().putBoolean("setting:SIM 2", sim2).apply() })
@@ -2009,7 +2349,7 @@ private fun BlockedScreen(activity: MainActivity, onBack: () -> Unit) {
 private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primary).statusBarsPadding().padding(top = 6.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onPrimary) }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onPrimary) } }
 
 @Composable
-private fun DialerScreen(number: String, onNumber: (String) -> Unit, onBack: () -> Unit, onCall: () -> Unit) {
+private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: List<Person>, onBack: () -> Unit, onCall: () -> Unit, onCallPerson: (Person) -> Unit) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
@@ -2026,13 +2366,51 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, onBack: () 
         if (clean.isBlank()) Toast.makeText(context, "No phone number in the clipboard", Toast.LENGTH_SHORT).show()
         else { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onNumber(numberRef.value + clean); Toast.makeText(context, "Pasted $clean", Toast.LENGTH_SHORT).show() }
     }
+    fun copyNumber() {
+        if (numberRef.value.isBlank()) return
+        try { clipboard.setText(AnnotatedString(numberRef.value)); Toast.makeText(context, "Copied ${numberRef.value}", Toast.LENGTH_SHORT).show() } catch (_: Exception) { }
+    }
+    fun insertPlus() {
+        val t = numberRef.value
+        if (!t.startsWith("+")) onNumber("+" + t)
+    }
+    // DTMF tones like a real dialer (Google Dialer / Truecaller behaviour)
+    val toneGenerator = remember {
+        try { ToneGenerator(AudioManager.STREAM_DTMF, 70) } catch (_: Exception) { null }
+    }
+    DisposableEffect(toneGenerator) {
+        onDispose { try { toneGenerator?.stopTone(); toneGenerator?.release() } catch (_: Exception) { } }
+    }
+    fun playTone(digit: String) {
+        val tone = when (digit) {
+            "0" -> ToneGenerator.TONE_DTMF_0
+            "1" -> ToneGenerator.TONE_DTMF_1
+            "2" -> ToneGenerator.TONE_DTMF_2
+            "3" -> ToneGenerator.TONE_DTMF_3
+            "4" -> ToneGenerator.TONE_DTMF_4
+            "5" -> ToneGenerator.TONE_DTMF_5
+            "6" -> ToneGenerator.TONE_DTMF_6
+            "7" -> ToneGenerator.TONE_DTMF_7
+            "8" -> ToneGenerator.TONE_DTMF_8
+            "9" -> ToneGenerator.TONE_DTMF_9
+            "*" -> ToneGenerator.TONE_DTMF_S
+            "#" -> ToneGenerator.TONE_DTMF_P
+            else -> -1
+        }
+        if (tone >= 0) try { toneGenerator?.startTone(tone, 150) } catch (_: Exception) { }
+    }
+    // Live contact suggestions while typing (T9 + number), like Google Dialer
+    val suggestions = remember(contacts, number) {
+        if (number.length < 2) emptyList()
+        else contacts.filter { matchesQuery(it.name, it.number, number) }.take(5)
+    }
 
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).statusBarsPadding().navigationBarsPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onSurface) }
             Spacer(Modifier.weight(1f))
+            TextButton(onClick = { insertPlus() }) { Text("+", fontSize = 16.sp, fontWeight = FontWeight.Bold) }
         }
-        Spacer(Modifier.weight(0.5f))
         Box(Modifier.fillMaxWidth().padding(horizontal = 26.dp).pointerInput(Unit) {
             detectTapGestures(onLongPress = { pasteNumber() }, onTap = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove) })
         }, contentAlignment = Alignment.Center) {
@@ -2041,37 +2419,72 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, onBack: () 
                 color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
         }
-        Text("Long-press the number to paste a copied one", Modifier.padding(top = 8.dp), fontSize = 10.sp, color = secondaryText.copy(alpha = 0.7f))
-        Spacer(Modifier.weight(0.7f))
+        /* Paste / Copy / Clear row (visible like Google Dialer, not hidden) */
+        Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { pasteNumber() }) { Text("Paste", fontSize = 12.sp) }
+            TextButton(onClick = { copyNumber() }, enabled = number.isNotEmpty()) { Text("Copy", fontSize = 12.sp) }
+            TextButton(onClick = { clearAll() }, enabled = number.isNotEmpty()) { Text("Clear", fontSize = 12.sp) }
+        }
+        Text("Long-press the number to paste a copied one", Modifier.padding(top = 2.dp), fontSize = 10.sp, color = secondaryText.copy(alpha = 0.7f))
+        /* Suggestions list */
+        if (suggestions.isNotEmpty()) {
+            Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 4.dp)) {
+                suggestions.forEach { person ->
+                    Row(Modifier.fillMaxWidth().clickable { onNumber(person.number) }.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) {
+                            Text(person.initials.take(1).uppercase(), color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(person.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp)
+                            Text(person.number, color = secondaryText, fontSize = 12.sp, maxLines = 1)
+                        }
+                        IconButton(onClick = { onCallPerson(person) }, modifier = Modifier.size(38.dp)) { Icon(Icons.Filled.Call, "Call ${person.name}", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(19.dp)) }
+                    }
+                }
+            }
+        } else {
+            Spacer(Modifier.weight(1f))
+        }
         val keys = listOf("1" to "", "2" to "ABC", "3" to "DEF", "4" to "GHI", "5" to "JKL", "6" to "MNO", "7" to "PQRS", "8" to "TUV", "9" to "WXYZ", "*" to "", "0" to "+", "#" to "")
         keys.chunked(3).forEach { row ->
             Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                 row.forEach { (digit, letters) ->
-                    DialKey(digit, letters, { append(digit) }, if (digit == "0") { { append("+") } } else null)
+                    DialKey(digit, letters) {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        playTone(digit)
+                        append(digit)
+                    }
                 }
             }
             Spacer(Modifier.height(10.dp))
         }
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(26.dp)) {
             Box(Modifier.size(64.dp))
-            Button(onClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onCall() }, shape = CircleShape, modifier = Modifier.size(64.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E9C67))) { Icon(Icons.Filled.Call, "Call", tint = Color.White, modifier = Modifier.size(25.dp)) }
-            Box(Modifier.size(50.dp).pointerInput(Unit) {
-                detectTapGestures(onTap = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); deleteLast() }, onLongPress = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); clearAll() })
-            }, contentAlignment = Alignment.Center) { Icon(Icons.Filled.Backspace, "Delete", tint = secondaryText, modifier = Modifier.size(22.dp)) }
+            Button(onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                if (number.isBlank()) Toast.makeText(context, "Enter a number first", Toast.LENGTH_SHORT).show() else onCall()
+            }, shape = CircleShape, modifier = Modifier.size(64.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E9C67))) { Icon(Icons.Filled.Call, "Call", tint = Color.White, modifier = Modifier.size(25.dp)) }
+            /* Backspace only appears when there is something to delete (Google Dialer) */
+            if (number.isNotEmpty()) {
+                Surface(onClick = { haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove); deleteLast() }, shape = CircleShape, color = Color.Transparent, modifier = Modifier.size(50.dp)) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Icon(Icons.Filled.Backspace, "Delete", tint = secondaryText, modifier = Modifier.size(22.dp)) }
+                }
+            } else {
+                Box(Modifier.size(50.dp))
+            }
         }
         Spacer(Modifier.weight(0.4f))
     }
 }
 
 @Composable
-private fun DialKey(digit: String, letters: String, onTap: () -> Unit, onLongPress: (() -> Unit)?) {
-    val longAction: ((Offset) -> Unit)? = if (onLongPress != null) {
-        val lp = onLongPress
-        { _: Offset -> lp() }
-    } else null
-    Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
-        modifier = Modifier.size(72.dp).pointerInput(digit) { detectTapGestures(onTap = { onTap() }, onLongPress = longAction) }) {
+private fun DialKey(digit: String, letters: String, onTap: () -> Unit) {
+    /* Surface(onClick) gives ripple feedback + TalkBack semantics, unlike a
+       raw pointerInput box which felt dead and was hard to press. */
+    Surface(onClick = onTap, shape = CircleShape, color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+        modifier = Modifier.size(72.dp)) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(digit, fontSize = 25.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
@@ -2080,6 +2493,7 @@ private fun DialKey(digit: String, letters: String, onTap: () -> Unit, onLongPre
         }
     }
 }
+
 
 @Composable
 private fun ProfileScreen(activity: MainActivity, onBack: () -> Unit, onTheme: () -> Unit, onSettings: () -> Unit, onNotifications: () -> Unit) {
