@@ -2002,7 +2002,7 @@ class MainActivity : ComponentActivity() {
     fun sendDtmf(digit: Char) { SipEngine.sendDtmf(digit) }
     fun blindTransfer(target: String): Boolean = SipEngine.blindTransfer(target)
     fun attendedTransfer(): Boolean = SipEngine.attendedTransfer()
-    fun requestSmsPermission() { runtimePermissionLauncher.launch(arrayOf(Manifest.permission.SEND_SMS)) }
+    fun requestSendSmsPermission() { runtimePermissionLauncher.launch(arrayOf(Manifest.permission.SEND_SMS)) }
 
     fun dialVoicemail() {
         val num = prefs().getString("setting:voicemail", "").orEmpty().trim()
@@ -3640,7 +3640,7 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 toggle = true, checked = missedSms, onClick = {
                     missedSms = !missedSms
                     prefs.edit().putBoolean("setting:missedSms", missedSms).apply()
-                    if (missedSms) activity.requestSmsPermission()
+                    if (missedSms) activity.requestSendSmsPermission()
                 })
             SettingRow(Icons.AutoMirrored.Filled.Message, MaterialTheme.colorScheme.primary, "Auto-reply message",
                 if (missedText.isBlank()) "Default: “Sorry, I can't take your call right now…”" else missedText.take(60),
