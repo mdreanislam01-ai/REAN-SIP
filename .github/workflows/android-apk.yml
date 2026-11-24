@@ -68,6 +68,11 @@ jobs:
           printf 'storeFile=android/app/callerx-release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
             "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
           gradle --no-daemon :app:assembleRelease :app:bundleRelease --stacktrace --console=plain
+          echo "--- signed artefacts ---"
+          ls -l android/app/build/outputs/apk/release android/app/build/outputs/bundle/release
+          echo "--- signature check ---"
+          "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools/35.0.0/apksigner" verify --print-certs \
+            android/app/build/outputs/apk/release/app-release.apk | head -n 12
       - uses: actions/upload-artifact@v4
         with:
           name: CallerX-release
@@ -78,11 +83,25 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.21
-          name: CallerX Android APK v1.5.21
+          tag_name: callerx-v1.5.22
+          name: CallerX Android APK v1.5.22
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.22 — call waiting, recordings, widget, auto restore:
+            - Call waiting: a second incoming SIP call shows an "Answer & hold" card instead of
+              replacing the live call on screen.
+            - Call recordings screen: play, share and delete recordings inside the app
+              (Settings → Call recordings).
+            - Adaptive audio: when network quality stays poor the live call is renegotiated into
+              low-bandwidth mode so it does not break up.
+            - Home-screen widget (SIP status + dial pad / speed dial 1 / voicemail) and a
+              Quick Settings tile.
+            - Automatic backup to a folder you pick (Google Drive, Dropbox, phone storage) with
+              automatic restore when that folder is picked again on a new install.
+            - Signed release builds: ./scripts/make-keystore.sh prints the four GitHub secrets;
+              CI then verifies the APK signature and publishes app-release.apk + .aab.
 
             v1.5.21 — in-call extras, missed-call handling:
             - DTMF keypad during a SIP call: press Keypad and the tones go to the other side

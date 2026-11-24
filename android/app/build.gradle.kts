@@ -20,8 +20,8 @@ android {
         applicationId = "com.callerx.app"
         minSdk = 23
         targetSdk = 35
-        versionCode = 40
-        versionName = "1.5.21"
+        versionCode = 41
+        versionName = "1.5.22"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -62,4 +62,5 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("org.linphone:linphone-sdk-android:5.4.110")
+    implementation("androidx.documentfile:documentfile:1.0.1")
 }

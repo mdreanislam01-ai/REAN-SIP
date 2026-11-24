@@ -49,6 +49,29 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.22 — call waiting, recordings, widget, auto restore
+
+- **Call waiting**: a second incoming SIP call no longer overwrites the live call screen —
+  a "Call waiting" card shows *Answer & hold* / *Decline*, the current call is paused
+  automatically and the ringtone stops as soon as the waiting call is handled.
+- **Call recordings screen** (Settings → Call recordings): play, share (FileProvider) and
+  delete recordings inside the app; nothing leaves the phone unless you share it.
+- **Adaptive audio**: if `currentQuality` stays below ~1.6 for two samples the live call is
+  renegotiated with `setLowBandwidthEnabled(true)` so it stops breaking up. G.729 is
+  patent-encumbered and not part of the open-source linphone build, so the fallback is
+  low-bandwidth narrowband rather than a specific codec. Settings → *Adaptive audio*.
+- **Home-screen widget** (`CallerXWidgetProvider`) with live SIP status and three shortcuts
+  (dial pad, speed dial 1, voicemail) plus a **Quick Settings tile** (`CallerXDialTile`).
+  The engine writes `status:online` / `status:account` to preferences and repaints the widget
+  on every registration change.
+- **Automatic backup & restore**: pick a folder once (Google Drive, Dropbox, phone storage)
+  via the system folder picker with persisted access. `callerx-autobackup.json` is refreshed
+  at most every 6 hours, and picking that folder on a new install restores the settings
+  automatically (`applyBackupJson`).
+- **Signed release**: `./scripts/make-keystore.sh` creates the upload keystore and prints the
+  four GitHub secrets; CI then builds `app-release.apk` + `.aab`, runs `apksigner verify`
+  and uploads both. Without the secrets the debug APK is still published.
+
 ## v1.5.21 — in-call extras, missed-call handling
 
 - **DTMF keypad during a call**: press *Keypad* on the in-call screen and every tone is sent

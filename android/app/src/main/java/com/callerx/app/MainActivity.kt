@@ -15,6 +15,7 @@ import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.media.ToneGenerator
@@ -445,6 +446,19 @@ object SipEngine {
                         }
                         a?.registered = isRegistered
                         a?.registrationMessage = lastRegistrationMessage
+                        /* Mirror the state for the widget and the Quick Settings tile. */
+                        try {
+                            val ctx = appContext
+                            if (ctx != null) {
+                                val acc = core?.defaultAccount
+                                val label = acc?.params?.identityAddress?.let { addr -> addr.username ?: addr.domain }.orEmpty()
+                                ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).edit()
+                                    .putBoolean("status:online", isRegistered)
+                                    .putString("status:account", label)
+                                    .apply()
+                                CallerXWidgetProvider.refresh(ctx)
+                            }
+                        } catch (_: Exception) { }
                         if (state == RegistrationState.Ok) regFailCount = 0
                         if (state == RegistrationState.Failed && isDefault) {
                             regFailCount++
@@ -463,12 +477,21 @@ object SipEngine {
                             Call.State.IncomingReceived -> {
                                 val remoteName = call.remoteAddress?.displayName?.takeIf { it.isNotBlank() } ?: "Incoming caller"
                                 val remoteNumber = call.remoteAddress?.username ?: call.remoteAddressAsString.orEmpty()
-                                if (a != null) {
+                                /* Call waiting: a second call arriving during an established call must not
+                                   overwrite the details of the call already on the screen. */
+                                val others = try { core.calls.count { it != call && it.state != Call.State.End && it.state != Call.State.Released } } catch (_: Exception) { 0 }
+                                val waiting = others > 0
+                                if (a != null && !waiting) {
                                     a.activeCallName = remoteName
                                     a.activeNumber = remoteNumber
                                     a.callConnected = false
                                     a.muted = false; a.speaker = false
                                     a.callStartedAt = 0L; a.recording = false
+                                }
+                                if (a != null && waiting) {
+                                    a.waitingName = remoteName
+                                    a.waitingNumber = remoteNumber
+                                    a.callWaiting = true
                                 }
                                 sipCallIncoming = true; sipCallLogged = false
                                 incomingCallerNumber = remoteNumber
@@ -495,10 +518,17 @@ object SipEngine {
                                 if (a != null) { a.callConnected = true; if (a.callStartedAt == 0L) a.callStartedAt = System.currentTimeMillis() }
                                 stopIncomingVibration()
                                 mainHandler.postDelayed({ routeAudio(a?.speaker ?: speakerPreferred) }, 300)
+                                startCodecWatch()
                             }
                             Call.State.StreamsRunning -> {
                                 if (a != null) { a.callConnected = true; if (a.callStartedAt == 0L) a.callStartedAt = System.currentTimeMillis() }
                                 if (sipCallIncoming) incomingCallAnswered = true
+                                if (a != null && a.callWaiting && call.remoteAddress?.username.orEmpty() == a.waitingNumber) {
+                                    /* the waiting call was answered: it becomes the live call */
+                                    a.callWaiting = false
+                                    a.activeCallName = a.waitingName
+                                    a.activeNumber = a.waitingNumber
+                                }
                                 stopIncomingVibration()
                                 acquireCallLocks()
                                 acquireAudioFocus()
@@ -506,6 +536,7 @@ object SipEngine {
                             }
                             Call.State.End, Call.State.Released, Call.State.Error -> {
                                 stopIncomingVibration()
+                                if (a != null && a.callWaiting && call.remoteAddress?.username.orEmpty() == a.waitingNumber) a.callWaiting = false
                                 if (!sipCallLogged && a != null) {
                                     val dur = if (a.callStartedAt > 0L) ((System.currentTimeMillis() - a.callStartedAt) / 1000L).coerceAtLeast(0L) else 0L
                                     a.logSipCall(a.activeNumber, a.activeCallName, sipCallIncoming, a.callConnected, dur)
@@ -516,6 +547,7 @@ object SipEngine {
                                     autoReplyToMissedCall(incomingCallerNumber)
                                 }
                                 if (a != null) { a.callStartedAt = 0L; a.recording = false; a.callConnected = false }
+                                stopCodecWatch()
                                 releaseCallLocks()
                                 releaseAudioFocus()
                             }
@@ -1127,7 +1159,78 @@ object SipEngine {
         toggleCallRecording()
     }
 
-    /* ---------- DTMF keypad during a call (IVR menus, PIN codes) ---------- */
+    /* ---------- Call waiting: answer / decline a second incoming call ---------- */
+    private fun incomingWaitingCall(): Call? = try {
+        core?.calls?.firstOrNull { it.state == Call.State.IncomingReceived }
+    } catch (_: Exception) { null }
+
+    fun answerWaitingCall(): Boolean {
+        val c = core ?: return false
+        val incoming = incomingWaitingCall() ?: return false
+        /* hold whatever is running, exactly like a normal call-waiting answer */
+        try { c.calls.filter { it != incoming && (it.state == Call.State.StreamsRunning || it.state == Call.State.Connected) }.forEach { it.pause() } } catch (_: Exception) { }
+        val ok = try { incoming.accept() == 0 } catch (_: Exception) { false }
+        val a = CallBridge.activity
+        if (a != null && ok) {
+            a.callWaiting = false
+            a.activeCallName = a.waitingName
+            a.activeNumber = a.waitingNumber
+            a.callConnected = true
+            a.callStartedAt = System.currentTimeMillis()
+        }
+        stopIncomingVibration()
+        return ok
+    }
+
+    fun declineWaitingCall() {
+        val incoming = incomingWaitingCall() ?: return
+        try { incoming.decline(Reason.Declined) } catch (_: Exception) { }
+        CallBridge.activity?.callWaiting = false
+        stopIncomingVibration()
+    }
+
+    /* ---------- Adaptive audio: drop to low-bandwidth codecs on a weak network ----------
+       G.729 is patent-encumbered and not shipped in the open-source linphone build, so the
+       automatic fallback switches the live call to liblinphone's low-bandwidth mode
+       (narrowband, no Opus) with a reINVITE when the measured quality stays poor. */
+    private var codecWatch: Runnable? = null
+    private var codecFallbackApplied = false
+    private var poorQualitySamples = 0
+
+    private fun startCodecWatch() {
+        stopCodecWatch()
+        val ctx = appContext ?: return
+        if (!ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getBoolean("setting:autoCodec", true)) return
+        val r = object : Runnable {
+            override fun run() {
+                val c = core ?: return
+                val call = try { c.currentCall } catch (_: Exception) { null } ?: return
+                val quality = try { call.currentQuality } catch (_: Exception) { -1f }
+                if (quality in 0f..1.6f) poorQualitySamples++ else poorQualitySamples = 0
+                if (!codecFallbackApplied && poorQualitySamples >= 2) {
+                    codecFallbackApplied = true
+                    try {
+                        val params = c.createCallParams(call) ?: call.currentParams
+                        params.setLowBandwidthEnabled(true)
+                        call.update(params)
+                        CallBridge.activity?.errorMessage = "Weak network detected · switched to low-bandwidth audio to keep the call stable."
+                    } catch (_: Exception) { }
+                }
+                mainHandler.postDelayed(this, 4000)
+            }
+        }
+        codecWatch = r
+        mainHandler.postDelayed(r, 6000)
+    }
+
+    private fun stopCodecWatch() {
+        codecWatch?.let { mainHandler.removeCallbacks(it) }
+        codecWatch = null
+        codecFallbackApplied = false
+        poorQualitySamples = 0
+    }
+
+    /* ---------- DTMF keypad during a call (IVR menus, PIN codes) ----------
     fun sendDtmf(digit: Char) {
         val call = core?.currentCall ?: activeCall ?: return
         try { call.sendDtmf(digit) } catch (_: Exception) { }
@@ -1321,6 +1424,12 @@ class MainActivity : ComponentActivity() {
     }
     var dialIntentNumber by mutableStateOf("")
     var callUiRequested by mutableStateOf(false)
+    /* Call waiting (second incoming SIP call). */
+    var callWaiting by mutableStateOf(false)
+    var waitingName by mutableStateOf("")
+    var waitingNumber by mutableStateOf("")
+    /* Home-screen widget / Quick Settings tile requests. */
+    var widgetRequest by mutableStateOf("")
     var dialerRoleTick by mutableIntStateOf(0)
     var profileTick by mutableIntStateOf(0)
     /* System ringtone picker (Settings → Ringtone). */
@@ -1344,6 +1453,23 @@ class MainActivity : ComponentActivity() {
                 errorMessage = "Backup saved to the folder you picked (Google Drive, Dropbox, phone storage…)."
             } catch (e: Exception) { errorMessage = "Could not write the backup: ${e.message}" }
         }
+    }
+
+    /* Folder for automatic backups + automatic restore on a new install.
+       Google Drive, Dropbox or any folder on the phone can be chosen; the access
+       is persisted so the app can refresh the snapshot without asking again. */
+    private val backupFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        if (uri == null) return@registerForActivityResult
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        } catch (_: Exception) { }
+        val folderUri = uri.toString()
+        callerxPrefs().edit().putString("backup:folder", folderUri).apply()
+        val restored = restoreFromChosenFolder(silent = false)
+        /* the restored snapshot carries the old device's folder URI: keep the one just picked */
+        callerxPrefs().edit().putString("backup:folder", folderUri).apply()
+        if (!restored) autoBackupToChosenFolder()
+        resumeTick++
     }
 
     private val pickPhotoLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -1609,37 +1735,144 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Applies a CallerX backup JSON document and returns how many keys were restored. */
+    private fun applyBackupJson(json: String): Int {
+        val root = JSONObject(json)
+        val values = root.optJSONObject("prefs") ?: JSONObject()
+        val editor = callerxPrefs().edit()
+        for (key in values.keys()) {
+            val entry = values.optJSONObject(key) ?: continue
+            when (entry.optString("t")) {
+                "b" -> editor.putBoolean(key, entry.optBoolean("v"))
+                "i" -> editor.putInt(key, entry.optInt("v"))
+                "l" -> editor.putLong(key, entry.optLong("v"))
+                "f" -> editor.putFloat(key, entry.optDouble("v").toFloat())
+                "s" -> editor.putString(key, entry.optString("v"))
+                "ss" -> {
+                    val arr = entry.optJSONArray("v")
+                    editor.putStringSet(key, (0 until (arr?.length() ?: 0)).map { arr!!.optString(it) }.toSet())
+                }
+            }
+        }
+        editor.apply()
+        return values.length()
+    }
+
     fun restoreFromBackup(): Boolean {
         return try {
             val dir = File(filesDir, "backups")
             val newest = dir.listFiles()?.filter { it.extension == "json" }?.maxByOrNull { it.lastModified() }
                 ?: run { errorMessage = "No backup file found on this phone yet."; return false }
-            val root = JSONObject(newest.readText())
-            val values = root.optJSONObject("prefs") ?: JSONObject()
-            val editor = callerxPrefs().edit()
-            for (key in values.keys()) {
-                val entry = values.optJSONObject(key) ?: continue
-                when (entry.optString("t")) {
-                    "b" -> editor.putBoolean(key, entry.optBoolean("v"))
-                    "i" -> editor.putInt(key, entry.optInt("v"))
-                    "l" -> editor.putLong(key, entry.optLong("v"))
-                    "f" -> editor.putFloat(key, entry.optDouble("v").toFloat())
-                    "s" -> editor.putString(key, entry.optString("v"))
-                    "ss" -> {
-                        val arr = entry.optJSONArray("v")
-                        editor.putStringSet(key, (0 until (arr?.length() ?: 0)).map { arr!!.optString(it) }.toSet())
-                    }
-                }
-            }
-            editor.apply()
+            val count = applyBackupJson(newest.readText())
             SipEngine.applyAccounts(this)
             resumeTick++
-            errorMessage = "Restored ${values.length()} settings from ${newest.name}."
+            errorMessage = "Restored $count settings from ${newest.name}."
             true
         } catch (e: Exception) {
             errorMessage = "Restore failed: ${e.message ?: "the file is damaged"}"
             false
         }
+    }
+
+    /* ---------- Folder-based automatic backup & restore ---------- */
+    private fun folderDocument(): androidx.documentfile.provider.DocumentFile? {
+        val stored = callerxPrefs().getString("backup:folder", "") ?: ""
+        if (stored.isBlank()) return null
+        return try {
+            androidx.documentfile.provider.DocumentFile.fromTreeUri(this, Uri.parse(stored))
+        } catch (_: Exception) { null }
+    }
+
+    fun autoBackupFolderLabel(): String {
+        val stored = callerxPrefs().getString("backup:folder", "") ?: ""
+        if (stored.isBlank()) return "Not set · tap to pick Google Drive or phone storage"
+        val last = callerxPrefs().getLong("backup:lastFolder", 0L)
+        val when_ = if (last <= 0L) "no backup yet" else android.text.format.DateFormat.getMediumDateFormat(this).format(Date(last))
+        return "Google Drive / storage folder · last auto backup: $when_"
+    }
+
+    fun chooseBackupFolder() {
+        try { backupFolderLauncher.launch(null) } catch (_: Exception) { errorMessage = "This phone has no folder picker." }
+    }
+
+    /** Writes callerx-autobackup.json into the chosen folder (seen by Drive, Dropbox, storage). */
+    fun autoBackupToChosenFolder(): Boolean {
+        val doc = folderDocument() ?: return false
+        return try {
+            val json = createBackupJson()
+            val name = "callerx-autobackup.json"
+            val existing = doc.findFile(name)
+            val file = existing ?: doc.createFile("application/json", name) ?: return false
+            contentResolver.openOutputStream(file.uri, "wt")?.use { out -> out.write(json.toByteArray()) }
+            callerxPrefs().edit().putLong("backup:lastFolder", System.currentTimeMillis()).apply()
+            resumeTick++
+            true
+        } catch (e: Exception) {
+            errorMessage = "Auto backup failed: ${e.message ?: "the folder is not writable"}"
+            false
+        }
+    }
+
+    /** Restores callerx-autobackup.json from the chosen folder if it exists. */
+    fun restoreFromChosenFolder(silent: Boolean): Boolean {
+        val doc = folderDocument() ?: return false
+        return try {
+            val file = doc.findFile("callerx-autobackup.json") ?: return false
+            val json = contentResolver.openInputStream(file.uri)?.use { it.readBytes().decodeToString() } ?: return false
+            val count = applyBackupJson(json)
+            SipEngine.applyAccounts(this)
+            resumeTick++
+            if (!silent && count > 0) errorMessage = "Restored $count settings from callerx-autobackup.json — your SIP accounts, speed dials and blocked numbers are back."
+            count > 0
+        } catch (e: Exception) {
+            if (!silent) errorMessage = "Restore failed: ${e.message ?: "the backup file is damaged"}"
+            false
+        }
+    }
+
+    /* Runs on every start: refresh the snapshot at most once every 6 hours. */
+    private fun maybeFolderAutoBackup() {
+        try {
+            val last = callerxPrefs().getLong("backup:lastFolder", 0L)
+            if (System.currentTimeMillis() - last < 6L * 3600 * 1000) return
+            if (folderDocument() == null) return
+            lifecycleScope.launch(Dispatchers.IO) { try { autoBackupToChosenFolder() } catch (_: Exception) { } }
+        } catch (_: Exception) { }
+    }
+
+    /* ---------- Recordings (item: call recording player) ---------- */
+    fun recordingFiles(): List<File> {
+        val dir = File(filesDir, "recordings")
+        return try { dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: emptyList() } catch (_: Exception) { emptyList() }
+    }
+
+    fun shareRecording(file: File) {
+        try {
+            val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.files", file)
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "audio/x-matroska"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, "Share recording"))
+        } catch (e: Exception) { errorMessage = "Could not share the recording: ${e.message}" }
+    }
+
+    fun deleteRecording(file: File): Boolean = try {
+        val ok = file.delete()
+        if (ok) { resumeTick++; errorMessage = "Recording deleted." }
+        ok
+    } catch (_: Exception) { false }
+
+    /* ---------- Widget / Quick Settings tile entry points ---------- */
+    fun dialSpeedSlot(slot: Int) {
+        val num = callerxPrefs().getString("speed:$slot", "").orEmpty()
+        if (num.isBlank()) {
+            widgetRequest = "dialer"
+            errorMessage = "No speed dial on $slot yet. Long-press a recent call's ⋮ menu to set one."
+            return
+        }
+        startCellCall(num, 0)
     }
 
     fun requestSmsPermission() {
@@ -1906,9 +2139,21 @@ class MainActivity : ComponentActivity() {
            phone or destroying this Activity must never stop the mic/call. */
         startKeepAliveService()
         maybeAutoBackup()
+        maybeFolderAutoBackup()
+        handleWidgetIntent(intent)
         registerDataObservers()
         refreshData()
         setContent { CallerXApp(this) }
+    }
+
+    /* Widget / Quick Settings tile taps arrive as extras on the launcher intent. */
+    private fun handleWidgetIntent(intent: Intent?) {
+        if (intent == null) return
+        intent.getStringExtra("callerx_widget")?.let { widgetRequest = it }
+        if (intent.hasExtra("callerx_speed")) {
+            val slot = intent.getIntExtra("callerx_speed", 0)
+            if (slot in 1..9) widgetRequest = "speed:$slot"
+        }
     }
 
     override fun onResume() { super.onResume(); resumeTick++; CallBridge.activity = this; scheduleDataRefresh(150); SipEngine.refreshRegisters() }
@@ -1918,6 +2163,7 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         intent.data?.schemeSpecificPart?.let { dialIntentNumber = it }
         callUiRequested = intent.getBooleanExtra("callerx_open_call", false)
+        handleWidgetIntent(intent)
     }
 
     override fun onDestroy() {
@@ -1943,6 +2189,8 @@ class MainActivity : ComponentActivity() {
     }
 
     fun answerCall() { SipEngine.answerCall() }
+    fun answerWaitingCall() { SipEngine.answerWaitingCall() }
+    fun declineWaitingCall() { SipEngine.declineWaitingCall() }
     fun answerCellCall() { try { TelecomCallBridge.currentCall?.answer(0) } catch (e: Exception) { errorMessage = "Could not answer call: ${e.message}" } }
     fun endCellCall() { try { TelecomCallBridge.currentCall?.disconnect() } catch (e: Exception) { errorMessage = "Could not end call: ${e.message}" } }
     fun endCall() { SipEngine.endCall() }
@@ -2086,7 +2334,7 @@ private fun CallerXApp(activity: MainActivity) {
 
             // one step back inside each section
             screen == "sipform" -> screen = "sip"
-            screen == "sip" || screen == "blocked" || screen == "theme" || screen == "profile" || screen == "speeddial" -> screen = "settings"
+            screen == "sip" || screen == "blocked" || screen == "theme" || screen == "profile" || screen == "speeddial" || screen == "recordings" -> screen = "settings"
             screen == "settings" -> goHome("Calls")
             screen == "contact" -> { selected = null; goHome(tab) }
             screen == "dialer" -> goHome("Calls")
@@ -2116,6 +2364,18 @@ private fun CallerXApp(activity: MainActivity) {
         showWelcome = !prefs.getBoolean("permission-intro-seen", false)
     }
     LaunchedEffect(activity.dialIntentNumber) { if (activity.dialIntentNumber.isNotBlank()) { number = activity.dialIntentNumber; screen = "dialer"; activity.dialIntentNumber = "" } }
+    /* Home-screen widget / Quick Settings tile taps. */
+    LaunchedEffect(activity.widgetRequest) {
+        val request = activity.widgetRequest
+        if (request.isBlank()) return@LaunchedEffect
+        activity.widgetRequest = ""
+        when {
+            request == "dialer" -> { screen = "dialer"; tab = "Calls" }
+            request == "voicemail" -> activity.dialVoicemail()
+            request.startsWith("speed:") -> request.removePrefix("speed:").toIntOrNull()?.let { activity.dialSpeedSlot(it) }
+            request == "recordings" -> screen = "recordings"
+        }
+    }
     LaunchedEffect(activity.errorMessage) { if (activity.errorMessage.isNotBlank()) showError = true }
     LaunchedEffect(activity.callState, activity.callUiRequested, TelecomCallBridge.state) {
         if (activity.callState == "Incoming SIP call" || activity.callUiRequested || TelecomCallBridge.state == "Incoming cellular call") {
@@ -2208,11 +2468,13 @@ private fun CallerXApp(activity: MainActivity) {
             BlockedScreen(activity, onBack = { screen = "settings" })
         } else if (screen == "speeddial") {
             SpeedDialScreen(onBack = { screen = "settings" })
+        } else if (screen == "recordings") {
+            RecordingsScreen(activity, onBack = { screen = "settings" })
         } else if (screen == "settings") {
             SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() },
                 onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" },
                 onBlocked = { screen = "blocked" }, onRoute = { showRouteDialog = true }, onDialer = { showDialerDialog = true },
-                onPower = { activity.openPowerSettings() }, onSpeedDial = { screen = "speeddial" }, onBack = null)
+                onPower = { activity.openPowerSettings() }, onSpeedDial = { screen = "speeddial" }, onRecordings = { screen = "recordings" }, onBack = null)
         } else {
             Scaffold(
                 containerColor = MaterialTheme.colorScheme.background,
@@ -2294,7 +2556,7 @@ private fun CallerXApp(activity: MainActivity) {
                         else -> SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() },
                             onSip = { screen = "sip" }, onTheme = { screen = "theme" }, onProfile = { screen = "profile" },
                             onBlocked = { screen = "blocked" }, onRoute = { showRouteDialog = true }, onDialer = { showDialerDialog = true },
-                            onPower = { activity.openPowerSettings() }, onSpeedDial = { screen = "speeddial" }, onBack = null)
+                            onPower = { activity.openPowerSettings() }, onSpeedDial = { screen = "speeddial" }, onRecordings = { screen = "recordings" }, onBack = null)
                     }
                 }
             }
@@ -3059,6 +3321,31 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
                     }
                 }
             }
+            /* Call waiting: a second incoming call while this one is live. */
+            if (!isCell && activity.callWaiting) {
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    color = Color(0xFF1EAA62).copy(alpha = if (dark) 0.20f else 0.10f),
+                    modifier = Modifier.fillMaxWidth().padding(top = 14.dp)
+                ) {
+                    Column(Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Icon(Icons.Filled.Call, null, tint = Color(0xFF1EAA62), modifier = Modifier.size(15.dp))
+                            Text("CALL WAITING", fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp, color = Color(0xFF1EAA62))
+                        }
+                        Text(activity.waitingName.ifBlank { "Second caller" }, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = primaryText, modifier = Modifier.padding(top = 4.dp))
+                        Text(activity.waitingNumber, fontSize = 12.sp, color = secondaryText)
+                        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { hold = true; activity.answerWaitingCall() },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1EAA62))
+                            ) { Text("Answer & hold", fontSize = 12.sp, color = Color.White) }
+                            OutlinedButton(onClick = { activity.declineWaitingCall() }, modifier = Modifier.weight(1f)) { Text("Decline", fontSize = 12.sp) }
+                        }
+                    }
+                }
+            }
             Spacer(Modifier.weight(1f))
             Box(Modifier.size(200.dp), contentAlignment = Alignment.Center) {
                 Box(Modifier.size(190.dp).graphicsLayer { scaleX = pulse; scaleY = pulse; alpha = .22f }.clip(CircleShape).background(sourceColor.copy(alpha = .15f)))
@@ -3483,7 +3770,7 @@ private fun SipFormScreen(activity: MainActivity, editIndex: Int, onBack: () -> 
 /* ---------- Settings ---------- */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boolean) -> Unit, onSip: () -> Unit, onTheme: () -> Unit, onProfile: () -> Unit, onBlocked: () -> Unit, onRoute: () -> Unit, onDialer: () -> Unit, onPower: () -> Unit, onSpeedDial: () -> Unit = {}, onBack: (() -> Unit)?) {
+private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boolean) -> Unit, onSip: () -> Unit, onTheme: () -> Unit, onProfile: () -> Unit, onBlocked: () -> Unit, onRoute: () -> Unit, onDialer: () -> Unit, onPower: () -> Unit, onSpeedDial: () -> Unit = {}, onRecordings: (() -> Unit)? = null, onBack: (() -> Unit)?) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE) }
     var sim1 by remember { mutableStateOf(prefs.getBoolean("setting:SIM 1", true)) }
@@ -3496,6 +3783,7 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     var pinDraft by remember { mutableStateOf(prefs.getString("applock:pin", "") ?: "") }
     var showVibration by remember { mutableStateOf(false) }
     val vibrationStyle = prefs.getInt("setting:vibration", 1)
+    var autoCodec by remember { mutableStateOf(prefs.getBoolean("setting:autoCodec", true)) }
     var missedSms by remember { mutableStateOf(prefs.getBoolean("setting:missedSms", false)) }
     var missedText by remember { mutableStateOf(prefs.getString("setting:missedSmsText", "") ?: "") }
     var voicemail by remember { mutableStateOf(prefs.getString("setting:voicemail", "") ?: "") }
@@ -3625,6 +3913,8 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
             SectionTitle("ACCOUNT")
             SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "Profile & Backup Account", if (activity.googleBackupAccount().isNotBlank()) "Google · ${activity.googleBackupAccount()}" else "Profile, Google account backup & phone storage", onProfile)
+            SettingRow(Icons.Filled.Folder, MaterialTheme.colorScheme.primary, "Automatic backup & restore",
+                activity.autoBackupFolderLabel(), onClick = { activity.chooseBackupFolder() })
             SectionTitle("VOIP & SIP")
             SettingRow(Icons.Filled.Cloud, MaterialTheme.colorScheme.primary, "SIP Account", if (defaultAcc != null) "${defaultAcc.domain} · ${activity.registrationMessage}" else "No account added", onSip)
             SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio & Codec", "Opus 16 kHz mono, G.722 · echo cancellation on", onRoute = null, onClick = { activity.errorMessage = "Codecs in use: Opus 16 kHz mono (low bandwidth, stable on 4G), G.722, PCMA, PCMU and DTMF events. Echo cancellation is always on." })
@@ -3634,6 +3924,8 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.SwapCalls, MaterialTheme.colorScheme.primary, "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else "Use the default route automatically", toggle = true, checked = ask, onClick = { ask = !ask; prefs.edit().putBoolean("setting:Ask before each call", ask).apply() })
             SettingRow(Icons.Filled.Mic, MaterialTheme.colorScheme.primary, "Auto Call Recording", if (autoRec) "On · every call is recorded (${activity.recordingCount()} saved)" else "Off · ${activity.recordingCount()} recordings saved", toggle = true, checked = autoRec, onClick = { autoRec = !autoRec; prefs.edit().putBoolean("setting:autoRecord", autoRec).apply() })
             SettingRow(Icons.Filled.Call, MaterialTheme.colorScheme.primary, "Default call route", if (route.isBlank()) "Not set — you are asked every time" else "All calls go via $route", onRoute)
+            SettingRow(Icons.Filled.PlayArrow, MaterialTheme.colorScheme.primary, "Call recordings",
+                "${activity.recordingCount()} saved · play, share or delete them", onClick = { onRecordings?.invoke() })
             SectionTitle("MISSED CALLS & VOICEMAIL")
             SettingRow(Icons.Filled.Message, MaterialTheme.colorScheme.primary, "Auto-SMS on missed call",
                 if (missedSms) "On · the caller gets a text when you miss a SIP call" else "Off · missed SIP calls are only logged",
@@ -3661,6 +3953,11 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 if (srtp) "On · media is encrypted end to end" else "Off · only if your provider forces it",
                 toggle = true, checked = srtp, onClick = {
                     srtp = !srtp; prefs.edit().putBoolean("setting:srtp", srtp).apply(); activity.applyAccounts()
+                })
+            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Adaptive audio (weak network)",
+                if (autoCodec) "On · drop to narrowband when quality falls" else "Off · always use HD audio",
+                toggle = true, checked = autoCodec, onClick = {
+                    autoCodec = !autoCodec; prefs.edit().putBoolean("setting:autoCodec", autoCodec).apply()
                 })
             SettingRow(Icons.Filled.MusicNote, MaterialTheme.colorScheme.primary, "Ringtone",
                 activity.ringtoneLabel(), onClick = { activity.pickRingtone() })
@@ -4140,6 +4437,83 @@ private fun ProfileScreen(activity: MainActivity, onBack: () -> Unit, onTheme: (
                 SettingRow(Icons.Filled.Settings, primary, "Notifications", "Open Android notification settings for CallerX", onClick = onNotifications)
                 SettingRow(Icons.Filled.Palette, primary, "Theme", "Change the accent color of the whole app", onClick = onTheme)
                 SettingRow(Icons.Filled.Settings, primary, "Settings", "Back to all settings", onClick = onSettings)
+            }
+        }
+    }
+}
+
+/* ---------- Call recordings: play, share, delete (all inside CallerX) ---------- */
+@Composable
+private fun RecordingsScreen(activity: MainActivity, onBack: () -> Unit) {
+    var tick by remember { mutableStateOf(0) }
+    var playing by remember { mutableStateOf<File?>(null) }
+    var player by remember { mutableStateOf<MediaPlayer?>(null) }
+    val files = remember(tick, activity.resumeTick) { activity.recordingFiles() }
+
+    fun stopPlayback() {
+        try { player?.stop() } catch (_: Exception) { }
+        try { player?.release() } catch (_: Exception) { }
+        player = null
+        playing = null
+    }
+
+    fun play(file: File) {
+        stopPlayback()
+        try {
+            val mp = MediaPlayer()
+            mp.setDataSource(file.absolutePath)
+            mp.prepare()
+            mp.start()
+            mp.setOnCompletionListener { stopPlayback() }
+            player = mp
+            playing = file
+        } catch (e: Exception) {
+            stopPlayback()
+            activity.errorMessage = "Could not play this recording: ${e.message ?: "unsupported file"}"
+        }
+    }
+
+    DisposableEffect(Unit) { onDispose { try { player?.release() } catch (_: Exception) { } } }
+
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        TopBar("Call recordings", onBack)
+        if (files.isEmpty()) {
+            Column(Modifier.fillMaxSize().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                Icon(Icons.Filled.Mic, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(44.dp))
+                Text("No recordings yet", fontWeight = FontWeight.SemiBold, fontSize = 16.sp, modifier = Modifier.padding(top = 12.dp))
+                Text("Press Record during a call, or turn on Auto Call Recording in Settings.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 6.dp))
+            }
+        } else {
+            LazyColumn(Modifier.fillMaxSize().padding(bottom = 24.dp)) {
+                items(files.size) { index ->
+                    val file = files[index]
+                    val isPlaying = playing?.absolutePath == file.absolutePath
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Surface(
+                            onClick = { if (isPlaying) stopPlayback() else play(file) },
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                            modifier = Modifier.size(42.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(if (isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow, if (isPlaying) "Stop" else "Play", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp))
+                            }
+                        }
+                        Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                            Text(
+                                try { DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(file.lastModified())) } catch (_: Exception) { file.name },
+                                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                            Text("${file.length() / 1024} KB · ${file.name}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        IconButton(onClick = { activity.shareRecording(file) }) { Icon(Icons.Filled.Share, "Share", modifier = Modifier.size(19.dp)) }
+                        IconButton(onClick = {
+                            if (isPlaying) stopPlayback()
+                            if (activity.deleteRecording(file)) tick++
+                        }) { Icon(Icons.Filled.Delete, "Delete", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(19.dp)) }
+                    }
+                    HorizontalDivider(Modifier.padding(start = 70.dp), color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
+                }
             }
         }
     }
