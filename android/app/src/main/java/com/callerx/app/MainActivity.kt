@@ -2672,9 +2672,6 @@ private fun CallerXApp(activity: MainActivity) {
                             val acc = list.firstOrNull { it.isDefault } ?: list.firstOrNull { it.enabled } ?: list.firstOrNull()
                             acc?.let { a -> listOf(a.displayName, a.name, a.user).firstOrNull { it.isNotBlank() } } ?: ""
                         }
-                        val favoriteNumbers = remember(contacts, activity.resumeTick) {
-                            contacts.filter { c -> val norm = c.number.filter { it.isDigit() || it == '+' }; prefs.getBoolean("fav:$norm", false) }.map { it.number }.toSet()
-                        }
                         val hits = when (tab) {
                             "Contacts" -> contacts.count { matchesQuery(it.name, it.number, debouncedQuery) }
                             "Favorites" -> contacts.count { p -> p.number in favoriteNumbers && matchesQuery(p.name, p.number, debouncedQuery) }
@@ -2695,6 +2692,10 @@ private fun CallerXApp(activity: MainActivity) {
                             resultText = if (debouncedQuery.isBlank()) "" else "$hits result${if (hits == 1) "" else "s"}",
                             onSip = { showSipInfo = true }
                         )
+                    }
+                    /* Starred contacts (used by the Favorites tab and the Contacts header). */
+                    val favoriteNumbers = remember(contacts, activity.resumeTick) {
+                        contacts.filter { c -> val norm = c.number.filter { it.isDigit() || it == '+' }; prefs.getBoolean("fav:$norm", false) }.map { it.number }.toSet()
                     }
                     when (tab) {
                         "Calls" -> CallsTab(recentCalls, photoByNumber, filter, { filter = it }, debouncedQuery,
