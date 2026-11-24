@@ -22,6 +22,9 @@ android {
         targetSdk = 35
         versionCode = 44
         versionName = "1.5.25"
+        /* Keep the universal APK to two ABIs: without this the universal build packs all
+           four liblinphone ABIs and grows to ~170 MB. */
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
     /* Per-ABI APKs: the universal build stays app-debug.apk for compatibility, and
