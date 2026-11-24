@@ -3798,7 +3798,7 @@ private fun ContactDetailScreen(activity: MainActivity, person: Person, recents:
             Spacer(Modifier.height(14.dp))
             Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
                 Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                    SettingRow(Icons.Filled.Star, primary, "Favorite", if (fav) "Saved in your favorites" else "Add this contact to favorites", toggle = true, checked = fav, onClick = { fav = !fav; prefs.edit().putBoolean("fav:$norm", fav).apply() })
+                    SettingRow(Icons.Filled.Star, primary, "Favorite", if (fav) "Saved in your favorites" else "Add this contact to favorites", toggle = true, checked = fav, onClick = { fav = !fav; prefs.edit().putBoolean("fav:$norm", fav).apply(); activity.resumeTick++ })
                     SettingRow(Icons.Filled.Edit, primary, "Edit contact", "Open the device contact editor", onClick = onEdit)
                     SettingRow(if (blocked) Icons.Filled.Check else Icons.Filled.Block, Color(0xFFD64545), if (blocked) "Unblock number" else "Block number", if (blocked) "Calls from this number are rejected" else "Reject calls from this number", onClick = { activity.setBlocked(person.number, !blocked) })
                 }
