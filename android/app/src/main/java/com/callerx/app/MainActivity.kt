@@ -524,7 +524,6 @@ object SipEngine {
             val c = Factory.instance().createCore(buildCoreConfig(soundsDir), null, ctx)
             core = c
             registerDeviceReceiver(ctx)   // re-route when a headset is plugged/unplugged
-            registerAudioDeviceCallback(ctx)  // USB-C headsets only show up here on many ROMs
             c.addListener(object : CoreListenerStub() {
                 override fun onAccountRegistrationStateChanged(core: Core, account: Account, state: RegistrationState, message: String) {
                     mainHandler.post {
@@ -678,7 +677,7 @@ object SipEngine {
                             state == Call.State.OutgoingEarlyMedia || state == Call.State.Connected ||
                             state == Call.State.StreamsRunning || state == Call.State.Paused || state == Call.State.Resuming
                         callActive = active
-                        if (active) showCallNotification() else cancelCallNotification()
+                        if (active) { showCallNotification(); startRoutePolling() } else { cancelCallNotification(); stopRoutePolling() }
                       } catch (t: Throwable) {
                         recordNonFatal("call state \${state.name}", t)
                       }
@@ -763,6 +762,7 @@ object SipEngine {
     }
 
     private fun releaseCallLocks() {
+        try { stopRoutePolling() } catch (_: Exception) { }
         try { callWakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
         callWakeLock = null
         try { callWifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
@@ -957,7 +957,7 @@ object SipEngine {
                     }, delayMs)
                 }
                 /* Some headsets only expose SCO after startBluetoothSco(), so verify and retry. */
-                if (choice == "bluetooth" || (choice == "auto" && sco != null)) {
+                if (choice == "bluetooth" || (choice == "auto" && bluetoothConnected() && choice != "earpiece")) {
                     mainHandler.postDelayed({
                         try {
                             val now = try { am.communicationDevice?.type } catch (_: Exception) { null }
@@ -1014,24 +1014,26 @@ object SipEngine {
     /* Re-routes as soon as a headset is plugged in / removed or a Bluetooth
        device connects, even in the middle of a call. */
     /* ACTION_HEADSET_PLUG does not fire for USB-C earphones on many ROMs (Xiaomi/HyperOS
-       included), so listen to AudioManager's own device list instead — this is what makes a
-       Type-C headset connect in the middle of a call. */
-    private var audioDeviceCallback: AudioManager.AudioDeviceCallback? = null
-    private fun registerAudioDeviceCallback(ctx: Context) {
-        if (audioDeviceCallback != null) return
-        try {
-            val am = ctx.getSystemService(AudioManager::class.java) ?: return
-            val cb = object : AudioManager.AudioDeviceCallback() {
-                override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
-                    mainHandler.postDelayed({ if (callActive) routeAudio(speakerPreferred) }, 500)
-                }
-                override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
-                    mainHandler.postDelayed({ if (callActive) routeAudio(speakerPreferred) }, 500)
-                }
-            }
-            am.registerAudioDeviceCallback(cb, mainHandler)
-            audioDeviceCallback = cb
-        } catch (_: Exception) { }
+       included), so while a call is running the device list is polled instead — that is what
+       makes a Type-C headset that is plugged in during a call take over the audio. */
+    private var routePolling = false
+    private val routePoll = object : Runnable {
+        override fun run() {
+            if (!callActive) { routePolling = false; return }
+            try { routeAudio(speakerPreferred) } catch (_: Exception) { }
+            mainHandler.postDelayed(this, 1500L)
+        }
+    }
+
+    private fun startRoutePolling() {
+        if (routePolling) return
+        routePolling = true
+        mainHandler.postDelayed(routePoll, 1200L)
+    }
+
+    private fun stopRoutePolling() {
+        routePolling = false
+        try { mainHandler.removeCallbacks(routePoll) } catch (_: Exception) { }
     }
 
     private var deviceReceiver: BroadcastReceiver? = null
