@@ -99,11 +99,18 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.30
-          name: CallerX Android APK v1.5.30
+          tag_name: callerx-v1.5.31
+          name: CallerX Android APK v1.5.31
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.31 — missed calls clear once you have seen them:
+            - The Calls tab badge only counts missed calls you have not looked at; opening the
+              Calls tab (or the Missed filter) clears the badge and the notification.
+            - Missed calls are collected into one notification ("3 missed calls · last from …")
+              instead of overwriting each other, and tapping it opens the Missed list instead of
+              the dial pad.
 
             v1.5.30 — crash fix + Bluetooth headset audio:
             - A failure while handling a SIP call state no longer force-closes the app: the

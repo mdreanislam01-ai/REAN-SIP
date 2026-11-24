@@ -1585,24 +1585,68 @@ object SipEngine {
     }
 
     /* Missed SIP call → its own notification channel, so it can be muted separately. */
+    /* Missed calls are collected in one list ("missed:pending") so the notification can say
+       "3 missed calls" instead of overwriting itself, and so the badge knows what is unseen. */
+    private fun pendingMissed(ctx: Context): org.json.JSONArray = try {
+        org.json.JSONArray(ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getString("missed:pending", "[]") ?: "[]")
+    } catch (_: Exception) { org.json.JSONArray() }
+
+    fun missedSeenAt(): Long = try {
+        appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getLong("missed:seenAt", 0L) ?: 0L
+    } catch (_: Exception) { 0L }
+
+    fun unseenMissedCount(): Int = try {
+        val ctx = appContext ?: return 0
+        val seen = missedSeenAt()
+        val arr = pendingMissed(ctx)
+        var n = 0
+        for (i in 0 until arr.length()) if (arr.optJSONObject(i)?.optLong("ts", 0L) ?: 0L > seen) n++
+        n
+    } catch (_: Exception) { 0 }
+
+    /** The user looked at the missed calls: forget the badge and the notification. */
+    fun clearMissed(context: Context) {
+        try {
+            context.getSharedPreferences("callerx", Context.MODE_PRIVATE).edit()
+                .putString("missed:pending", "[]")
+                .putLong("missed:seenAt", System.currentTimeMillis())
+                .apply()
+            context.getSystemService(NotificationManager::class.java)?.cancel(9101)
+            CallBridge.activity?.resumeTick?.let { CallBridge.activity?.resumeTick = it + 1 }
+        } catch (_: Exception) { }
+    }
+
     private fun showMissedCallNotification(number: String, name: String) {
         val ctx = appContext ?: return
         try {
             ensureNotificationChannels(ctx)
             val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+            val prefs = ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE)
+            val arr = pendingMissed(ctx)
+            runCatching {
+                arr.put(org.json.JSONObject().apply {
+                    put("number", number); put("name", name); put("ts", System.currentTimeMillis())
+                })
+            }
+            val recent = org.json.JSONArray()
+            for (i in maxOf(0, arr.length() - 20) until arr.length()) recent.put(arr.optJSONObject(i))
+            prefs.edit().putString("missed:pending", recent.toString()).apply()
+            val count = unseenMissedCount().coerceAtLeast(1)
             val open = Intent(ctx, MainActivity::class.java).apply {
-                putExtra("callerx_widget", "dialer")
+                putExtra("callerx_widget", "missed")
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
             }
             val pi = PendingIntent.getActivity(ctx, 9101, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val builder = androidx.core.app.NotificationCompat.Builder(ctx, "callerx_missed")
                 .setSmallIcon(android.R.drawable.sym_call_missed)
-                .setContentTitle("Missed call · ${name.ifBlank { number }}")
-                .setContentText(number)
+                .setContentTitle(if (count > 1) "$count missed calls" else "Missed call · ${name.ifBlank { number }}")
+                .setContentText(if (count > 1) "Last: ${name.ifBlank { number }} · $number" else number)
                 .setContentIntent(pi)
                 .setAutoCancel(true)
+                .setNumber(count)
                 .setPriority(androidx.core.app.NotificationCompat.PRIORITY_DEFAULT)
             nm.notify(9101, builder.build())
+            CallBridge.activity?.resumeTick?.let { CallBridge.activity?.resumeTick = it + 1 }
         } catch (_: Exception) { }
     }
 
@@ -2768,6 +2812,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Marks the missed calls as seen (badge + notification disappear). */
+    fun markMissedCallsSeen() {
+        SipEngine.clearMissed(this)
+        resumeTick++
+    }
+
+    fun unseenMissed(): Int = SipEngine.unseenMissedCount()
+
     fun setCallRoute(route: String) { SipEngine.setCallRoute(route); resumeTick++ }
 
     fun callRouteLabel(): String = when (prefs().getString("setting:callRoute", "auto") ?: "auto") {
@@ -3009,6 +3061,14 @@ private fun CallerXApp(activity: MainActivity) {
             request.startsWith("speed:") -> request.removePrefix("speed:").toIntOrNull()?.let { activity.dialSpeedSlot(it) }
             request == "recordings" -> screen = "recordings"
             request == "favorites" -> { tab = "Favorites"; screen = "home" }
+            request == "missed" -> { tab = "Calls"; filter = "Missed"; screen = "home" }
+        }
+    }
+    /* "I have seen them": half a second on the Calls tab (or the Missed filter) is enough. */
+    LaunchedEffect(tab, filter, screen, activity.resumeTick, recentCalls.size) {
+        if (screen == "home" && (tab == "Calls" || filter == "Missed") && activity.unseenMissed() > 0) {
+            delay(700)
+            activity.markMissedCallsSeen()
         }
     }
     LaunchedEffect(activity.errorMessage) { if (activity.errorMessage.isNotBlank()) showError = true }
@@ -3150,16 +3210,19 @@ private fun CallerXApp(activity: MainActivity) {
                 contentWindowInsets = WindowInsets(0, 0, 0, 0),
                 bottomBar = { NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     // missed calls from the last 24 h get a badge, like the system dialer
-                    val missedCount = remember(recentCalls) {
+                    /* Badge = missed calls you have not looked at yet (last 24 h). Opening the
+                       Calls tab or tapping the missed notification clears it. */
+                    val missedSeen = remember(activity.resumeTick, recentCalls) { activity.missedSeenAt() }
+                    val missedCount = remember(recentCalls, missedSeen) {
                         val dayAgo = System.currentTimeMillis() - 24L * 3600 * 1000
-                        recentCalls.count { it.callType == CallLog.Calls.MISSED_TYPE && it.ts >= dayAgo }
+                        recentCalls.count { it.callType == CallLog.Calls.MISSED_TYPE && it.ts >= dayAgo && it.ts > missedSeen }
                     }
                     listOf("Calls" to Icons.Filled.Call, "Favorites" to Icons.Filled.Star, "Contacts" to Icons.Filled.Contacts, "Messages" to Icons.AutoMirrored.Filled.Message, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
                         NavigationBarItem(
                             selected = tab == label,
                             onClick = { tab = label; query = "" },
                             icon = {
-                                if (label == "Calls" && missedCount > 0) {
+                                if (label == "Calls" && missedCount > 0 && tab != "Calls") {
                                     BadgedBox(badge = { Badge { Text("$missedCount", fontSize = 9.sp) } }) {
                                         Icon(icon, label, modifier = Modifier.size(20.dp))
                                     }

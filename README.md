@@ -49,6 +49,15 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.31 — missed calls disappear once you have seen them
+
+- The **Calls tab badge counts only unseen missed calls**; opening the Calls tab or the Missed
+  filter (≈0.7 s) clears the badge and cancels the missed-call notification.
+- Missed calls now go into **one aggregated notification** ("3 missed calls · Last: … · number")
+  instead of replacing each other, and tapping it opens the **Missed** list (it used to open the
+  dial pad).
+- The badge is hidden while the Calls tab itself is open, so it no longer flashes on launch.
+
 ## v1.5.30 — no more force-close during calls, working Bluetooth audio
 
 - The `onCallStateChanged` handler runs inside `mainHandler.post`; **any** exception there killed
