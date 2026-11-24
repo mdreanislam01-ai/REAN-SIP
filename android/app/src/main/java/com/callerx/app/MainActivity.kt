@@ -2378,6 +2378,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    fun pickBlockListFile() {
+        blockImportLauncher.launch(arrayOf("text/*", "application/csv", "application/octet-stream"))
+    }
+
     /** Imports one number or wildcard per line (CSV commas and spaces also work). */
     fun importBlockedList(uri: Uri) {
         try {
@@ -4634,7 +4638,7 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 onClick = { activity.exportBlockedList() })
             SettingRow(Icons.Filled.FileDownload, MaterialTheme.colorScheme.primary, "Import blocked list",
                 "One number or +88017* wildcard per line · merges with the current list",
-                onClick = { activity.blockImportLauncher.launch(arrayOf("text/*", "text/comma-separated-values", "application/octet-stream")) })
+                onClick = { activity.pickBlockListFile() })
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
                 if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
                 toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })
