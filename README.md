@@ -49,6 +49,18 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.32 — Type-C (USB-C) headset audio
+
+- **USB-C earphones now route for calls**: `USB_HEADSET`, `USB_DEVICE`, `USB_ACCESSORY`,
+  `LINE_ANALOG`, `AUX_LINE` and hearing aids are treated as headsets, `USB-C headset` is its own
+  entry in the audio picker (Settings → Audio output and in-call ⋮), and the route is re-applied
+  0.25 s / 0.8 s / 1.6 s into a call because USB audio devices attach slowly.
+- **`AudioDeviceCallback`** is registered: plugging the Type-C headset in *during* a call reroutes
+  at once. `ACTION_HEADSET_PLUG` simply never fires for USB-C on Xiaomi/HyperOS and many ROMs.
+- **Settings → Audio diagnostics**: lists mode, SCO state, communication device and every output /
+  input device with its type and product name — shareable, so a silent headset can be diagnosed
+  from the phone itself.
+
 ## v1.5.31 — missed calls disappear once you have seen them
 
 - The **Calls tab badge counts only unseen missed calls**; opening the Calls tab or the Missed

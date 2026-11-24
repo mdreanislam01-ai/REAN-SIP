@@ -524,6 +524,7 @@ object SipEngine {
             val c = Factory.instance().createCore(buildCoreConfig(soundsDir), null, ctx)
             core = c
             registerDeviceReceiver(ctx)   // re-route when a headset is plugged/unplugged
+            registerAudioDeviceCallback(ctx)  // USB-C headsets only show up here on many ROMs
             c.addListener(object : CoreListenerStub() {
                 override fun onAccountRegistrationStateChanged(core: Core, account: Account, state: RegistrationState, message: String) {
                     mainHandler.post {
@@ -846,6 +847,86 @@ object SipEngine {
         }
     } catch (_: Exception) { false }
 
+    /* Every device type that can carry a headset/speakerphone call. USB-C earphones show up
+       as USB_HEADSET (digital), USB_DEVICE (DAC/AUX) or even WIRED_HEADPHONES on some ROMs. */
+    private val EXTERNAL_ROUTE_TYPES = setOf(
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_USB_DEVICE,
+        AudioDeviceInfo.TYPE_USB_ACCESSORY,
+        AudioDeviceInfo.TYPE_LINE_ANALOG,
+        AudioDeviceInfo.TYPE_AUX_LINE,
+        AudioDeviceInfo.TYPE_HEARING_AID
+    )
+
+    private fun communicationTarget(am: AudioManager, choice: String): AudioDeviceInfo? {
+        val devices = try { am.availableCommunicationDevices } catch (_: Exception) { emptyList<AudioDeviceInfo>() }
+        if (devices.isEmpty()) return null
+        fun pick(type: Int) = devices.firstOrNull { it.type == type }
+        val sco = pick(AudioDeviceInfo.TYPE_BLUETOOTH_SCO) ?: pick(AudioDeviceInfo.TYPE_HEARING_AID)
+        val usb = pick(AudioDeviceInfo.TYPE_USB_HEADSET)
+            ?: pick(AudioDeviceInfo.TYPE_USB_DEVICE)
+            ?: pick(AudioDeviceInfo.TYPE_USB_ACCESSORY)
+        val wired = pick(AudioDeviceInfo.TYPE_WIRED_HEADSET)
+            ?: pick(AudioDeviceInfo.TYPE_WIRED_HEADPHONES)
+            ?: pick(AudioDeviceInfo.TYPE_LINE_ANALOG)
+            ?: pick(AudioDeviceInfo.TYPE_AUX_LINE)
+        return when (choice) {
+            "speaker" -> pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) ?: devices.firstOrNull()
+            "earpiece" -> pick(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+            "bluetooth" -> sco
+            "usb" -> usb
+            "wired" -> wired ?: usb
+            else -> sco ?: (wired ?: usb) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+        }
+    }
+
+    /** Readable name for an AudioDeviceInfo type (used by the diagnostics dialog). */
+    fun audioTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "Earpiece"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Speaker"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired headset (mic)"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired headphones"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth SCO (call)"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth A2DP (music)"
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "USB device (DAC / AUX)"
+        AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USB accessory"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C headset"
+        AudioDeviceInfo.TYPE_LINE_ANALOG -> "Line analog"
+        AudioDeviceInfo.TYPE_LINE_DIGITAL -> "Line digital"
+        AudioDeviceInfo.TYPE_AUX_LINE -> "AUX line"
+        AudioDeviceInfo.TYPE_HEARING_AID -> "Hearing aid"
+        AudioDeviceInfo.TYPE_BLE_HEADSET -> "BLE headset"
+        AudioDeviceInfo.TYPE_BLE_SPEAKER -> "BLE speaker"
+        else -> "type $type"
+    }
+
+    /** Everything the phone reports about call audio — shown in Settings → Audio diagnostics. */
+    fun audioDiagnostics(): String {
+        val ctx = appContext ?: return "Audio engine not running"
+        return try {
+            val am = ctx.getSystemService(AudioManager::class.java) ?: return "AudioManager missing"
+            val sb = StringBuilder()
+            sb.appendLine("CallerX audio diagnostics")
+            sb.appendLine("Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) · ${Build.MANUFACTURER} ${Build.MODEL}")
+            sb.appendLine("preferred route: ${forcedRoute()} · speaker toggle: $speakerPreferred")
+            sb.appendLine("mode: ${am.mode} · speakerphone: ${am.isSpeakerphoneOn}")
+            sb.appendLine("bluetooth: connected=${bluetoothConnected()} hfpReady=${bluetoothCallAudioReady()}")
+            if (Build.VERSION.SDK_INT >= 31) {
+                sb.appendLine("current communication device: " + (am.communicationDevice?.let { audioTypeName(it.type) } ?: "none (Android decides)"))
+                sb.appendLine("available for calls:")
+                am.availableCommunicationDevices.forEach { sb.appendLine("  • ${audioTypeName(it.type)} — ${it.productName}") }
+            }
+            sb.appendLine("outputs:")
+            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).forEach { sb.appendLine("  • ${audioTypeName(it.type)} — ${it.productName}") }
+            sb.appendLine("inputs:")
+            am.getDevices(AudioManager.GET_DEVICES_INPUTS).forEach { sb.appendLine("  • ${audioTypeName(it.type)} — ${it.productName}") }
+            sb.toString()
+        } catch (t: Throwable) { "Diagnostics failed: ${t.message}" }
+    }
+
     fun routeAudio(preferSpeaker: Boolean) {
         speakerPreferred = preferSpeaker
         val ctx = appContext ?: return
@@ -859,21 +940,22 @@ object SipEngine {
             }
 
             if (Build.VERSION.SDK_INT >= 31) {
-                val devices = try { am.availableCommunicationDevices } catch (_: Exception) { emptyList<AudioDeviceInfo>() }
-                fun pick(type: Int) = devices.firstOrNull { it.type == type }
-                val sco = pick(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
-                val wired = pick(AudioDeviceInfo.TYPE_WIRED_HEADSET)
-                    ?: pick(AudioDeviceInfo.TYPE_WIRED_HEADPHONES)
-                    ?: pick(AudioDeviceInfo.TYPE_USB_HEADSET)
-                val target = when (choice) {
-                    "speaker" -> pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) ?: devices.firstOrNull()
-                    "earpiece" -> pick(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
-                    "bluetooth" -> sco
-                    "wired" -> wired
-                    else -> sco ?: wired ?: pick(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
-                }
+                val target = communicationTarget(am, choice)
                 if (target != null) try { am.setCommunicationDevice(target) } catch (_: Exception) { }
-                headsetActive = choice == "bluetooth" || choice == "wired" || (choice == "auto" && (sco != null || wired != null))
+                try { am.isSpeakerphoneOn = choice == "speaker" } catch (_: Exception) { }
+                headsetActive = choice == "bluetooth" || choice == "wired" ||
+                    (choice == "auto" && (target?.type ?: 0) in EXTERNAL_ROUTE_TYPES)
+                /* Attach order is not guaranteed (USB-C headsets especially): re-apply the route
+                   a few times so a headset that appears 0.3–2 s after the call still wins. */
+                listOf(250L, 800L, 1600L).forEach { delayMs ->
+                    mainHandler.postDelayed({
+                        try {
+                            if (!callActive) return@postDelayed
+                            val fresh = communicationTarget(am, choice)
+                            if (fresh != null && am.communicationDevice?.type != fresh.type) am.setCommunicationDevice(fresh)
+                        } catch (_: Exception) { }
+                    }, delayMs)
+                }
                 /* Some headsets only expose SCO after startBluetoothSco(), so verify and retry. */
                 if (choice == "bluetooth" || (choice == "auto" && sco != null)) {
                     mainHandler.postDelayed({
@@ -912,7 +994,7 @@ object SipEngine {
             fun pick(vararg names: String): AudioDevice? =
                 devices.firstOrNull { d -> names.any { n -> d.type.name.equals(n, ignoreCase = true) } }
             val bt = pick("Bluetooth", "BluetoothSco", "BluetoothA2DP")
-            val wired = pick("Headset", "Headphones", "HearingAid")
+            val wired = pick("Headset", "Headphones", "HearingAid", "USB", "USBHeadset", "Usb", "AuxLine", "Line")
             val target = when (choice) {
                 "speaker" -> pick("Speaker")
                 "earpiece" -> pick("Earpiece")
@@ -931,6 +1013,27 @@ object SipEngine {
 
     /* Re-routes as soon as a headset is plugged in / removed or a Bluetooth
        device connects, even in the middle of a call. */
+    /* ACTION_HEADSET_PLUG does not fire for USB-C earphones on many ROMs (Xiaomi/HyperOS
+       included), so listen to AudioManager's own device list instead — this is what makes a
+       Type-C headset connect in the middle of a call. */
+    private var audioDeviceCallback: AudioManager.AudioDeviceCallback? = null
+    private fun registerAudioDeviceCallback(ctx: Context) {
+        if (audioDeviceCallback != null) return
+        try {
+            val am = ctx.getSystemService(AudioManager::class.java) ?: return
+            val cb = object : AudioManager.AudioDeviceCallback() {
+                override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                    mainHandler.postDelayed({ if (callActive) routeAudio(speakerPreferred) }, 500)
+                }
+                override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                    mainHandler.postDelayed({ if (callActive) routeAudio(speakerPreferred) }, 500)
+                }
+            }
+            am.registerAudioDeviceCallback(cb, mainHandler)
+            audioDeviceCallback = cb
+        } catch (_: Exception) { }
+    }
+
     private var deviceReceiver: BroadcastReceiver? = null
     private fun registerDeviceReceiver(ctx: Context) {
         if (deviceReceiver != null) return
@@ -2828,7 +2931,8 @@ class MainActivity : ComponentActivity() {
         "speaker" -> "Speaker"
         "earpiece" -> "Phone earpiece"
         "bluetooth" -> "Bluetooth headset"
-        "wired" -> "Wired / USB headset"
+        "usb" -> "USB-C headset"
+        "wired" -> "Wired headset (3.5 mm / adapter)"
         else -> if (SipEngine.bluetoothConnected() && SipEngine.bluetoothCallAudioReady()) "Automatic · Bluetooth" else "Automatic"
     }
 
@@ -2839,10 +2943,13 @@ class MainActivity : ComponentActivity() {
         if (SipEngine.bluetoothConnected()) {
             add("bluetooth" to if (SipEngine.bluetoothCallAudioReady()) "Bluetooth headset" else "Bluetooth connected, but it has no call-audio (HFP) profile")
         }
-        add("wired" to "Wired / USB headset")
+        add("usb" to "USB-C headset")
+        add("wired" to "Wired headset (3.5 mm / adapter)")
     }
 
     fun prefsRouteChoice(): String = prefs().getString("setting:callRoute", "auto") ?: "auto"
+
+    fun audioDiagnosticsText(): String = SipEngine.audioDiagnostics()
 
     /** Android 12+ needs the runtime Bluetooth permission before a headset can carry call audio. */
     fun needsBluetoothPermission(): Boolean = Build.VERSION.SDK_INT >= 31 &&
@@ -4717,6 +4824,8 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     var showFontSize by remember { mutableStateOf(false) }
     var showPbx by remember { mutableStateOf(false) }
     var showRestoreParts by remember { mutableStateOf(false) }
+    var showAudioDiag by remember { mutableStateOf(false) }
+    var showAudioRouteSettings by remember { mutableStateOf(false) }
     var restoreParts by remember { mutableStateOf(setOf("sip", "speed", "blocked", "settings")) }
     var parkCode by remember { mutableStateOf(prefs.getString("pbx:park", "*0") ?: "*0") }
     var pickupCode by remember { mutableStateOf(prefs.getString("pbx:pickup", "*8") ?: "*8") }
@@ -4918,6 +5027,47 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 dismissButton = { TextButton(onClick = { showPbx = false }) { Text("Cancel") } }
             )
         }
+        if (showAudioRouteSettings) {
+            val selected = activity.prefsRouteChoice()
+            AlertDialog(
+                onDismissRequest = { showAudioRouteSettings = false },
+                title = { Text("Audio output") },
+                text = {
+                    Column {
+                        Text("Applied to every call until you change it. During a call the same list is in ⋮ → Audio output.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        activity.audioRouteOptions().forEach { (id, label) ->
+                            Row(Modifier.fillMaxWidth().clickable { activity.setCallRoute(id); showAudioRouteSettings = false }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = selected == id, onClick = { activity.setCallRoute(id); showAudioRouteSettings = false })
+                                Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface)
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showAudioRouteSettings = false }) { Text("Close") } }
+            )
+        }
+        if (showAudioDiag) {
+            val text = remember(showAudioDiag) { activity.audioDiagnosticsText() }
+            AlertDialog(
+                onDismissRequest = { showAudioDiag = false },
+                title = { Text("Audio diagnostics") },
+                text = {
+                    Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) {
+                        Text(text, fontSize = 10.5.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        try {
+                            val share = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }
+                            activity.startActivity(Intent.createChooser(share, "Share audio diagnostics"))
+                        } catch (_: Exception) { }
+                    }) { Text("Share") }
+                },
+                dismissButton = { TextButton(onClick = { showAudioDiag = false }) { Text("Close") } }
+            )
+        }
         if (showRestoreParts) {
             AlertDialog(
                 onDismissRequest = { showRestoreParts = false },
@@ -5028,6 +5178,12 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
                 if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
                 toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })
+            SettingRow(Icons.Filled.Headset, MaterialTheme.colorScheme.primary, "Audio output",
+                "Now: ${activity.callRouteLabel()} · tap to choose (also shown in the in-call ⋮ menu)",
+                onClick = { showAudioRouteSettings = true })
+            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio diagnostics",
+                "Lists every speaker / USB-C / Bluetooth device Android reports — share it if a headset stays silent",
+                onClick = { showAudioDiag = true })
             if (Build.VERSION.SDK_INT >= 31) SettingRow(Icons.Filled.Bluetooth, MaterialTheme.colorScheme.primary, "Bluetooth call audio",
                 if (activity.needsBluetoothPermission()) "Permission needed · tap to allow headset calls" else "Allowed · headsets can carry call audio",
                 onClick = { activity.requestBluetoothPermission() })

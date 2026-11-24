@@ -99,11 +99,21 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.31
-          name: CallerX Android APK v1.5.31
+          tag_name: callerx-v1.5.32
+          name: CallerX Android APK v1.5.32
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.32 — USB-C (Type-C) headset audio:
+            - USB-C earphones are now routed for calls: USB_HEADSET / USB_DEVICE / USB_ACCESSORY /
+              AUX / LINE types are all treated as headsets, and the route is re-applied 0.25 s,
+              0.8 s and 1.6 s after a call starts because USB audio devices appear late.
+            - AudioManager's AudioDeviceCallback is registered, so plugging the Type-C headset in
+              the middle of a call reroutes immediately (ACTION_HEADSET_PLUG never fires for USB-C
+              on Xiaomi/HyperOS and many other ROMs).
+            - "USB-C headset" is a first-class choice in the audio picker, and Settings has an
+              audio diagnostics screen that lists every device Android reports (shareable).
 
             v1.5.31 — missed calls clear once you have seen them:
             - The Calls tab badge only counts missed calls you have not looked at; opening the
