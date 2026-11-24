@@ -39,8 +39,11 @@ jobs:
           result=$?
           if [ "$result" -ne 0 ]; then
             tail -n 25 build.log
-            summary=$(grep -E -i -A2 -B1 'e: |error:|unresolved reference|type mismatch|cannot infer|overload resolution|not enough information|cannot access|what went wrong|execution failed' build.log | head -n 30 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
-            echo "::error::$summary"
+            errors=$(grep -E -i 'e: file|e: [a-z]|error:|unresolved reference|type mismatch|cannot infer|overload resolution|not enough information' build.log | sed 's#https://[^ ]*##g' | cut -c1-220)
+            head_summary=$(printf '%s\n' "$errors" | head -n 10 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            tail_summary=$(printf '%s\n' "$errors" | tail -n 10 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            echo "::error::first errors: $head_summary"
+            echo "::error::last errors: $tail_summary"
             exit "$result"
           fi
           tail -n 25 build.log

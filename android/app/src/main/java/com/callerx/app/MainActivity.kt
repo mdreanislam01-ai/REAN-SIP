@@ -1230,7 +1230,7 @@ object SipEngine {
         poorQualitySamples = 0
     }
 
-    /* ---------- DTMF keypad during a call (IVR menus, PIN codes) ----------
+    /* ---------- DTMF keypad during a call (IVR menus, PIN codes) ---------- */
     fun sendDtmf(digit: Char) {
         val call = core?.currentCall ?: activeCall ?: return
         try { call.sendDtmf(digit) } catch (_: Exception) { }
