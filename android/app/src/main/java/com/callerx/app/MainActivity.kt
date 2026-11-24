@@ -2531,6 +2531,11 @@ class MainActivity : ComponentActivity() {
             callState = SipEngine.lastCallState
             callUiRequested = true
         }
+        /* Recreated while ringing/in a call (lock screen, task swipe): come back on top of
+           the keyguard instead of hiding behind it. */
+        if (callUiRequested || SipEngine.callActive || TelecomCallBridge.currentCall != null) {
+            applyCallWindow(true)
+        }
         /* The engine runs in the foreground service, not here: locking the
            phone or destroying this Activity must never stop the mic/call. */
         startKeepAliveService()
@@ -2611,6 +2616,64 @@ class MainActivity : ComponentActivity() {
     fun mergeSipCalls(): Boolean = SipEngine.mergeCalls()
 
     /* ---------- Call metrics: duration, quality, network, recording ---------- */
+    /* ---------- Lock screen behaviour during calls ---------- */
+
+    /** Settings → "Show calls over the lock screen" (default on). */
+    fun callOverLockEnabled(): Boolean = try {
+        prefs().getBoolean("setting:callOverLock", true)
+    } catch (_: Exception) { true }
+
+    /** Settings → "Skip app PIN during calls" (default on). */
+    fun pinSkipDuringCall(): Boolean = try {
+        prefs().getBoolean("setting:pinSkipCall", true)
+    } catch (_: Exception) { true }
+
+    /**
+     * Shows this Activity above the keyguard and wakes the screen while a call is live.
+     * A secure lock (PIN/pattern/fingerprint) is never bypassed: on those the system still
+     * asks the owner to unlock, we only make sure the call UI is what appears on top.
+     */
+    fun applyCallWindow(on: Boolean) {
+        try {
+            if (Build.VERSION.SDK_INT >= 27) {
+                setShowWhenLocked(on)
+                setTurnScreenOn(on)
+            } else {
+                @Suppress("DEPRECATION")
+                if (on) window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+                else window.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+            }
+            if (on && Build.VERSION.SDK_INT >= 26) {
+                val km = getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
+                if (km?.isKeyguardLocked == true && !km.isDeviceSecure) {
+                    /* requestDismissKeyguard only removes a non-secure keyguard; on a secure
+                       one Android shows the normal unlock prompt. Nothing is bypassed. */
+                    km.requestDismissKeyguard(this, null)
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** True when Android 14+ lets CallerX use full-screen call alerts. */
+    fun fullScreenCallAlertsAllowed(): Boolean = try {
+        if (Build.VERSION.SDK_INT >= 34) {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager).canUseFullScreenIntent()
+        } else true
+    } catch (_: Exception) { true }
+
+    /** Opens the system screen where the user can allow full-screen call alerts. */
+    fun openFullScreenAlertSettings() {
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, android.net.Uri.parse("package:$packageName")))
+            } else {
+                errorMessage = "Android ${Build.VERSION.RELEASE} allows full-screen call alerts automatically."
+            }
+        } catch (_: Exception) {
+            errorMessage = "Open Settings → Apps → CallerX → Notifications to allow full-screen alerts."
+        }
+    }
+
     fun callQuality(): Float = SipEngine.callQuality()
 
     fun qualityLabel(q: Float): String = when {
@@ -2864,6 +2927,7 @@ private fun CallerXApp(activity: MainActivity) {
        Icons switch to white over the coloured header and to dark over the
        light call screen, so they are always readable. */
     val view = LocalView.current
+    val overLockScreen = remember(activity.resumeTick, screen) { activity.callOverLockEnabled() }
     SideEffect {
         val win = (view.context as? android.app.Activity)?.window
         if (win != null) {
@@ -2877,9 +2941,11 @@ private fun CallerXApp(activity: MainActivity) {
             /* Call screen must show over the lock screen and keep the screen on,
                otherwise locking the phone kills the visible call UI / mic. */
             if (screen == "call") {
-                win.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                win.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                activity.applyCallWindow(overLockScreen)
             } else {
-                win.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                win.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                activity.applyCallWindow(false)
             }
         }
     }
@@ -3219,8 +3285,9 @@ private fun CallerXApp(activity: MainActivity) {
             dismissButton = { TextButton(onClick = { showWelcome = false; prefs.edit().putBoolean("permission-intro-seen", true).apply() }) { Text("Not now") } }
         )
 
-        /* PIN lock sits on top of everything (SIP calls still ring in the background). */
-        if (appPin.isNotBlank() && !unlocked) {
+        /* PIN lock sits on top of everything except a live call: an incoming or ongoing call
+           must never be hidden behind the app-lock keypad. */
+        if (appPin.isNotBlank() && !unlocked && !(screen == "call" && activity.pinSkipDuringCall())) {
             LockScreen(
                 pinLength = appPin.length,
                 input = pinInput,
@@ -4739,6 +4806,17 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
                 if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
                 toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })
+            SettingRow(Icons.Filled.LockOpen, MaterialTheme.colorScheme.primary, "Show calls over the lock screen",
+                if (activity.callOverLockEnabled()) "On · a ringing call appears on top of the lock screen" else "Off · calls only show as a notification",
+                toggle = true, checked = activity.callOverLockEnabled(),
+                onClick = { prefs.edit().putBoolean("setting:callOverLock", !activity.callOverLockEnabled()).apply(); activity.resumeTick++ })
+            SettingRow(Icons.Filled.Pin, MaterialTheme.colorScheme.primary, "Skip app PIN during calls",
+                if (activity.pinSkipDuringCall()) "On · the PIN keypad never covers an incoming call" else "Off · the PIN keypad also covers calls",
+                toggle = true, checked = activity.pinSkipDuringCall(),
+                onClick = { prefs.edit().putBoolean("setting:pinSkipCall", !activity.pinSkipDuringCall()).apply(); activity.resumeTick++ })
+            SettingRow(Icons.Filled.NotificationsActive, MaterialTheme.colorScheme.primary, "Full-screen call alerts",
+                if (activity.fullScreenCallAlertsAllowed()) "Allowed · Android shows the call screen instantly" else "Blocked by Android · tap to allow (needed for calls on the lock screen)",
+                onClick = { activity.openFullScreenAlertSettings() })
             SettingRow(Icons.Filled.BugReport, MaterialTheme.colorScheme.primary, "Crash log",
                 if (activity.hasCrashLog()) "A crash was recorded · tap to share the log" else "No crash recorded",
                 onClick = { activity.shareCrashLog() })

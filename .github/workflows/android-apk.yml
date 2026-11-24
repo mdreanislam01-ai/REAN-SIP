@@ -99,11 +99,19 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.28
-          name: CallerX Android APK v1.5.28
+          tag_name: callerx-v1.5.29
+          name: CallerX Android APK v1.5.29
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.29 — calls on the lock screen:
+            - MainActivity declares showWhenLocked + turnScreenOn and applies them with
+              setShowWhenLocked()/setTurnScreenOn(), so a ringing call appears on top of the
+              lock screen instead of staying behind it (secure locks still ask to unlock).
+            - The app-lock PIN no longer covers an incoming or ongoing call.
+            - New Settings rows: "Show calls over the lock screen", "Skip app PIN during
+              calls" and "Full-screen call alerts" (opens the Android 14+ permission screen).
 
             v1.5.28 — call screen stays, cleaner controls, contact search in the log:
             - The call screen can no longer slip back to the home tab while a call runs
