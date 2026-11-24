@@ -2662,6 +2662,10 @@ private fun CallerXApp(activity: MainActivity) {
                 } }
             ) { padding ->
                 Column(Modifier.fillMaxSize().padding(padding)) {
+                    /* Starred contacts — used by the search counter, the Favorites tab and Contacts. */
+                    val favoriteNumbers = remember(contacts, activity.resumeTick) {
+                        contacts.filter { c -> val norm = c.number.filter { it.isDigit() || it == '+' }; prefs.getBoolean("fav:$norm", false) }.map { it.number }.toSet()
+                    }
                     if (tab != "Settings") {
                         /* Header = CallerX / SIM 1 · SIM 2 · SIP / full-width search bar,
                            with only "Online" on the right (see HomeHeader). */
@@ -2692,10 +2696,6 @@ private fun CallerXApp(activity: MainActivity) {
                             resultText = if (debouncedQuery.isBlank()) "" else "$hits result${if (hits == 1) "" else "s"}",
                             onSip = { showSipInfo = true }
                         )
-                    }
-                    /* Starred contacts (used by the Favorites tab and the Contacts header). */
-                    val favoriteNumbers = remember(contacts, activity.resumeTick) {
-                        contacts.filter { c -> val norm = c.number.filter { it.isDigit() || it == '+' }; prefs.getBoolean("fav:$norm", false) }.map { it.number }.toSet()
                     }
                     when (tab) {
                         "Calls" -> CallsTab(recentCalls, photoByNumber, filter, { filter = it }, debouncedQuery,
