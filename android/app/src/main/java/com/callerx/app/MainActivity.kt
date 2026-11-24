@@ -1928,11 +1928,20 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Applies a CallerX backup JSON document and returns how many keys were restored. */
-    private fun applyBackupJson(json: String): Int {
+    /** Which part of a backup a preference key belongs to (selective restore). */
+    private fun backupGroupOf(key: String): String = when {
+        key == "sip_accounts" || key == "sip_log" || key == "quality:log" -> "sip"
+        key.startsWith("speed:") || key.startsWith("fav:") || key == "speeddial" -> "speed"
+        key == "blocked" || key.startsWith("block:") -> "blocked"
+        else -> "settings"
+    }
+
+    private fun applyBackupJson(json: String, only: Set<String>? = null): Int {
         val root = JSONObject(json)
         val values = root.optJSONObject("prefs") ?: JSONObject()
         val editor = callerxPrefs().edit()
         for (key in values.keys()) {
+            if (only != null && backupGroupOf(key) !in only) continue
             val entry = values.optJSONObject(key) ?: continue
             when (entry.optString("t")) {
                 "b" -> editor.putBoolean(key, entry.optBoolean("v"))
@@ -2099,22 +2108,30 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Restores a backup document, decrypting it first when it was encrypted. */
-    fun restoreBackupText(text: String, password: String = ""): Boolean {
+    fun restoreBackupText(text: String, password: String = "", only: Set<String>? = null): Boolean {
         return try {
             val json = if (isEncryptedBackup(text)) {
                 val pw = password.ifBlank { callerxPrefs().getString("backup:password", "").orEmpty() }
                 if (pw.isBlank()) { errorMessage = "This backup is password-protected. Type its password to restore it."; return false }
                 decryptPayload(text, pw)
             } else text
-            val count = applyBackupJson(json)
+            val count = applyBackupJson(json, only)
             SipEngine.applyAccounts(this)
             resumeTick++
-            errorMessage = "Restored $count settings" + if (isEncryptedBackup(text)) " from the encrypted backup." else "."
+            val scope = if (only == null) "settings" else "settings (${only.joinToString(", ")})"
+            errorMessage = "Restored $count $scope" + if (isEncryptedBackup(text)) " from the encrypted backup." else "."
             count > 0
         } catch (e: Exception) {
             errorMessage = "Restore failed: ${e.message ?: "wrong password or damaged file"}"
             false
         }
+    }
+
+    /** Selective restore: newest backup, only the chosen groups ("sip", "speed", "blocked", "settings"). */
+    fun restoreSelected(groups: Set<String>): Boolean {
+        val text = latestBackupText()
+        if (text == null) { errorMessage = "No backup file found on this phone yet."; return false }
+        return restoreBackupText(text, only = groups)
     }
 
     /** Newest local backup text (plain or encrypted), used by the "Restore" button. */
@@ -2807,6 +2824,10 @@ private fun CallerXApp(activity: MainActivity) {
     }
 
     MaterialTheme(colorScheme = scheme) {
+      /* Phones get the full width; tablets and landscape get a centred 520dp column
+         so the dialer and lists never stretch across a 10" screen. */
+      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+        Box(Modifier.fillMaxHeight().widthIn(max = 520.dp).fillMaxWidth()) {
         if (screen == "call") {
             NativeCallScreen(activity, dark, onTheme = { dark = it; prefs.edit().putBoolean("dark", it).apply() },
                 onAnswer = { if (TelecomCallBridge.currentCall != null) activity.answerCellCall() else activity.answerCall() },
@@ -3135,7 +3156,9 @@ private fun CallerXApp(activity: MainActivity) {
                 onBackspace = { pinInput = pinInput.dropLast(1) }
             )
         }
-    }
+            }
+      }
+}
 }
 
 @Composable
@@ -4256,6 +4279,8 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     var passwordDraft by remember { mutableStateOf(prefs.getString("backup:password", "") ?: "") }
     var showFontSize by remember { mutableStateOf(false) }
     var showPbx by remember { mutableStateOf(false) }
+    var showRestoreParts by remember { mutableStateOf(false) }
+    var restoreParts by remember { mutableStateOf(setOf("sip", "speed", "blocked", "settings")) }
     var parkCode by remember { mutableStateOf(prefs.getString("pbx:park", "*0") ?: "*0") }
     var pickupCode by remember { mutableStateOf(prefs.getString("pbx:pickup", "*8") ?: "*8") }
     val accounts = activity.accountsList()
@@ -4456,6 +4481,35 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 dismissButton = { TextButton(onClick = { showPbx = false }) { Text("Cancel") } }
             )
         }
+        if (showRestoreParts) {
+            AlertDialog(
+                onDismissRequest = { showRestoreParts = false },
+                title = { Text("Restore parts of a backup") },
+                text = {
+                    Column {
+                        Text("Uses the newest backup on this phone and copies only what you tick. Everything else on the phone stays untouched.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        listOf("sip" to "SIP accounts, SIP history, quality log", "speed" to "Speed dials and favorites", "blocked" to "Blocked numbers", "settings" to "App settings (theme, dialer, forwarding, PIN…)").forEach { (id, label) ->
+                            Row(Modifier.fillMaxWidth().clickable {
+                                restoreParts = if (id in restoreParts) restoreParts - id else restoreParts + id
+                            }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(checked = id in restoreParts, onCheckedChange = {
+                                    restoreParts = if (it) restoreParts + id else restoreParts - id
+                                })
+                                Text(label, fontSize = 12.5.sp, modifier = Modifier.padding(start = 4.dp))
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(enabled = restoreParts.isNotEmpty(), onClick = {
+                        activity.restoreSelected(restoreParts)
+                        showRestoreParts = false
+                    }) { Text("Restore") }
+                },
+                dismissButton = { TextButton(onClick = { showRestoreParts = false }) { Text("Cancel") } }
+            )
+        }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
             SectionTitle("ACCOUNT")
             SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "Profile & Backup Account", if (activity.googleBackupAccount().isNotBlank()) "Google · ${activity.googleBackupAccount()}" else "Profile, Google account backup & phone storage", onProfile)
@@ -4525,6 +4579,9 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.Lock, MaterialTheme.colorScheme.primary, "Backup password",
                 if (activity.backupPasswordSet()) "On · new backups are encrypted (AES-256-GCM)" else "Off · backups are plain JSON",
                 onClick = { showBackupPassword = true })
+            SettingRow(Icons.Filled.RestorePage, MaterialTheme.colorScheme.primary, "Restore parts of a backup",
+                "Pick SIP accounts, speed dials, blocked numbers or settings only",
+                onClick = { showRestoreParts = true })
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
                 if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
                 toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })

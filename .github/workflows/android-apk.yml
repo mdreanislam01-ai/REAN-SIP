@@ -47,10 +47,19 @@ jobs:
             exit "$result"
           fi
           tail -n 25 build.log
+      # ABI splits produce app-universal-debug.apk; keep the historical app-debug.apk
+      # name so existing download links and the release notes stay valid.
+      - name: Normalise split APK names
+        run: |
+          cd android/app/build/outputs/apk/debug
+          if [ -f app-universal-debug.apk ]; then cp app-universal-debug.apk app-debug.apk; fi
+          ls -l
       - uses: actions/upload-artifact@v4
         with:
           name: CallerX-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
           if-no-files-found: error
 
       # ---- Signed release APK + Play-ready AAB ----
@@ -75,7 +84,7 @@ jobs:
           ls -l android/app/build/outputs/apk/release android/app/build/outputs/bundle/release
           echo "--- signature check ---"
           "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools/35.0.0/apksigner" verify --print-certs \
-            android/app/build/outputs/apk/release/app-release.apk | head -n 12
+            android/app/build/outputs/apk/release/app-universal-release.apk | head -n 12
       - uses: actions/upload-artifact@v4
         with:
           name: CallerX-release
@@ -86,11 +95,19 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.24
-          name: CallerX Android APK v1.5.24
+          tag_name: callerx-v1.5.25
+          name: CallerX Android APK v1.5.25
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.25 — sizes, selective restore, tablet layout:
+            - Per-ABI APKs: the release now also ships app-arm64-v8a-debug.apk (~40% smaller
+              download for modern phones) next to the universal app-debug.apk.
+            - Selective restore: restore only SIP accounts/history, speed dials & favorites,
+              blocked numbers or app settings from the newest backup.
+            - Wide-screen layout: everything is centred in a 520dp column on tablets and in
+              landscape instead of stretching edge to edge.
 
             v1.5.24 — encryption, screening, appearance:
             - Encrypted backups: optional AES-256-GCM password (PBKDF2 120k) for every new backup.
@@ -250,5 +267,7 @@ jobs:
             - Dialpad rebuilt like Google Dialer: ripple keys, DTMF tones, haptics, live
               contact suggestions while typing, Paste/Copy/Clear, + key, and a backspace
               that only appears when there is a number to delete.
-          files: android/app/build/outputs/apk/debug/app-debug.apk
+          files: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
           overwrite_files: true

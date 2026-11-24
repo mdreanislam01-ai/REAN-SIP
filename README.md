@@ -49,6 +49,14 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.25 — smaller downloads, selective restore, wide screens
+
+- **Per-ABI APKs**: every release now carries `app-arm64-v8a-debug.apk` (modern phones, much
+  smaller download) alongside the universal `app-debug.apk`.
+- **Selective restore**: Settings → *Restore parts of a backup* → tick SIP accounts/history,
+  speed dials & favorites, blocked numbers and/or app settings.
+- **Wide-screen / landscape layout**: the whole UI is capped to a centred 520 dp column.
+
 ## v1.5.24 — encrypted backups, call screening, appearance
 
 - **Encrypted backups**: optional password → every new backup is AES-256-GCM with
