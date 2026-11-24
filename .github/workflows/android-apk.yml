@@ -52,11 +52,23 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.17
-          name: CallerX Android APK v1.5.17
+          tag_name: callerx-v1.5.18
+          name: CallerX Android APK v1.5.18
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.18 — privacy & convenience pack:
+            - Swipe a recent call right to call, left to delete it from history.
+            - App lock: 4-digit PIN hides the app content (Settings → App lock (PIN)).
+            - Missed calls get a "Call back" action; quick-reply SMS templates; share contact as vCard.
+            - Incoming vibration style: short / double / long.
+            - Call log filter chips now include SIP, SIM 1 and SIM 2.
+            - Blocked numbers accept wildcards such as +88017*.
+            - Speed dial manager: Settings → Speed dial shows and clears the 1-9 mappings.
+            - Several SIP accounts: the route sheet lets you pick which account places the call.
+            - Real call recording (Call.startRecording with a file in the app folder) is wired to the
+              Record button and to "Auto Call Recording".
 
             v1.5.17 — headset audio fixed + add call / conference:
             - Headphone audio now works during SIP calls: routing uses the Android
