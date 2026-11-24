@@ -41,13 +41,72 @@ The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow files runs the **Build CallerX APK** GitHub Actions workflow. It builds the debug APK, uploads it as a workflow artifact, and publishes it to the rolling GitHub release:
 
-**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.11>**
+**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.15>**
 
 ## Notes
 
 - This is a debug build, signed with the default debug key. For Play Store distribution a release keystore is required.
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
+
+## v1.5.16 — polish pack
+
+- Contact photos in recents and contacts (initials as fallback), missed-call badge (24 h)
+  on the Calls tab, live mm:ss timer in the ongoing-call notification.
+- Tap the header chip for a SIP status popup (account, server:port, transport, state).
+- Speed dial: ⋮ → **Speed dial** on a recent call, then hold that key in the dial pad.
+- Recent searches appear as chips under the search bar.
+- Dark mode uses a darker shade of the accent for the header.
+- Registration retries back off 10 s → 20 s → 40 s → 80 s (max 120 s), resetting after success.
+- Silent weekly backup to phone storage.
+
+### Release signing (optional)
+
+Copy `keystore.properties.example` to `keystore.properties` in the repo root and point it at
+your keystore; `./gradlew assembleRelease` then produces a properly signed APK. Both the
+properties file and `*.jks` are git-ignored. Without it, release builds fall back to the
+debug key.
+
+## v1.5.15 — SIP account chip, Profile & Backup, calmer scrolling
+
+- Header chip shows the SIP account name (green dot = registered, amber = connecting) and
+  "Offline" when no account is added.
+- Settings → **Profile & Backup Account** with real backup: Google account picker (registered
+  with Android's Google Drive backup) and a JSON file in `Downloads/CallerX`, plus Restore.
+- Calmer fling physics on call history / contacts / messages so scrolling stops where you
+  want it.
+
+## v1.5.14 — dialpad header in the app theme colour
+
+- The top strip of the dial pad (status bar + "CallerX" row) is painted with the theme accent
+  instead of white, with white status-bar icons — the same treatment as the home header.
+
+## v1.5.13 — dialpad number box above the keypad
+
+- The typed number lives in a rounded box **just above the keypad** (copy left, backspace
+  right) instead of at the very top of the screen; long-press the box to paste a copied
+  number, and the extra Paste button in the top bar is gone.
+- A light "CallerX" heading stays visible at the top next to the back arrow.
+- Contact suggestions keep listing matching numbers between the heading and the number box.
+- Status bar icons follow the screen colour (dark icons on the light dialer, white on the
+  coloured header), and the legacy `systemUiVisibility` flags no longer fight the modern
+  insets controller.
+
+## v1.5.12 — header, status bar and Truecaller-style dialpad
+
+- Header is three clean lines: **CallerX**, then **SIM 1 · SIM 2 · SIP**, then a single
+  full-width search bar inside the coloured header (it was previously hidden behind a
+  magnifier toggle and overlapped the title). The right side shows only **Online** /
+  **Offline**.
+- The status bar (clock / Wi-Fi / battery) is painted with the app theme colour instead of
+  a white strip, with white icons; the dialer keeps a light bar with dark icons. The
+  duplicate status-bar padding on Android 15 that left a white gap is gone.
+- Dialpad now follows Truecaller: paste icon top-right, copy icon left of the number,
+  backspace right of it (long-press clears all), matched contact name above the number,
+  flat keys with DTMF tones + haptics, and a centred green call button.
+- Call-history filter chips scroll sideways, so the **Clear** button no longer wraps.
+- Audio routing honours a connected Bluetooth / wired headset (SCO started) and the
+  speaker toggle.
 
 ## v1.5.11 — lock-screen mic, network drops, search & dialpad
 

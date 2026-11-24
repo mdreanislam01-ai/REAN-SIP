@@ -1,8 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+/* Release signing: drop a keystore.properties (git-ignored) in the repo root to
+   sign release builds with your own key; without it release uses the debug key. */
+val keystorePropsFile = rootProject.file("keystore.properties")
+val hasKeystore = keystorePropsFile.exists()
+val keystoreProps = Properties().apply { if (hasKeystore) keystorePropsFile.inputStream().use { load(it) } }
 
 android {
     namespace = "com.callerx.app"
@@ -12,9 +20,27 @@ android {
         applicationId = "com.callerx.app"
         minSdk = 23
         targetSdk = 35
-        versionCode = 30
-        versionName = "1.5.11"
+        versionCode = 36
+        versionName = "1.5.17"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+    }
+
+    signingConfigs {
+        if (hasKeystore) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = if (hasKeystore) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
+        }
     }
 
     buildFeatures { compose = true }
