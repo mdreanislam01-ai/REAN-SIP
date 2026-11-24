@@ -49,6 +49,29 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.30 — no more force-close during calls, working Bluetooth audio
+
+- The `onCallStateChanged` handler runs inside `mainHandler.post`; **any** exception there killed
+  the app ("CallerX force closed due to an internal error"). It is now fully guarded and logged
+  to the shareable error log (Settings → Crash log).
+- **Audio routing rewritten**: a manual route (⋮ → *Audio output*: automatic / earpiece /
+  speaker / Bluetooth / wired) always wins, liblinphone only overrides when it actually lists
+  the headset, Bluetooth SCO is retried when the headset appears late, and routing starts after
+  the streams are up instead of while the audio HAL is still negotiating.
+- **Settings → Bluetooth call audio** requests the Android 12+ permission; the in-call picker
+  warns when the headset is music-only (A2DP, no HFP) — that case cannot carry call audio.
+- **Network handover**: Wi-Fi ⇄ mobile data re-registers SIP quietly and never during a call.
+
+## v1.5.29 — a ringing call shows up on the lock screen
+
+- `MainActivity` now declares `android:showWhenLocked`/`turnScreenOn` and applies
+  `setShowWhenLocked()`/`setTurnScreenOn()` + `requestDismissKeyguard()` for swipe locks, so a
+  call appears *over* the lock screen instead of leaving the phone on the lock screen.
+  A secure lock (PIN/pattern/biometric) is never bypassed — Android still asks the owner.
+- The app-lock PIN keypad no longer covers an incoming or ongoing call.
+- Settings → *Calls & lock screen*: **Show calls over the lock screen**, **Skip app PIN during
+  calls**, and **Full-screen call alerts** (opens the Android 14+ full-screen-intent screen).
+
 ## v1.5.28 — the call screen stays put, fewer buttons, contact search
 
 - **Call screen no longer disappears** while calling: the screen state now survives Activity

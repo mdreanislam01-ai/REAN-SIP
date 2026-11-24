@@ -20,8 +20,8 @@ android {
         applicationId = "com.callerx.app"
         minSdk = 23
         targetSdk = 35
-        versionCode = 47
-        versionName = "1.5.28"
+        versionCode = 49
+        versionName = "1.5.30"
         /* Keep the universal APK to two ABIs: without this the universal build packs all
            four liblinphone ABIs and grows to ~170 MB. */
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
