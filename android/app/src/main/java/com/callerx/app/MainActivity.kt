@@ -752,7 +752,7 @@ object SipEngine {
                 params.setServerAddress(server)
                 params.setRegisterEnabled(a.autoBoot)
                 try { params.setExpires(300) } catch (_: Exception) { }
-                if (encryptMedia) try { params.mediaEncryption = MediaEncryption.SRTP } catch (_: Exception) { }
+                /* Media encryption is negotiated per call (see startSipCall / answerCall). */
                 val account = c.createAccount(params) ?: continue
                 c.addAuthInfo(auth)
                 c.addAccount(account)
@@ -942,8 +942,12 @@ object SipEngine {
             if (a != null) { a.activeCallName = name; a.activeNumber = clean; a.callConnected = false }
             /* Optional: force a specific SIP account when several are registered. */
             val chosen = if (accountIndex >= 0) try { c.accountList.getOrNull(accountIndex) } catch (_: Exception) { null } else null
-            val params = if (chosen != null) try { c.createCallParams(null) } catch (_: Exception) { null } else null
-            if (params != null && chosen != null) try { params.account = chosen } catch (_: Exception) { }
+            val encryptMedia = appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getBoolean("setting:srtp", false) ?: false
+            val params = try { c.createCallParams(null) } catch (_: Exception) { null }
+            if (params != null) {
+                if (chosen != null) try { params.account = chosen } catch (_: Exception) { }
+                if (encryptMedia) try { params.setMediaEncryption(MediaEncryption.SRTP) } catch (_: Exception) { }
+            }
             val call = if (params != null) {
                 try { c.inviteAddressWithParams(address, params) } catch (_: Exception) { c.inviteAddress(address) }
             } else c.inviteAddress(address)
@@ -1029,7 +1033,23 @@ object SipEngine {
         }
     }
 
-    fun answerCall() { stopIncomingVibration(); try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { CallBridge.activity?.errorMessage = "Could not answer call: ${e.message}" } }
+    fun answerCall() {
+        stopIncomingVibration()
+        try {
+            val c = core ?: return
+            val call = c.currentCall ?: return
+            val encryptMedia = appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getBoolean("setting:srtp", false) ?: false
+            var answered = false
+            if (encryptMedia) {
+                val params = try { c.createCallParams(call) } catch (_: Exception) { null }
+                if (params != null) {
+                    try { params.setMediaEncryption(MediaEncryption.SRTP) } catch (_: Exception) { }
+                    try { answered = call.acceptWithParams(params) == 0 } catch (_: Exception) { answered = false }
+                }
+            }
+            if (!answered) call.accept()
+        } catch (e: Exception) { CallBridge.activity?.errorMessage = "Could not answer call: ${e.message}" }
+    }
     fun endCall() {
         stopIncomingVibration()
         try {
