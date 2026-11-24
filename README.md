@@ -41,13 +41,152 @@ The debug APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow files runs the **Build CallerX APK** GitHub Actions workflow. It builds the debug APK, uploads it as a workflow artifact, and publishes it to the rolling GitHub release:
 
-**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.11>**
+**<https://github.com/mdreanislam01-ai/REAN-SIP/releases/tag/callerx-v1.5.15>**
 
 ## Notes
 
 - This is a debug build, signed with the default debug key. For Play Store distribution a release keystore is required.
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
+
+## v1.5.23 — forwarding, favorites, quality report, 7-day backups
+
+- **Call forwarding** (Settings → Call forwarding): forward all / when busy / when unanswered,
+  with a 10–60 s no-answer timer. Implemented with `Call.redirectTo()` (SIP **302 Moved
+  Temporarily**) — honest note: the SIP server must honour 302; providers that do not need
+  their own star codes.
+- **Favorites tab** in the bottom bar: starred contacts only, with call, message and
+  un-star actions; empty state explains how to star a contact.
+- **Call-log grouping**: one row per number with a `· N calls` counter (newest entry wins),
+  filters and swipe actions unchanged.
+- **Call quality report** (Settings → Call quality report): for the last 30 SIP calls it shows
+  a MOS estimate plus the real RTCP values — round-trip delay, jitter buffer, remote/local
+  packet loss, bandwidth up/down and the SRTP suite in use. MOS is computed from those
+  numbers, not measured by a probe.
+- **Recording player**: seek bar with live position/duration and 0.5× / 1× / 1.5× / 2× speed
+  (`PlaybackParams`) next to play, share and delete.
+- **Versioned automatic backups**: the chosen folder now receives `callerx-autobackup.json`
+  (used for restore) plus dated snapshots, keeping the newest 7 and pruning older ones.
+
+## v1.5.22 — call waiting, recordings, widget, auto restore
+
+- **Call waiting**: a second incoming SIP call no longer overwrites the live call screen —
+  a "Call waiting" card shows *Answer & hold* / *Decline*, the current call is paused
+  automatically and the ringtone stops as soon as the waiting call is handled.
+- **Call recordings screen** (Settings → Call recordings): play, share (FileProvider) and
+  delete recordings inside the app; nothing leaves the phone unless you share it.
+- **Adaptive audio**: if `currentQuality` stays below ~1.6 for two samples the live call is
+  renegotiated with `setLowBandwidthEnabled(true)` so it stops breaking up. G.729 is
+  patent-encumbered and not part of the open-source linphone build, so the fallback is
+  low-bandwidth narrowband rather than a specific codec. Settings → *Adaptive audio*.
+- **Home-screen widget** (`CallerXWidgetProvider`) with live SIP status and three shortcuts
+  (dial pad, speed dial 1, voicemail) plus a **Quick Settings tile** (`CallerXDialTile`).
+  The engine writes `status:online` / `status:account` to preferences and repaints the widget
+  on every registration change.
+- **Automatic backup & restore**: pick a folder once (Google Drive, Dropbox, phone storage)
+  via the system folder picker with persisted access. `callerx-autobackup.json` is refreshed
+  at most every 6 hours, and picking that folder on a new install restores the settings
+  automatically (`applyBackupJson`).
+- **Signed release**: `./scripts/make-keystore.sh` creates the upload keystore and prints the
+  four GitHub secrets; CI then builds `app-release.apk` + `.aab`, runs `apksigner verify`
+  and uploads both. Without the secrets the debug APK is still published.
+
+## v1.5.21 — in-call extras, missed-call handling
+
+- **DTMF keypad during a call**: press *Keypad* on the in-call screen and every tone is sent
+  to the other side (IVR menus, conference PINs, extension dialling). Sent digits are shown
+  with Clear/Close; tones use RFC 2833 events so no audio is clipped.
+- **Call transfer**: *Transfer* → enter a number or SIP address → **Blind** (REFER, you leave
+  the call) or, when two calls exist via *Add call*, **Attended** (both remote parties are
+  joined and CallerX drops out).
+- **Missed-call auto-SMS**: when a SIP call is missed (or declined), a normal SMS reply is
+  sent to the caller. Message text is editable in Settings → Missed calls & voicemail; SMS
+  sending permission is requested only when the toggle is switched on. Blocked numbers never
+  get a reply.
+- **Voicemail**: save your voicemail number and hold **1** on the dial pad to call it, like a
+  stock dialer (a stored speed dial on 1 still wins).
+- SRTP is now applied per call (outgoing params + `acceptWithParams` on answer) because
+  `AccountParams` in linphone-sdk 5.4 has no media-encryption setter.
+
+## v1.5.18 — privacy & convenience pack
+
+- Swipe a recent call right to call it, left to delete it from the call log.
+- App lock with a 4-digit PIN (Settings → App lock (PIN)); calls still ring behind the lock.
+- Missed calls get **Call back**; quick-reply templates; share a contact as vCard.
+- Incoming vibration style: short / double / long.
+- Call-log filter chips now include **SIP**, **SIM 1**, **SIM 2**; blocked numbers accept
+  wildcards such as `+88017*`.
+- Speed dial manager (Settings → Speed dial) and a per-call SIP account picker when several
+  accounts are enabled.
+- End call hangs up every call, including a merged conference.
+
+## v1.5.17 — headset audio + add call / conference
+
+- Headphone audio works during SIP calls: routing uses the Android `AudioManager`
+  communication devices (Bluetooth SCO → wired/USB headset → earpiece → speaker) and
+  re-routes automatically when a headset is plugged or a Bluetooth device connects mid-call.
+  A "Headset" chip confirms the active route on the call screen.
+- **Add call** holds the current call and dials a second number; with two calls the screen
+  lists both with **Swap** and **Merge** (local SIP conference).
+
+## v1.5.16 — polish pack
+
+- Contact photos in recents and contacts (initials as fallback), missed-call badge (24 h)
+  on the Calls tab, live mm:ss timer in the ongoing-call notification.
+- Tap the header chip for a SIP status popup (account, server:port, transport, state).
+- Speed dial: ⋮ → **Speed dial** on a recent call, then hold that key in the dial pad.
+- Recent searches appear as chips under the search bar.
+- Dark mode uses a darker shade of the accent for the header.
+- Registration retries back off 10 s → 20 s → 40 s → 80 s (max 120 s), resetting after success.
+- Silent weekly backup to phone storage.
+
+### Release signing (optional)
+
+Copy `keystore.properties.example` to `keystore.properties` in the repo root and point it at
+your keystore; `./gradlew assembleRelease` then produces a properly signed APK. Both the
+properties file and `*.jks` are git-ignored. Without it, release builds fall back to the
+debug key.
+
+## v1.5.15 — SIP account chip, Profile & Backup, calmer scrolling
+
+- Header chip shows the SIP account name (green dot = registered, amber = connecting) and
+  "Offline" when no account is added.
+- Settings → **Profile & Backup Account** with real backup: Google account picker (registered
+  with Android's Google Drive backup) and a JSON file in `Downloads/CallerX`, plus Restore.
+- Calmer fling physics on call history / contacts / messages so scrolling stops where you
+  want it.
+
+## v1.5.14 — dialpad header in the app theme colour
+
+- The top strip of the dial pad (status bar + "CallerX" row) is painted with the theme accent
+  instead of white, with white status-bar icons — the same treatment as the home header.
+
+## v1.5.13 — dialpad number box above the keypad
+
+- The typed number lives in a rounded box **just above the keypad** (copy left, backspace
+  right) instead of at the very top of the screen; long-press the box to paste a copied
+  number, and the extra Paste button in the top bar is gone.
+- A light "CallerX" heading stays visible at the top next to the back arrow.
+- Contact suggestions keep listing matching numbers between the heading and the number box.
+- Status bar icons follow the screen colour (dark icons on the light dialer, white on the
+  coloured header), and the legacy `systemUiVisibility` flags no longer fight the modern
+  insets controller.
+
+## v1.5.12 — header, status bar and Truecaller-style dialpad
+
+- Header is three clean lines: **CallerX**, then **SIM 1 · SIM 2 · SIP**, then a single
+  full-width search bar inside the coloured header (it was previously hidden behind a
+  magnifier toggle and overlapped the title). The right side shows only **Online** /
+  **Offline**.
+- The status bar (clock / Wi-Fi / battery) is painted with the app theme colour instead of
+  a white strip, with white icons; the dialer keeps a light bar with dark icons. The
+  duplicate status-bar padding on Android 15 that left a white gap is gone.
+- Dialpad now follows Truecaller: paste icon top-right, copy icon left of the number,
+  backspace right of it (long-press clears all), matched contact name above the number,
+  flat keys with DTMF tones + haptics, and a centred green call button.
+- Call-history filter chips scroll sideways, so the **Clear** button no longer wraps.
+- Audio routing honours a connected Bluetooth / wired headset (SCO started) and the
+  speaker toggle.
 
 ## v1.5.11 — lock-screen mic, network drops, search & dialpad
 
