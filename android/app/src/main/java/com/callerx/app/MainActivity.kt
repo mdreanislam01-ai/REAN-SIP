@@ -3646,7 +3646,8 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
     var showTransfer by remember { mutableStateOf(false) }
     var transferNumber by remember { mutableStateOf("") }
     var qualitySamples by remember { mutableStateOf(listOf<Float>()) }
-    val callerPhoto = remember(activity.activeNumber) { if (isCell) "" else activity.photoForNumber(activity.activeNumber) }
+    val isCell = TelecomCallBridge.currentCall != null
+    val callerPhoto = remember(activity.activeNumber, isCell) { if (isCell) "" else activity.photoForNumber(activity.activeNumber) }
     LaunchedEffect(activity.callStartedAt) {
         qualitySamples = emptyList()
         while (activity.callStartedAt > 0L) {
@@ -3655,7 +3656,6 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
             delay(1500)
         }
     }
-    val isCell = TelecomCallBridge.currentCall != null
     /* live list of SIP calls: more than one means "add call" was used */
     val sipCalls = if (isCell) emptyList() else activity.sipCallSummaries()
     val state = if (isCell) TelecomCallBridge.state else activity.callState
