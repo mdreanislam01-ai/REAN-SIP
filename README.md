@@ -49,6 +49,14 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.26 — blocklist import/export, Bangla resources
+
+- **Blocked list as a file**: Settings → *Export blocked list* shares a plain text file;
+  *Import blocked list* merges one number (or `+88017*` wildcard) per line — commas, spaces
+  and semicolons also work.
+- **বাংলা resources**: `res/values-bn/strings.xml` translates the app name, widget, tile and
+  shortcut labels; the Bangla walkthrough lives in `docs/USER-GUIDE-BN.md`.
+
 ## v1.5.25 — smaller downloads, selective restore, wide screens
 
 - **Per-ABI APKs**: every release now carries `app-arm64-v8a-debug.apk` (modern phones, much

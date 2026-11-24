@@ -95,11 +95,17 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.25
-          name: CallerX Android APK v1.5.25
+          tag_name: callerx-v1.5.26
+          name: CallerX Android APK v1.5.26
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.26 — blocklist files, Bangla resources:
+            - Export the blocked list to a text file and import one back (one number or a
+              +88017* wildcard per line); imports merge instead of replacing.
+            - Bangla (bn) resources for the app name, widget, Quick Settings tile and the four
+              app shortcuts, plus docs/USER-GUIDE-BN.md as a full Bangla walkthrough.
 
             v1.5.25 — sizes, selective restore, tablet layout:
             - Per-ABI APKs: the release now also ships app-arm64-v8a-debug.apk (~40% smaller

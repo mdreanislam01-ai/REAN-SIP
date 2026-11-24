@@ -1642,6 +1642,10 @@ class MainActivity : ComponentActivity() {
     /* Folder for automatic backups + automatic restore on a new install.
        Google Drive, Dropbox or any folder on the phone can be chosen; the access
        is persisted so the app can refresh the snapshot without asking again. */
+    private val blockImportLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri != null) importBlockedList(uri)
+    }
+
     private val backupFolderLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         if (uri == null) return@registerForActivityResult
         try {
@@ -2352,6 +2356,49 @@ class MainActivity : ComponentActivity() {
         resumeTick++
     }
     fun isBlockedNumber(number: String): Boolean = isBlockedNumber(this, number)
+
+    /** Writes every blocked entry to callerx-blocked.txt and opens the share sheet. */
+    fun exportBlockedList() {
+        val list = blockedNumbers()
+        if (list.isEmpty()) { errorMessage = "The blocked list is empty — nothing to export."; return }
+        try {
+            val file = File(filesDir, "callerx-blocked.txt")
+            file.writeText(list.joinToString("\n") + "\n")
+            val uri = androidx.core.content.FileProvider.getUriForFile(this, "com.callerx.app.files", file)
+            val share = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "CallerX blocked numbers (${list.size})")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(share, "Export blocked numbers"))
+            errorMessage = "Exported ${list.size} blocked numbers."
+        } catch (e: Exception) {
+            errorMessage = "Could not export the blocked list: ${e.message}"
+        }
+    }
+
+    /** Imports one number or wildcard per line (CSV commas and spaces also work). */
+    fun importBlockedList(uri: Uri) {
+        try {
+            val text = contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() } ?: return
+            val merged = blockedNumbers().toMutableSet()
+            val parts = text.split('\n', ',', ';')
+            var added = 0
+            parts.forEach { raw ->
+                val entry = raw.trim().removePrefix("+")
+                if (entry.isBlank()) return@forEach
+                val clean = if (entry.contains('*')) entry.filterIndexed { i, ch -> ch.isDigit() || (ch == '*' && i == entry.length - 1) } else entry.filter { it.isDigit() }
+                if (clean.isBlank()) return@forEach
+                if (merged.add(clean)) added++
+            }
+            prefs().edit().putString("blocked", JSONArray(merged.toList()).toString()).apply()
+            resumeTick++
+            errorMessage = "Imported $added numbers (${merged.size} blocked in total)."
+        } catch (e: Exception) {
+            errorMessage = "Import failed: ${e.message ?: "unknown file"}"
+        }
+    }
 
     /* ---------- Call routing defaults ---------- */
     fun routeAvailable(route: String): Boolean = when (route) {
@@ -4582,6 +4629,12 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.RestorePage, MaterialTheme.colorScheme.primary, "Restore parts of a backup",
                 "Pick SIP accounts, speed dials, blocked numbers or settings only",
                 onClick = { showRestoreParts = true })
+            SettingRow(Icons.Filled.FileUpload, MaterialTheme.colorScheme.primary, "Export blocked list",
+                "${activity.blockedNumbers().size} numbers · text file you can share or keep",
+                onClick = { activity.exportBlockedList() })
+            SettingRow(Icons.Filled.FileDownload, MaterialTheme.colorScheme.primary, "Import blocked list",
+                "One number or +88017* wildcard per line · merges with the current list",
+                onClick = { activity.blockImportLauncher.launch(arrayOf("text/*", "text/comma-separated-values", "application/octet-stream")) })
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
                 if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
                 toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })

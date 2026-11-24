@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Bangla (বাংলা) resources. The Compose screens keep their English literals for now;
+     these cover everything that comes from resources: app name, widget, tile and the
+     four long-press app shortcuts. -->
+<resources>
+    <string name="app_name">CallerX</string>
+    <string name="callerx_widget_desc">SIP স্ট্যাটাস, ডায়ালপ্যাড, স্পিড ডায়াল ও ভয়েসমেইল শর্টকাট।</string>
+    <string name="callerx_tile_label">CallerX ডায়ালপ্যাড</string>
+    <string name="shortcut_dialpad">নতুন SIP কল</string>
+    <string name="shortcut_voicemail">ভয়েসমেইল</string>
+    <string name="shortcut_favorites">প্রিয় Contacts</string>
+    <string name="shortcut_recordings">রেকর্ডিং</string>
+</resources>
