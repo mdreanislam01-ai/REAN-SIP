@@ -49,6 +49,22 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.24 — encrypted backups, call screening, appearance
+
+- **Encrypted backups**: optional password → every new backup is AES-256-GCM with
+  PBKDF2-SHA256 (120k rounds); restore decrypts when the password is known and otherwise asks
+  for it. Files stay ordinary documents for Drive/Dropbox (`CALLERX-ENC1:` prefix).
+- **Block before ringing**: `CallerXScreeningService` rejects blocked and wildcard-matched
+  numbers before the ring (needs the call-screening role). Toggle: Settings → *Block before ringing*.
+- **AMOLED black** theme + **text size** (85–130%) applied to the whole Compose tree.
+- **Full-screen caller photo** on the call screen and a **live quality sparkline**.
+- **App shortcuts** (New SIP call, Voicemail, Favorites, Recordings), **transfer quick-picks**,
+  **PBX park/pickup codes** as one-tap DTMF chips, **delete-all for a grouped number**,
+  a separate **missed-call notification channel**, an **offline crash log** (Settings → Crash log)
+  and **WSS** as a SIP transport option.
+- Docs: `docs/USER-GUIDE-BN.md` (Bangla walkthrough), `docs/AUDIT.md` (repo audit),
+  `docs/PLAY-STORE.md` (listing draft), `scripts/changelog.sh` (release notes from commits).
+
 ## v1.5.23 — forwarding, favorites, quality report, 7-day backups
 
 - **Call forwarding** (Settings → Call forwarding): forward all / when busy / when unanswered,

@@ -2123,6 +2123,16 @@ class MainActivity : ComponentActivity() {
         dir.listFiles()?.filter { it.isFile && (it.extension == "json" || it.name.endsWith(".txt")) }?.maxByOrNull { it.lastModified() }?.readText()
     } catch (_: Exception) { null }
 
+    /** PBX park / pickup codes as (label, code) pairs for the in-call sheet. */
+    fun pbxCodes(): List<Pair<String, String>> {
+        val park = callerxPrefs().getString("pbx:park", "*0").orEmpty().trim()
+        val pickup = callerxPrefs().getString("pbx:pickup", "*8").orEmpty().trim()
+        return buildList {
+            if (park.isNotBlank()) add("Park" to park)
+            if (pickup.isNotBlank()) add("Pickup" to pickup)
+        }
+    }
+
     /* ---------- Call screening ---------- */
     fun screeningEnabled(): Boolean = callerxPrefs().getBoolean("setting:screening", true)
 
@@ -3862,6 +3872,17 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
                     Column {
                         Text("Blind: your provider dials the new number and you drop out of the call.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Text("Attended: add a second call first, then the two other parties are connected together.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp))
+                        val pbx = remember { activity.pbxCodes() }
+                        if (pbx.isNotEmpty()) {
+                            Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                pbx.forEach { (label, code) ->
+                                    SuggestionChip(
+                                        onClick = { code.forEach { ch -> activity.sendDtmf(ch) } },
+                                        label = { Text("$label $code", fontSize = 11.sp) }
+                                    )
+                                }
+                            }
+                        }
                         val quick = remember { activity.recentNumbers(5) }
                         if (quick.isNotEmpty()) {
                             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -4183,7 +4204,7 @@ private fun SipFormScreen(activity: MainActivity, editIndex: Int, onBack: () -> 
                         OutlinedTextField(port, { port = it }, Modifier.weight(0.8f), label = { Text("Port", fontSize = 12.sp) }, singleLine = true, shape = RoundedCornerShape(14.dp))
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        listOf("UDP", "TCP", "TLS").forEach { t ->
+                        listOf("UDP", "TCP", "TLS", "WSS").forEach { t ->
                             FilterChip(selected = transport == t, onClick = { transport = t }, label = { Text(t, fontSize = 12.sp) }, shape = RoundedCornerShape(10.dp))
                             Spacer(Modifier.width(6.dp))
                         }
@@ -4234,6 +4255,9 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     var showBackupPassword by remember { mutableStateOf(false) }
     var passwordDraft by remember { mutableStateOf(prefs.getString("backup:password", "") ?: "") }
     var showFontSize by remember { mutableStateOf(false) }
+    var showPbx by remember { mutableStateOf(false) }
+    var parkCode by remember { mutableStateOf(prefs.getString("pbx:park", "*0") ?: "*0") }
+    var pickupCode by remember { mutableStateOf(prefs.getString("pbx:pickup", "*8") ?: "*8") }
     val accounts = activity.accountsList()
     val defaultAcc = accounts.firstOrNull { it.isDefault }
     val route = activity.defaultRoute()
@@ -4409,6 +4433,29 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 confirmButton = { TextButton(onClick = { showFontSize = false }) { Text("Close") } }
             )
         }
+        if (showPbx) {
+            AlertDialog(
+                onDismissRequest = { showPbx = false },
+                title = { Text("PBX feature codes") },
+                text = {
+                    Column {
+                        Text("Codes your PBX uses for call park and pickup. During a call the Transfer sheet shows them as one-tap chips.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(value = parkCode, onValueChange = { parkCode = it.take(12) }, singleLine = true, label = { Text("Call park code") }, shape = RoundedCornerShape(14.dp))
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(value = pickupCode, onValueChange = { pickupCode = it.take(12) }, singleLine = true, label = { Text("Group pickup code") }, shape = RoundedCornerShape(14.dp))
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        prefs.edit().putString("pbx:park", parkCode.trim()).putString("pbx:pickup", pickupCode.trim()).apply()
+                        showPbx = false
+                        activity.errorMessage = "PBX codes saved."
+                    }) { Text("Save") }
+                },
+                dismissButton = { TextButton(onClick = { showPbx = false }) { Text("Cancel") } }
+            )
+        }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
             SectionTitle("ACCOUNT")
             SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "Profile & Backup Account", if (activity.googleBackupAccount().isNotBlank()) "Google · ${activity.googleBackupAccount()}" else "Profile, Google account backup & phone storage", onProfile)
@@ -4416,6 +4463,9 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 activity.autoBackupFolderLabel(), onClick = { activity.chooseBackupFolder() })
             SectionTitle("VOIP & SIP")
             SettingRow(Icons.Filled.Cloud, MaterialTheme.colorScheme.primary, "SIP Account", if (defaultAcc != null) "${defaultAcc.domain} · ${activity.registrationMessage}" else "No account added", onSip)
+            SettingRow(Icons.Filled.Dialpad, MaterialTheme.colorScheme.primary, "PBX feature codes",
+                "Park ${parkCode.ifBlank { "—" }} · pickup ${pickupCode.ifBlank { "—" }} · one-tap during a call",
+                onClick = { showPbx = true })
             SettingRow(Icons.Filled.CallSplit, MaterialTheme.colorScheme.primary, "Call forwarding",
                 activity.forwardingSummary(), onClick = { onForwarding?.invoke() })
             SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio & Codec", "Opus 16 kHz mono, G.722 · echo cancellation on", onRoute = null, onClick = { activity.errorMessage = "Codecs in use: Opus 16 kHz mono (low bandwidth, stable on 4G), G.722, PCMA, PCMU and DTMF events. Echo cancellation is always on." })
