@@ -99,11 +99,19 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.34
-          name: CallerX Android APK v1.5.34
+          tag_name: callerx-v1.5.35
+          name: CallerX Android APK v1.5.35
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.35 — in-app updates:
+            - The app checks the GitHub release feed on start (at most every 6 hours) and offers
+              "Update available · vX" with the release notes.
+            - "Update now" downloads the APK that matches the phone's ABI inside the app, verifies
+              its package name, version and signing certificate, then opens the Android installer.
+              One permission ("Install unknown apps") is needed once; after that it is two taps.
+            - Settings → App updates (manual check) and "Check for updates automatically".
 
             v1.5.34 — headset audio really reaches the headset:
             - Fixed the root cause of "headset connected but sound on the phone": the in-call
