@@ -32,6 +32,10 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
+      - name: Unit tests
+        run: |
+          gradle --no-daemon :app:testDebugUnitTest --console=plain 2>&1 | tee test.log
+          tail -n 15 test.log
       - name: Build debug APK
         run: |
           set +e
@@ -39,24 +43,235 @@ jobs:
           result=$?
           if [ "$result" -ne 0 ]; then
             tail -n 25 build.log
-            summary=$(grep -E -i -A2 -B1 'e: |error:|unresolved reference|type mismatch|cannot infer|overload resolution|not enough information|cannot access|what went wrong|execution failed' build.log | head -n 30 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
-            echo "::error::$summary"
+            errors=$(grep -E -i 'e: file|e: [a-z]|error:|unresolved reference|type mismatch|cannot infer|overload resolution|not enough information' build.log | sed 's#https://[^ ]*##g' | cut -c1-220)
+            head_summary=$(printf '%s\n' "$errors" | head -n 10 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            tail_summary=$(printf '%s\n' "$errors" | tail -n 10 | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            echo "::error::first errors: $head_summary"
+            echo "::error::last errors: $tail_summary"
             exit "$result"
           fi
           tail -n 25 build.log
+      # ABI splits produce app-universal-debug.apk; keep the historical app-debug.apk
+      # name so existing download links and the release notes stay valid.
+      - name: Normalise split APK names
+        run: |
+          cd android/app/build/outputs/apk/debug
+          if [ -f app-universal-debug.apk ]; then cp app-universal-debug.apk app-debug.apk; fi
+          ls -l
       - uses: actions/upload-artifact@v4
         with:
           name: CallerX-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
           if-no-files-found: error
+
+      # ---- Signed release APK + Play-ready AAB ----
+      # Runs only when the keystore secrets are configured; otherwise it is skipped
+      # with a message, so pull requests from forks and plain pushes still build.
+      - name: Build signed release APK and AAB (optional)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "No KEYSTORE_BASE64 secret configured - skipping the signed release build."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/callerx-release.jks
+          printf 'storeFile=android/app/callerx-release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
+          gradle --no-daemon :app:assembleRelease :app:bundleRelease --stacktrace --console=plain
+          echo "--- signed artefacts ---"
+          ls -l android/app/build/outputs/apk/release android/app/build/outputs/bundle/release
+          echo "--- signature check ---"
+          "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools/35.0.0/apksigner" verify --print-certs \
+            android/app/build/outputs/apk/release/app-universal-release.apk | head -n 12
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CallerX-release
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: ignore
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.11
-          name: CallerX Android APK v1.5.11
+          tag_name: callerx-v1.5.28
+          name: CallerX Android APK v1.5.28
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.28 — call screen stays, cleaner controls, contact search in the log:
+            - The call screen can no longer slip back to the home tab while a call runs
+              (state survives Activity recreation, every resume re-opens the live call).
+            - The call screen shows only Mute / Speaker / Hold / ⋮; Keypad, Add call,
+              Transfer, Record, Merge, Swap and Share moved into the ⋮ menu.
+            - Searching the call log also searches the contact list, with a Contacts section
+              under the call rows.
+
+            v1.5.27 — unit tests in CI:
+            - JVM unit tests (NumberRulesTest) cover the +880/880/00/0 number equivalence and
+              the exact/suffix/wildcard call-blocking matcher; CI runs them before building.
+
+            v1.5.26 — blocklist files, Bangla resources:
+            - Export the blocked list to a text file and import one back (one number or a
+              +88017* wildcard per line); imports merge instead of replacing.
+            - Bangla (bn) resources for the app name, widget, Quick Settings tile and the four
+              app shortcuts, plus docs/USER-GUIDE-BN.md as a full Bangla walkthrough.
+
+            v1.5.25 — sizes, selective restore, tablet layout:
+            - Per-ABI APKs: the release now also ships app-arm64-v8a-debug.apk (~40% smaller
+              download for modern phones) next to the universal app-debug.apk.
+            - Selective restore: restore only SIP accounts/history, speed dials & favorites,
+              blocked numbers or app settings from the newest backup.
+            - Wide-screen layout: everything is centred in a 520dp column on tablets and in
+              landscape instead of stretching edge to edge.
+
+            v1.5.24 — encryption, screening, appearance:
+            - Encrypted backups: optional AES-256-GCM password (PBKDF2 120k) for every new backup.
+            - Block before ringing: a CallScreeningService rejects blocked/wildcard numbers before
+              the phone rings (when CallerX holds the screening role).
+            - AMOLED pure-black theme and a text-size setting (85-130%) for the whole app.
+            - Full-screen caller photo on the call screen plus a live quality sparkline.
+            - App shortcuts (New SIP call, Voicemail, Favorites, Recordings), transfer quick-picks
+              and PBX park/pickup codes as one-tap chips.
+            - Grouped call rows can delete every call of that number; separate missed-call
+              notification channel; offline crash log with share; WSS transport option.
+            - Docs: docs/USER-GUIDE-BN.md (Bangla guide), docs/AUDIT.md, docs/PLAY-STORE.md and
+              scripts/changelog.sh.
+
+            v1.5.23 — forwarding, favourites, quality report, 7 backups:
+            - Call forwarding: forward all / when busy / when unanswered with a 10-60 s delay
+              (SIP 302, provider must honour it).
+            - Favorites tab in the bottom bar with call, message and un-star actions.
+            - Call log grouping: one row per number with "· N calls", like Google Dialer.
+            - Call quality report: MOS estimate, delay, jitter, packet loss, bandwidth and the
+              SRTP suite of the last 30 SIP calls (Settings → Call quality report).
+            - Recordings player: seek bar, live position and 0.5x / 1x / 1.5x / 2x speed.
+            - Automatic backup keeps 7 dated snapshots in the chosen folder (plus the latest
+              file used for restore) and never fills your Drive.
+
+            v1.5.22 — call waiting, recordings, widget, auto restore:
+            - Call waiting: a second incoming SIP call shows an "Answer & hold" card instead of
+              replacing the live call on screen.
+            - Call recordings screen: play, share and delete recordings inside the app
+              (Settings → Call recordings).
+            - Adaptive audio: when network quality stays poor the live call is renegotiated into
+              low-bandwidth mode so it does not break up.
+            - Home-screen widget (SIP status + dial pad / speed dial 1 / voicemail) and a
+              Quick Settings tile.
+            - Automatic backup to a folder you pick (Google Drive, Dropbox, phone storage) with
+              automatic restore when that folder is picked again on a new install.
+            - Signed release builds: ./scripts/make-keystore.sh prints the four GitHub secrets;
+              CI then verifies the APK signature and publishes app-release.apk + .aab.
+
+            v1.5.21 — in-call extras, missed-call handling:
+            - DTMF keypad during a SIP call: press Keypad and the tones go to the other side
+              (IVR menus, conference PINs, extensions). Tones shown on screen, Clear/Close.
+            - Call transfer: blind transfer (REFER) to any number or SIP address, and attended
+              transfer between two calls (Add call → Transfer → Attended).
+            - Missed-call auto-SMS: a normal SMS reply goes out when you miss a SIP call, with
+              your own message text (Settings → Missed calls & voicemail).
+            - Voicemail: save your voicemail number and hold 1 on the dial pad to call it.
+
+            v1.5.20 — security, ringtone, cloud backup, latency:
+            - Security toggles: encrypted SIP transport (TLS/5061) and SRTP call-audio encryption.
+            - Ringtone picker: choose any ringtone on the phone; it plays for incoming SIP calls.
+            - "Save backup to Google Drive" uses the system file picker, so Drive, Dropbox or the
+              phone storage can hold the backup — no account permission or OAuth needed.
+            - SIP popup can measure server latency (TCP handshake to the registrar:port).
+            - Speed dial can also be set from a contact's ⋮ menu.
+            - CI builds a signed release APK and a Play-ready AAB when the KEYSTORE_BASE64,
+              KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD secrets are set.
+
+            v1.5.18 — privacy & convenience pack:
+            - Swipe a recent call right to call, left to delete it from history.
+            - App lock: 4-digit PIN hides the app content (Settings → App lock (PIN)).
+            - Missed calls get a "Call back" action; quick-reply SMS templates; share contact as vCard.
+            - Incoming vibration style: short / double / long.
+            - Call log filter chips now include SIP, SIM 1 and SIM 2.
+            - Blocked numbers accept wildcards such as +88017*.
+            - Speed dial manager: Settings → Speed dial shows and clears the 1-9 mappings.
+            - Several SIP accounts: the route sheet lets you pick which account places the call.
+            - Real call recording (Call.startRecording with a file in the app folder) is wired to the
+              Record button and to "Auto Call Recording".
+
+            v1.5.17 — headset audio fixed + add call / conference:
+            - Headphone audio now works during SIP calls: routing uses the Android
+              AudioManager communication devices (Bluetooth SCO, wired/USB headset, earpiece,
+              speaker) and re-routes automatically when a headset is plugged in or a Bluetooth
+              device connects mid-call. A "Headset" chip shows when it is the active route.
+            - New "Add call" button on the call screen: holds the current call and dials a
+              second number. With two calls the screen lists both with Swap and Merge, and
+              Merge puts everyone in one SIP conference call.
+
+            v1.5.16 — polish pack: photos, badge, speed dial, live timer, signing:
+            - Contact photos in recents and contacts (initials only as a fallback).
+            - Missed-call badge (last 24 h) on the Calls tab of the bottom bar.
+            - Live call timer in the ongoing-call notification (chronometer, no battery cost).
+            - Tap the header chip for a SIP status popup: account, server:port, transport,
+              online/offline and the registration message.
+            - Speed dial: pick 1-9 from any recent call's ⋮ menu, then hold that key in the
+              dial pad to call it (hold 0 still types "+").
+            - Recent searches appear as chips under the search bar; tap to search again.
+            - Dark mode now uses a darker shade of the accent for the header.
+            - Registration retries back off 10 s → 20 s → 40 s → 80 s (max 120 s) instead of
+              hitting the server every 20 s.
+            - Silent weekly backup to phone storage.
+            - Release signing support: drop keystore.properties in the repo root (see
+              keystore.properties.example); release builds then use your own key.
+
+            v1.5.15 — SIP account chip, Profile & Backup, calmer scrolling:
+            - The chip on the right of the header shows the SIP account's own name (green dot
+              when registered, amber while it is still connecting) and "Offline" when no SIP
+              account has been added, instead of the generic "Online".
+            - Settings → "Profile & Backup Account" (was "My Profile & User Account") now has real
+              backup: "Backup with Google account" opens the phone's Google account picker and
+              registers the backup with Android's Google Drive backup; "Backup to phone storage"
+              writes a readable JSON file in Downloads/CallerX. "Restore" brings SIP accounts,
+              blocked numbers, favourites, theme and profile back.
+            - Call history, contacts and messages scroll with calmer fling physics, so a flick no
+              longer races past the number you are looking for.
+
+            v1.5.14 — Dialpad header uses the app theme colour:
+            - The white strip at the top of the dial pad (status bar + CallerX row) is now
+              painted with the app theme colour, exactly like the home header, so the whole
+              top of the screen looks like one piece. The clock / Wi-Fi / battery icons are
+              white on it and stay readable.
+            - The theme colour setting still applies everywhere.
+
+            v1.5.13 — Dialpad number box moved above the keypad:
+            - The typed number now sits in its own rounded box just above the keypad (where
+              your screenshot marked it), with copy on the left and backspace on the right,
+              instead of being pinned to the very top of the screen.
+            - Press and hold that box to paste a copied number (the extra Paste button in the
+              top bar was removed). A small "press and hold to paste" hint shows while empty.
+            - The app heading "CallerX" stays visible at the top in a light, subtle style with
+              the back arrow.
+            - Contact suggestions still list the matching numbers between the heading and the
+              number box, and tapping one fills it in.
+            - Status bar icons now follow the screen colour properly (dark icons on the light
+              dialer, white icons on the coloured header).
+
+            v1.5.12 — Header, status bar and Truecaller-style dialpad:
+            - Header is now three clean lines: "CallerX", "SIM 1 · SIM 2 · SIP", then one
+              full-width search bar inside the coloured header. The right side shows only
+              "Online" / "Offline" (no more "SIP Online" chip overlapping the title).
+            - The status bar (clock, wifi, battery) is painted with the app theme colour
+              instead of a white strip, so the icons are always readable and the top of the
+              screen looks like part of the app. The dialer keeps a light bar with dark icons.
+            - No more double status-bar padding on Android 15 (that white gap above the header).
+            - Dialpad rebuilt like Truecaller: paste icon top-right, copy icon left of the
+              number, backspace right of it (long-press clears everything), contact name above
+              the number, flat keys with DTMF tones and haptics, and the green call button
+              centred at the bottom.
+            - Call-history filter chips scroll sideways so the Clear button no longer wraps.
+            - Audio routing respects a connected Bluetooth / wired headset (SCO started) and
+              the speaker toggle.
 
             v1.5.11 — Lock-screen mic, network drops, search & dialpad (Google Dialer style):
             - SIP engine now lives in the foreground service (microphone type), not in the
@@ -74,5 +289,7 @@ jobs:
             - Dialpad rebuilt like Google Dialer: ripple keys, DTMF tones, haptics, live
               contact suggestions while typing, Paste/Copy/Clear, + key, and a backspace
               that only appears when there is a number to delete.
-          files: android/app/build/outputs/apk/debug/app-debug.apk
+          files: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
           overwrite_files: true

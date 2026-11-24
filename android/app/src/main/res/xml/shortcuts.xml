@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="dialpad"
+        android:enabled="true"
+        android:icon="@drawable/ic_callerx_tile"
+        android:shortcutShortLabel="@string/shortcut_dialpad">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.callerx.app"
+            android:targetClass="com.callerx.app.MainActivity">
+            <extra android:name="callerx_widget" android:value="dialer" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="voicemail"
+        android:enabled="true"
+        android:icon="@drawable/ic_callerx_tile"
+        android:shortcutShortLabel="@string/shortcut_voicemail">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.callerx.app"
+            android:targetClass="com.callerx.app.MainActivity">
+            <extra android:name="callerx_widget" android:value="voicemail" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="favorites"
+        android:enabled="true"
+        android:icon="@drawable/ic_callerx_tile"
+        android:shortcutShortLabel="@string/shortcut_favorites">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.callerx.app"
+            android:targetClass="com.callerx.app.MainActivity">
+            <extra android:name="callerx_widget" android:value="favorites" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="recordings"
+        android:enabled="true"
+        android:icon="@drawable/ic_callerx_tile"
+        android:shortcutShortLabel="@string/shortcut_recordings">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.callerx.app"
+            android:targetClass="com.callerx.app.MainActivity">
+            <extra android:name="callerx_widget" android:value="recordings" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>
