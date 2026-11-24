@@ -653,7 +653,8 @@ object SipEngine {
                 val bluetooth = try { am.isBluetoothScoOn || am.isBluetoothA2dpOn } catch (_: Exception) { false }
                 if (!preferSpeaker && bluetooth) { try { am.startBluetoothSco() } catch (_: Exception) { } }
                 else { try { am.stopBluetoothSco() } catch (_: Exception) { } }
-                try { @Suppress("DEPRECATION") (am.isBluetoothScoOn = !preferSpeaker && bluetooth) } catch (_: Exception) { }
+                @Suppress("DEPRECATION")
+                try { am.isBluetoothScoOn = !preferSpeaker && bluetooth } catch (_: Exception) { }
                 try { am.isSpeakerphoneOn = preferSpeaker } catch (_: Exception) { }
                 headsetActive = !preferSpeaker && (wired || bluetooth)
             }
