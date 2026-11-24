@@ -99,11 +99,65 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.28
-          name: CallerX Android APK v1.5.28
+          tag_name: callerx-v1.5.34
+          name: CallerX Android APK v1.5.34
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.34 — headset audio really reaches the headset:
+            - Fixed the root cause of "headset connected but sound on the phone": the in-call
+              route poller used a stale speaker flag from the previous call and kept forcing the
+              loudspeaker. It now follows the Speaker button shown on screen.
+            - A headset that appears during a call takes the audio back from the speaker unless the
+              user pressed Speaker after connecting it (exactly how other dialers behave).
+            - Speaker state and "user chose speaker" reset at the start of every call.
+            - Audio diagnostics now also lists liblinphone's own audio devices and its current
+              output device, so a silent headset can be pinned down from the phone.
+
+            v1.5.33 — headset feedback and control:
+            - Plugging or unplugging a headset shows a toast ("USB-C headset connected · call
+              audio routed" / "Headset disconnected …") — in a call and while the app is open.
+            - New setting "Call audio only through headset": the phone speaker is never used for
+              call audio, and the Speaker button politely refuses.
+            - Settings → Audio diagnostics now has a "Test tone" button that plays 1.5 s through
+              the selected route, so a silent headset is obvious immediately.
+
+            v1.5.32 — USB-C (Type-C) headset audio:
+            - USB-C earphones are now routed for calls: USB_HEADSET / USB_DEVICE / USB_ACCESSORY /
+              AUX / LINE types are all treated as headsets, and the route is re-applied 0.25 s,
+              0.8 s and 1.6 s after a call starts because USB audio devices appear late.
+            - AudioManager's AudioDeviceCallback is registered, so plugging the Type-C headset in
+              the middle of a call reroutes immediately (ACTION_HEADSET_PLUG never fires for USB-C
+              on Xiaomi/HyperOS and many other ROMs).
+            - "USB-C headset" is a first-class choice in the audio picker, and Settings has an
+              audio diagnostics screen that lists every device Android reports (shareable).
+
+            v1.5.31 — missed calls clear once you have seen them:
+            - The Calls tab badge only counts missed calls you have not looked at; opening the
+              Calls tab (or the Missed filter) clears the badge and the notification.
+            - Missed calls are collected into one notification ("3 missed calls · last from …")
+              instead of overwriting each other, and tapping it opens the Missed list instead of
+              the dial pad.
+
+            v1.5.30 — crash fix + Bluetooth headset audio:
+            - A failure while handling a SIP call state no longer force-closes the app: the
+              whole handler is guarded and written to the shareable error log.
+            - Audio routing rewritten: user route (⋮ → Audio output) wins, liblinphone only
+              overrides when it really lists the headset, Bluetooth SCO is retried, and routing
+              starts after the streams are up (no more racing the audio HAL).
+            - Android 12+ Bluetooth permission row, plus a warning when a headset is paired for
+              music only (A2DP, no HFP call audio).
+            - Network handover (Wi-Fi ⇄ mobile data) re-registers SIP quietly and never while a
+              call is running.
+
+            v1.5.29 — calls on the lock screen:
+            - MainActivity declares showWhenLocked + turnScreenOn and applies them with
+              setShowWhenLocked()/setTurnScreenOn(), so a ringing call appears on top of the
+              lock screen instead of staying behind it (secure locks still ask to unlock).
+            - The app-lock PIN no longer covers an incoming or ongoing call.
+            - New Settings rows: "Show calls over the lock screen", "Skip app PIN during
+              calls" and "Full-screen call alerts" (opens the Android 14+ permission screen).
 
             v1.5.28 — call screen stays, cleaner controls, contact search in the log:
             - The call screen can no longer slip back to the home tab while a call runs
