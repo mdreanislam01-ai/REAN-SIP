@@ -1004,6 +1004,10 @@ object SipEngine {
             val label = externalRouteLabel()
             val msg = if (label.isBlank()) "Headset disconnected · call audio on the phone" else "$label connected · call audio routed"
             mainHandler.post { try { android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show() } catch (_: Exception) { } }
+            /* Streams already running on the old device: rebuild them so the headset gets audio. */
+            if (callActive && label.isNotBlank() && autoSwitchToHeadset()) {
+                mainHandler.postDelayed({ try { restartCallAudio() } catch (_: Exception) { } }, 400L)
+            }
         } catch (_: Exception) { }
     }
 
@@ -1091,24 +1095,56 @@ object SipEngine {
         try {
             val devices = c.audioDevices
             fun pick(vararg names: String): AudioDevice? =
-                devices.firstOrNull { d -> names.any { n -> d.type.name.equals(n, ignoreCase = true) } }
-            val bt = pick("Bluetooth", "BluetoothSco", "BluetoothA2DP")
-            val wired = pick("Headset", "Headphones", "HearingAid", "USB", "USBHeadset", "Usb", "AuxLine", "Line")
+                devices.firstOrNull { d -> names.any { n -> d.type.name.contains(n, ignoreCase = true) } }
+            val bt = pick("Bluetooth", "Sco", "HearingAid")
+            val wired = pick("Headset", "Headphone", "USB", "Aux", "Line", "Wired")
+            /* A headset that Android reports but liblinphone does not list must NOT be replaced by
+               the earpiece — that is exactly how a USB-C headset ends up silent. In that case we
+               leave the whole routing to AudioManager and only remember the intent. */
+            val androidHeadset = externalRouteLabel().isNotBlank()
             val target = when (choice) {
                 "speaker" -> pick("Speaker")
                 "earpiece" -> pick("Earpiece")
                 "bluetooth" -> bt
-                "wired" -> wired
-                else -> bt ?: wired ?: pick("Earpiece")
+                "usb", "wired" -> wired ?: bt
+                else -> when {
+                    bt != null -> bt
+                    wired != null -> wired
+                    androidHeadset -> return          // headset exists: never force earpiece on it
+                    else -> pick("Earpiece")
+                }
             }
-            /* No matching liblinphone device: leave the routing to AudioManager instead of
-               forcing the earpiece speaker, which is what silenced headsets before. */
             if (target == null) return
             c.outputAudioDevice = target
             val isHeadset = bt === target || wired === target
             if (isHeadset) try { c.inputAudioDevice = target } catch (_: Exception) { }
         } catch (t: Throwable) { recordNonFatal("routeLinphoneDevices", t) }
     }
+
+    /**
+     * liblinphone builds its audio track once per stream; on several ROMs (HyperOS included) a
+     * later `setCommunicationDevice()` does not move the already running track. Pausing and
+     * resuming the call rebuilds the stream against the new device — a fraction of a second of
+     * silence instead of a whole call stuck on the loudspeaker.
+     */
+    fun restartCallAudio(): Boolean {
+        val call = core?.currentCall ?: return false
+        return try {
+            routeAudio(currentSpeakerWanted())
+            if (call.state == Call.State.StreamsRunning) {
+                call.pause()
+                mainHandler.postDelayed({
+                    try { call.resume() } catch (_: Exception) { }
+                }, 800L)
+                true
+            } else false
+        } catch (t: Throwable) { recordNonFatal("restartCallAudio", t); false }
+    }
+
+    /** Auto-move the audio to a headset that is plugged in during a call (Settings toggle). */
+    fun autoSwitchToHeadset(): Boolean = try {
+        appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getBoolean("setting:autoSwitchAudio", true) ?: true
+    } catch (_: Exception) { true }
 
     /* Re-routes as soon as a headset is plugged in / removed or a Bluetooth
        device connects, even in the middle of a call. */
@@ -3160,6 +3196,16 @@ class MainActivity : ComponentActivity() {
 
     fun playTestTone() { SipEngine.playTestTone() }
 
+    /** Rebuilds the running call's audio stream so a just-chosen route takes effect. */
+    fun restartCallAudio(): Boolean = SipEngine.restartCallAudio()
+
+    fun autoSwitchAudioEnabled(): Boolean = SipEngine.autoSwitchToHeadset()
+
+    fun setAutoSwitchAudio(on: Boolean) {
+        prefs().edit().putBoolean("setting:autoSwitchAudio", on).apply()
+        resumeTick++
+    }
+
     fun headsetOnlyEnabled(): Boolean = SipEngine.headsetOnly()
 
     fun setHeadsetOnly(on: Boolean) {
@@ -4654,14 +4700,27 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
                 text = {
                     Column {
                         activity.audioRouteOptions().forEach { (id, label) ->
+                            val applyRoute = {
+                                activity.setCallRoute(id)
+                                activity.restartCallAudio()
+                                showAudioRoute = false
+                            }
                             Row(
-                                Modifier.fillMaxWidth().clickable { activity.setCallRoute(id); showAudioRoute = false }.padding(vertical = 9.dp),
+                                Modifier.fillMaxWidth().clickable { applyRoute() }.padding(vertical = 9.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                RadioButton(selected = selected == id, onClick = { activity.setCallRoute(id); showAudioRoute = false })
+                                RadioButton(selected = selected == id, onClick = { applyRoute() })
                                 Text(label, fontSize = 13.5.sp, color = MaterialTheme.colorScheme.onSurface)
                             }
                         }
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedButton(onClick = { activity.restartCallAudio(); showAudioRoute = false }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Restart call audio", fontSize = 12.5.sp)
+                        }
+                        Text(
+                            "If the headset stays silent after choosing it, restart the call audio — this rebuilds the SIP audio stream on the new device (about a second of silence).",
+                            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp)
+                        )
                         if (SipEngine.bluetoothConnected() && !SipEngine.bluetoothCallAudioReady()) {
                             Text(
                                 "This headset is paired for music only (A2DP). For call audio it must support Hands-Free (HFP) — check the headset manual or pair it again as a headset.",
@@ -5459,6 +5518,9 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
                 if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
                 toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })
+            SettingRow(Icons.Filled.Hearing, MaterialTheme.colorScheme.primary, "Move audio to a new headset automatically",
+                if (activity.autoSwitchAudioEnabled()) "On · plugging a headset during a call rebuilds the audio stream" else "Off · choose the route yourself in ⋮ → Audio output",
+                toggle = true, checked = activity.autoSwitchAudioEnabled(), onClick = { activity.setAutoSwitchAudio(!activity.autoSwitchAudioEnabled()) })
             SettingRow(Icons.Filled.VolumeOff, MaterialTheme.colorScheme.primary, "Call audio only through headset",
                 if (activity.headsetOnlyEnabled()) "On · never plays call audio on the phone speaker" else "Off · speaker and earpiece are allowed",
                 toggle = true, checked = activity.headsetOnlyEnabled(), onClick = { activity.setHeadsetOnly(!activity.headsetOnlyEnabled()) })

@@ -99,11 +99,20 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.35
-          name: CallerX Android APK v1.5.35
+          tag_name: callerx-v1.5.36
+          name: CallerX Android APK v1.5.36
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.36 — silent-headset fix:
+            - liblinphone no longer falls back to the earpiece when Android reports a headset that
+              liblinphone does not list (this was overriding the USB-C route and silencing the
+              headset, while other dialers kept working).
+            - Choosing a route during a call now rebuilds the SIP audio stream (pause/resume), so the
+              already-running audio track moves to the headset instead of staying on the speaker.
+            - New "Restart call audio" button in the in-call audio picker and a setting to move the
+              audio automatically when a headset is plugged in during a call.
 
             v1.5.35 — in-app updates:
             - The app checks the GitHub release feed on start (at most every 6 hours) and offers
