@@ -49,14 +49,47 @@ jobs:
           name: CallerX-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      # ---- Signed release APK + Play-ready AAB (only when the keystore secrets exist) ----
+      - name: Prepare release keystore
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/callerx-release.jks
+          cat > keystore.properties <<EOF
+          storeFile=android/app/callerx-release.jks
+          storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          EOF
+      - name: Build signed release APK and AAB
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease --stacktrace --console=plain
+      - uses: actions/upload-artifact@v4
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        with:
+          name: CallerX-release
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: warn
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.19
-          name: CallerX Android APK v1.5.19
+          tag_name: callerx-v1.5.20
+          name: CallerX Android APK v1.5.20
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.20 — security, ringtone, cloud backup, latency:
+            - Security toggles: encrypted SIP transport (TLS/5061) and SRTP call-audio encryption.
+            - Ringtone picker: choose any ringtone on the phone; it plays for incoming SIP calls.
+            - "Save backup to Google Drive" uses the system file picker, so Drive, Dropbox or the
+              phone storage can hold the backup — no account permission or OAuth needed.
+            - SIP popup can measure server latency (TCP handshake to the registrar:port).
+            - Speed dial can also be set from a contact's ⋮ menu.
+            - CI builds a signed release APK and a Play-ready AAB when the KEYSTORE_BASE64,
+              KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD secrets are set.
 
             v1.5.18 — privacy & convenience pack:
             - Swipe a recent call right to call, left to delete it from history.

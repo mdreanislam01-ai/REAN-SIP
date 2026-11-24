@@ -15,6 +15,8 @@ import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.Ringtone
+import android.media.RingtoneManager
 import android.media.ToneGenerator
 import android.net.ConnectivityManager
 import android.net.Network
@@ -470,7 +472,7 @@ object SipEngine {
                                 val ctx = appContext
                                 if (ctx != null && isBlockedNumber(ctx, remoteNumber)) {
                                     try { call.decline(Reason.Busy) } catch (_: Exception) { }
-                                } else startIncomingVibration()
+                                } else { startIncomingVibration(); startIncomingRingtone() }
                             }
                             Call.State.OutgoingInit, Call.State.OutgoingProgress -> {
                                 if (a != null) { a.callConnected = false; a.muted = false; a.speaker = false; a.callStartedAt = 0L; a.recording = false }
@@ -733,7 +735,10 @@ object SipEngine {
                 val auth = Factory.instance().createAuthInfo(a.user, null, a.pass, null, null, a.domain)
                 val params = c.createAccountParams()
                 val identity = Factory.instance().createAddress("sip:${a.user}@${a.domain}") ?: continue
-                val transport = a.transport.lowercase().ifBlank { "udp" }
+                val secPrefs = context.getSharedPreferences("callerx", Context.MODE_PRIVATE)
+                val forceTls = secPrefs.getBoolean("setting:tls", false)
+                val encryptMedia = secPrefs.getBoolean("setting:srtp", false)
+                val transport = if (forceTls) "tls" else a.transport.lowercase().ifBlank { "udp" }
                 val port = a.port.trim().ifBlank { if (transport == "tls") "5061" else "5060" }
                 val serverStr = when {
                     a.proxy.isNotBlank() -> {
@@ -747,6 +752,7 @@ object SipEngine {
                 params.setServerAddress(server)
                 params.setRegisterEnabled(a.autoBoot)
                 try { params.setExpires(300) } catch (_: Exception) { }
+                if (encryptMedia) try { params.mediaEncryption = MediaEncryption.SRTP } catch (_: Exception) { }
                 val account = c.createAccount(params) ?: continue
                 c.addAuthInfo(auth)
                 c.addAccount(account)
@@ -802,7 +808,7 @@ object SipEngine {
                 "stun_server=stun.l.google.com:19302",
                 "",
                 "[sound]",
-                "ring=$ring",
+                "ring=",              // CallerX plays the user's chosen ringtone (see startIncomingRingtone)
                 "ringback=$ringback",
                 "remote_ring=$ring",
                 "echocancellation=1",
@@ -886,9 +892,35 @@ object SipEngine {
     }
 
     private fun stopIncomingVibration() {
+        stopIncomingRingtone()
         if (!incomingVibrationOn) return
         try { appContext?.getSystemService(Vibrator::class.java)?.cancel() } catch (_: Exception) { }
         incomingVibrationOn = false
+    }
+
+    /* ---------- Incoming ringtone (Settings → Ringtone, or the system default) ---------- */
+    private var incomingRingtone: Ringtone? = null
+    private fun startIncomingRingtone() {
+        val ctx = appContext ?: return
+        stopIncomingRingtone()
+        try {
+            val stored = ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getString("setting:ringtone", "") ?: ""
+            val uri = stored.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            val rt = RingtoneManager.getRingtone(ctx, uri) ?: return
+            rt.audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            if (Build.VERSION.SDK_INT >= 28) rt.isLooping = true
+            rt.play()
+            incomingRingtone = rt
+        } catch (_: Exception) { }
+    }
+
+    private fun stopIncomingRingtone() {
+        try { incomingRingtone?.stop() } catch (_: Exception) { }
+        incomingRingtone = null
     }
 
     /* ---------- SIP calls ---------- */
@@ -1170,6 +1202,29 @@ class MainActivity : ComponentActivity() {
     var callUiRequested by mutableStateOf(false)
     var dialerRoleTick by mutableIntStateOf(0)
     var profileTick by mutableIntStateOf(0)
+    /* System ringtone picker (Settings → Ringtone). */
+    private val ringtonePicker = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == RESULT_OK) {
+            @Suppress("DEPRECATION")
+            val uri = result.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+            callerxPrefs().edit().putString("setting:ringtone", uri?.toString() ?: "").apply()
+            resumeTick++
+        }
+    }
+
+    /* Save a backup through the system file picker: Google Drive, Dropbox and any
+       other document provider on the phone appear in it, no OAuth needed. */
+    private val backupDocLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.openOutputStream(uri)?.use { out -> out.write(createBackupJson().toByteArray()) }
+                callerxPrefs().edit().putLong("backup:lastCloud", System.currentTimeMillis()).apply()
+                resumeTick++
+                errorMessage = "Backup saved to the folder you picked (Google Drive, Dropbox, phone storage…)."
+            } catch (e: Exception) { errorMessage = "Could not write the backup: ${e.message}" }
+        }
+    }
+
     private val pickPhotoLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri != null) {
             try {
@@ -1372,6 +1427,33 @@ class MainActivity : ComponentActivity() {
             prefs.edit().putLong("backup:lastAuto", System.currentTimeMillis()).apply()
             lifecycleScope.launch(Dispatchers.IO) { try { backupToPhoneStorage(silent = true) } catch (_: Exception) { } }
         } catch (_: Exception) { }
+    }
+
+    fun pickRingtone() {
+        val current = callerxPrefs().getString("setting:ringtone", "") ?: ""
+        val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_RINGTONE)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "CallerX ringtone")
+            if (current.isNotBlank()) putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, Uri.parse(current))
+        }
+        try { ringtonePicker.launch(intent) } catch (_: Exception) { errorMessage = "This phone has no ringtone picker." }
+    }
+
+    fun ringtoneLabel(): String {
+        val stored = callerxPrefs().getString("setting:ringtone", "") ?: ""
+        if (stored.isBlank()) return "Phone default"
+        return try {
+            RingtoneManager.getRingtone(this, Uri.parse(stored))?.getTitle(this) ?: "Custom ringtone"
+        } catch (_: Exception) { "Custom ringtone" }
+    }
+
+    fun exportBackupToCloud() {
+        val stamp = android.text.format.DateFormat.format("yyyyMMdd-HHmm", Date()).toString()
+        try {
+            backupDocLauncher.launch("callerx-backup-$stamp.json")
+        } catch (_: Exception) { errorMessage = "No cloud or file app is available to save the backup." }
     }
 
     fun chooseGoogleBackupAccount() {
@@ -1829,6 +1911,8 @@ private fun CallerXApp(activity: MainActivity) {
     var number by remember { mutableStateOf("") }
     var showCallSheet by remember { mutableStateOf(false) }
     var showSipInfo by remember { mutableStateOf(false) }
+    var latencyText by remember { mutableStateOf("") }
+    val netScope = rememberCoroutineScope()
     var speedDialPerson by remember { mutableStateOf<Person?>(null) }
     var quickReplyPerson by remember { mutableStateOf<Person?>(null) }
     var searchTick by remember { mutableIntStateOf(0) }
@@ -2064,7 +2148,11 @@ private fun CallerXApp(activity: MainActivity) {
                             val favoriteNumbers = remember(contacts, activity.resumeTick) {
                                 contacts.filter { c -> val norm = c.number.filter { it.isDigit() || it == '+' }; prefs.getBoolean("fav:$norm", false) }.map { it.number }.toSet()
                             }
-                            ContactsTab(contacts, debouncedQuery, favoriteNumbers, onOpen = { p -> selected = p; screen = "contact" }, onCall = { p -> requestCall(p.number, p.name) }, onMessage = { p -> activity.openSms(p.number) })
+                            ContactsTab(contacts, debouncedQuery, favoriteNumbers,
+                                onOpen = { p -> selected = p; screen = "contact" },
+                                onCall = { p -> requestCall(p.number, p.name) },
+                                onMessage = { p -> activity.openSms(p.number) },
+                                onSpeedDial = { p -> speedDialPerson = p })
                         }
                         "Messages" -> MessagesTab(activity, messages, debouncedQuery)
                         else -> SettingsScreen(activity, dark, { dark = it; prefs.edit().putBoolean("dark", it).apply() },
@@ -2168,6 +2256,31 @@ private fun CallerXApp(activity: MainActivity) {
                             Text("Registration refresh 300 s · keepalive 15 s · Opus 16 kHz mono", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Text(activity.registrationMessage, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                latencyText.ifBlank { "Server latency: not measured" },
+                                fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(onClick = {
+                                if (acc == null) return@TextButton
+                                latencyText = "Measuring…"
+                                val host = acc.domain
+                                val port = acc.port.toIntOrNull() ?: if (acc.transport.equals("tls", true)) 5061 else 5060
+                                netScope.launch {
+                                    val ms = withContext(Dispatchers.IO) {
+                                        try {
+                                            val started = System.currentTimeMillis()
+                                            java.net.Socket().use { sock ->
+                                                sock.connect(java.net.InetSocketAddress(host, port), 3000)
+                                                System.currentTimeMillis() - started
+                                            }
+                                        } catch (_: Exception) { -1L }
+                                    }
+                                    latencyText = if (ms >= 0) "Server latency: $ms ms · $host:$port" else "Server unreachable ($host:$port)"
+                                }
+                            }) { Text("Measure", fontSize = 11.5.sp, maxLines = 1, softWrap = false) }
+                        }
                     }
                 },
                 confirmButton = { TextButton(onClick = { showSipInfo = false; screen = "sip" }) { Text("Manage accounts") } },
@@ -2573,7 +2686,7 @@ private fun CallRow(person: Person, photoUri: String, onAvatar: () -> Unit, onCa
 }
 
 @Composable
-private fun ContactsTab(contacts: List<Person>, query: String, favorites: Set<String>, onOpen: (Person) -> Unit, onCall: (Person) -> Unit, onMessage: (Person) -> Unit) {
+private fun ContactsTab(contacts: List<Person>, query: String, favorites: Set<String>, onOpen: (Person) -> Unit, onCall: (Person) -> Unit, onMessage: (Person) -> Unit, onSpeedDial: (Person) -> Unit) {
     val visible = remember(contacts, query) { contacts.filter { matchesQuery(it.name, it.number, query) } }
     /* Real favorites (starred in contact details), not just the first five. */
     val favs = remember(visible, favorites) { visible.filter { it.number in favorites } }
@@ -2581,16 +2694,16 @@ private fun ContactsTab(contacts: List<Person>, query: String, favorites: Set<St
         if (query.isBlank()) {
             item { SectionTitle("FAVORITES") }
             if (favs.isEmpty()) item { Text("No favorites yet. Star a contact in its details page.", Modifier.padding(horizontal = 16.dp, vertical = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp) }
-            itemsIndexed(favs, key = { i, p -> "fav-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }, { onMessage(p) }) }
+            itemsIndexed(favs, key = { i, p -> "fav-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }, { onMessage(p) }, { onSpeedDial(p) }) }
         }
         item { SectionTitle(if (query.isBlank()) "ALL CONTACTS · ${contacts.size}" else "SEARCH RESULTS · ${visible.size}") }
         if (visible.isEmpty()) item { Text(if (query.isBlank()) "No matching contacts. Grant Contacts permission or add contacts to your device." else "No contact matches “$query”.", Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        itemsIndexed(visible, key = { i, p -> "con-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }, { onMessage(p) }) }
+        itemsIndexed(visible, key = { i, p -> "con-$i-${p.number}" }) { _, p -> ContactRow(p, { onOpen(p) }, { onCall(p) }, { onMessage(p) }, { onSpeedDial(p) }) }
     }
 }
 
 @Composable
-private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit, onMessage: () -> Unit) {
+private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit, onMessage: () -> Unit, onSpeedDial: () -> Unit) {
     var showMenu by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
@@ -2607,6 +2720,7 @@ private fun ContactRow(person: Person, onOpen: () -> Unit, onCall: () -> Unit, o
             DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                 DropdownMenuItem(text = { Text("Call") }, onClick = { showMenu = false; onCall() })
                 DropdownMenuItem(text = { Text("Message") }, onClick = { showMenu = false; onMessage() })
+                DropdownMenuItem(text = { Text("Speed dial") }, onClick = { showMenu = false; onSpeedDial() })
                 DropdownMenuItem(text = { Text("Copy number") }, onClick = {
                     showMenu = false
                     try { clipboard.setText(AnnotatedString(person.number)); Toast.makeText(context, "Copied ${person.number}", Toast.LENGTH_SHORT).show() } catch (_: Exception) { }
@@ -3160,6 +3274,8 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     var sim2 by remember { mutableStateOf(prefs.getBoolean("setting:SIM 2", true)) }
     var ask by remember { mutableStateOf(prefs.getBoolean("setting:Ask before each call", false)) }
     var autoRec by remember { mutableStateOf(prefs.getBoolean("setting:autoRecord", false)) }
+    var tls by remember { mutableStateOf(prefs.getBoolean("setting:tls", false)) }
+    var srtp by remember { mutableStateOf(prefs.getBoolean("setting:srtp", false)) }
     var showPinDialog by remember { mutableStateOf(false) }
     var pinDraft by remember { mutableStateOf(prefs.getString("applock:pin", "") ?: "") }
     var showVibration by remember { mutableStateOf(false) }
@@ -3241,6 +3357,19 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SectionTitle("GENERAL & SYSTEM")
             SettingRow(Icons.Filled.Phone, MaterialTheme.colorScheme.primary, "Dialer & Default Permission", if (activity.isDefaultDialer()) "CallerX is the default dialer" else "Set as default dialer · grant permissions", onDialer)
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Blocked numbers", "${activity.blockedNumbers().size} numbers · calls are rejected", onBlocked)
+            SectionTitle("SECURITY & CALL HANDLING")
+            SettingRow(Icons.Filled.Security, MaterialTheme.colorScheme.primary, "Encrypted SIP transport (TLS)",
+                if (tls) "On · every account uses TLS on port 5061" else "Off · each account uses its own transport",
+                toggle = true, checked = tls, onClick = {
+                    tls = !tls; prefs.edit().putBoolean("setting:tls", tls).apply(); activity.applyAccounts()
+                })
+            SettingRow(Icons.Filled.Lock, MaterialTheme.colorScheme.primary, "Encrypt call audio (SRTP)",
+                if (srtp) "On · media is encrypted end to end" else "Off · only if your provider forces it",
+                toggle = true, checked = srtp, onClick = {
+                    srtp = !srtp; prefs.edit().putBoolean("setting:srtp", srtp).apply(); activity.applyAccounts()
+                })
+            SettingRow(Icons.Filled.MusicNote, MaterialTheme.colorScheme.primary, "Ringtone",
+                activity.ringtoneLabel(), onClick = { activity.pickRingtone() })
             SettingRow(Icons.Filled.Lock, MaterialTheme.colorScheme.primary, "App lock (PIN)",
                 if (pinDraft.isBlank()) "Off · lock CallerX with a 4-digit PIN" else "On · PIN required when the app opens",
                 onClick = { showPinDialog = true })
@@ -3673,6 +3802,18 @@ private fun ProfileScreen(activity: MainActivity, onBack: () -> Unit, onTheme: (
                                     fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1, overflow = TextOverflow.Ellipsis
                                 )
+                            }
+                            Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                    Surface(onClick = { activity.exportBackupToCloud() }, shape = RoundedCornerShape(14.dp),
+                        color = primary.copy(alpha = 0.08f), modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.CloudUpload, null, tint = primary, modifier = Modifier.size(19.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("Save backup to Google Drive", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                                Text("Opens the phone's file picker: Drive, Dropbox or storage", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                             Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
                         }
