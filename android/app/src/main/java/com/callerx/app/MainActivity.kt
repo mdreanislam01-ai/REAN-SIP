@@ -2820,6 +2820,8 @@ class MainActivity : ComponentActivity() {
 
     fun unseenMissed(): Int = SipEngine.unseenMissedCount()
 
+    fun missedSeenAt(): Long = SipEngine.missedSeenAt()
+
     fun setCallRoute(route: String) { SipEngine.setCallRoute(route); resumeTick++ }
 
     fun callRouteLabel(): String = when (prefs().getString("setting:callRoute", "auto") ?: "auto") {
