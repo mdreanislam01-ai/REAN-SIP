@@ -237,7 +237,7 @@ private val T9_MAP = mapOf(
     'm' to '6', 'n' to '6', 'o' to '6', 'p' to '7', 'q' to '7', 'r' to '7', 's' to '7',
     't' to '8', 'u' to '8', 'v' to '8', 'w' to '9', 'x' to '9', 'y' to '9', 'z' to '9'
 )
-private fun digitsOnly(s: String) = s.filter { it.isDigit() }
+internal fun digitsOnly(s: String) = s.filter { it.isDigit() }
 private fun toT9(s: String) = buildString { for (ch in s.lowercase()) { val d = T9_MAP[ch]; if (d != null) append(d) else if (ch.isDigit()) append(ch) } }
 
 private fun relDay(ts: Long): String {
@@ -269,7 +269,7 @@ private fun saveRecentSearch(prefs: android.content.SharedPreferences, query: St
     } catch (_: Exception) { }
 }
 
-private fun canonicalDigits(s: String): String {
+internal fun canonicalDigits(s: String): String {
     var d = digitsOnly(s)
     if (d.startsWith("00")) d = d.drop(2)
     if (d.startsWith("880")) d = d.drop(3)
@@ -343,25 +343,32 @@ private fun loadBlockedNumbers(context: Context): List<String> {
     } catch (_: Exception) { mutableListOf() }
 }
 
-internal fun isBlockedNumber(context: Context, number: String): Boolean {
+/** Pure matcher for one blocked entry: exact number, suffix or a `+88017*` wildcard. */
+internal fun blockedEntryMatches(rule: String, number: String): Boolean {
     val norm = number.filter { it.isDigit() || it == '+' }
     val canon = canonicalDigits(norm)
+    val entry = rule.trim()
+    if (entry.isEmpty()) return false
+    return try {
+        if (entry.contains('*')) {
+            val regex = StringBuilder("^")
+            for (ch in entry) { if (ch == '*') regex.append(".*") else if (ch.isDigit() || ch == '+') regex.append(ch) }
+            regex.append("$")
+            val rx = Regex(regex.toString())
+            rx.matches(norm) || (canon.isNotEmpty() && rx.matches(canon))
+        } else {
+            val digits = entry.filter { it.isDigit() }
+            digits.isNotEmpty() && (norm.endsWith(digits) || norm == entry || (canon.isNotEmpty() && canon == canonicalDigits(entry)))
+        }
+    } catch (_: Exception) { false }
+}
+
+internal fun isBlockedNumber(context: Context, number: String): Boolean {
     return loadBlockedNumbers(context).any { entry ->
         val rule = entry.trim()
         if (rule.isEmpty()) return@any false
         try {
-            if (rule.contains('*')) {
-                /* Wildcard rule, e.g. "+88017*" blocks a whole range. */
-                val regex = StringBuilder("^")
-                for (ch in rule) { if (ch == '*') regex.append(".*") else if (ch.isDigit() || ch == '+') regex.append(ch) }
-                regex.append("$")
-                val rx = Regex(regex.toString())
-                rx.matches(norm) || (canon.isNotEmpty() && rx.matches(canon))
-            } else {
-                val digits = rule.filter { it.isDigit() }
-                rule.isNotEmpty() && digits.isNotEmpty() &&
-                    (norm.endsWith(digits) || norm == rule || (canon.isNotEmpty() && canon == canonicalDigits(rule)))
-            }
+            blockedEntryMatches(rule, number)
         } catch (_: Exception) { false }
     }
 }

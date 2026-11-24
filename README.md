@@ -49,6 +49,13 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.27 — unit tests in CI
+
+- `android/app/src/test/java/com/callerx/app/NumberRulesTest.kt` tests the `+880` / `880` /
+  `00880` / `0` number equivalence and the exact / suffix / wildcard blocking matcher.
+- CI runs `:app:testDebugUnitTest` before building, so a broken rule now fails the pipeline
+  instead of shipping.
+
 ## v1.5.26 — blocklist import/export, Bangla resources
 
 - **Blocked list as a file**: Settings → *Export blocked list* shares a plain text file;

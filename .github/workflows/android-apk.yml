@@ -32,6 +32,10 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
+      - name: Unit tests
+        run: |
+          gradle --no-daemon :app:testDebugUnitTest --console=plain 2>&1 | tee test.log
+          tail -n 15 test.log
       - name: Build debug APK
         run: |
           set +e
@@ -95,11 +99,15 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.26
-          name: CallerX Android APK v1.5.26
+          tag_name: callerx-v1.5.27
+          name: CallerX Android APK v1.5.27
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.27 — unit tests in CI:
+            - JVM unit tests (NumberRulesTest) cover the +880/880/00/0 number equivalence and
+              the exact/suffix/wildcard call-blocking matcher; CI runs them before building.
 
             v1.5.26 — blocklist files, Bangla resources:
             - Export the blocked list to a text file and import one back (one number or a
