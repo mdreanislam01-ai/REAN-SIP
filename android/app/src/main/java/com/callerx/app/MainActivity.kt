@@ -66,6 +66,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.ScrollScope
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -908,13 +909,11 @@ object SipEngine {
             if (address == null) { a?.errorMessage = "“$number” is not a valid SIP address. Dial the number your SIP provider expects (with or without +/00 prefix)."; return false }
             if (a != null) { a.activeCallName = name; a.activeNumber = clean; a.callConnected = false }
             /* Optional: force a specific SIP account when several are registered. */
-            val chosen = if (accountIndex >= 0) try { c.accounts.getOrNull(accountIndex) } catch (_: Exception) { null } else null
-            val call = if (chosen != null) {
-                try {
-                    val params = c.createCallParams(null)
-                    params?.account = chosen
-                    c.inviteAddressWithParams(address, params)
-                } catch (_: Exception) { c.inviteAddress(address) }
+            val chosen = if (accountIndex >= 0) try { c.accountList.getOrNull(accountIndex) } catch (_: Exception) { null } else null
+            val params = if (chosen != null) try { c.createCallParams(null) } catch (_: Exception) { null } else null
+            if (params != null && chosen != null) try { params.account = chosen } catch (_: Exception) { }
+            val call = if (params != null) {
+                try { c.inviteAddressWithParams(address, params) } catch (_: Exception) { c.inviteAddress(address) }
             } else c.inviteAddress(address)
             if (call == null) { a?.errorMessage = "The call could not be started. Check your network connection and SIP account, then try again."; return false }
             activeCall = call
