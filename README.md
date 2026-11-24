@@ -49,6 +49,27 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.18 — privacy & convenience pack
+
+- Swipe a recent call right to call it, left to delete it from the call log.
+- App lock with a 4-digit PIN (Settings → App lock (PIN)); calls still ring behind the lock.
+- Missed calls get **Call back**; quick-reply templates; share a contact as vCard.
+- Incoming vibration style: short / double / long.
+- Call-log filter chips now include **SIP**, **SIM 1**, **SIM 2**; blocked numbers accept
+  wildcards such as `+88017*`.
+- Speed dial manager (Settings → Speed dial) and a per-call SIP account picker when several
+  accounts are enabled.
+- End call hangs up every call, including a merged conference.
+
+## v1.5.17 — headset audio + add call / conference
+
+- Headphone audio works during SIP calls: routing uses the Android `AudioManager`
+  communication devices (Bluetooth SCO → wired/USB headset → earpiece → speaker) and
+  re-routes automatically when a headset is plugged or a Bluetooth device connects mid-call.
+  A "Headset" chip confirms the active route on the call screen.
+- **Add call** holds the current call and dials a second number; with two calls the screen
+  lists both with **Swap** and **Merge** (local SIP conference).
+
 ## v1.5.16 — polish pack
 
 - Contact photos in recents and contacts (initials as fallback), missed-call badge (24 h)

@@ -52,8 +52,8 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.18
-          name: CallerX Android APK v1.5.18
+          tag_name: callerx-v1.5.19
+          name: CallerX Android APK v1.5.19
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.

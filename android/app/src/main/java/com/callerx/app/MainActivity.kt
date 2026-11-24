@@ -998,7 +998,15 @@ object SipEngine {
     }
 
     fun answerCall() { stopIncomingVibration(); try { core?.currentCall?.let { it.accept() } } catch (e: Exception) { CallBridge.activity?.errorMessage = "Could not answer call: ${e.message}" } }
-    fun endCall() { stopIncomingVibration(); try { core?.currentCall?.terminate() ?: core?.terminateAllCalls() } catch (_: Exception) { core?.terminateAllCalls() } }
+    fun endCall() {
+        stopIncomingVibration()
+        try {
+            val c = core
+            val count = try { c?.calls?.size ?: 0 } catch (_: Exception) { 0 }
+            /* With two calls or a merged conference, End must hang up everything. */
+            if (count > 1) c?.terminateAllCalls() else (c?.currentCall?.terminate() ?: c?.terminateAllCalls())
+        } catch (_: Exception) { core?.terminateAllCalls() }
+    }
     fun toggleMute(muted: Boolean) {
         CallBridge.activity?.muted = muted
         if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setMuted(muted); showCallNotification(); return }
