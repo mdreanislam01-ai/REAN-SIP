@@ -78,11 +78,20 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.20
-          name: CallerX Android APK v1.5.20
+          tag_name: callerx-v1.5.21
+          name: CallerX Android APK v1.5.21
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.21 — in-call extras, missed-call handling:
+            - DTMF keypad during a SIP call: press Keypad and the tones go to the other side
+              (IVR menus, conference PINs, extensions). Tones shown on screen, Clear/Close.
+            - Call transfer: blind transfer (REFER) to any number or SIP address, and attended
+              transfer between two calls (Add call → Transfer → Attended).
+            - Missed-call auto-SMS: a normal SMS reply goes out when you miss a SIP call, with
+              your own message text (Settings → Missed calls & voicemail).
+            - Voicemail: save your voicemail number and hold 1 on the dial pad to call it.
 
             v1.5.20 — security, ringtone, cloud backup, latency:
             - Security toggles: encrypted SIP transport (TLS/5061) and SRTP call-audio encryption.

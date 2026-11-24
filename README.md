@@ -49,6 +49,23 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.21 — in-call extras, missed-call handling
+
+- **DTMF keypad during a call**: press *Keypad* on the in-call screen and every tone is sent
+  to the other side (IVR menus, conference PINs, extension dialling). Sent digits are shown
+  with Clear/Close; tones use RFC 2833 events so no audio is clipped.
+- **Call transfer**: *Transfer* → enter a number or SIP address → **Blind** (REFER, you leave
+  the call) or, when two calls exist via *Add call*, **Attended** (both remote parties are
+  joined and CallerX drops out).
+- **Missed-call auto-SMS**: when a SIP call is missed (or declined), a normal SMS reply is
+  sent to the caller. Message text is editable in Settings → Missed calls & voicemail; SMS
+  sending permission is requested only when the toggle is switched on. Blocked numbers never
+  get a reply.
+- **Voicemail**: save your voicemail number and hold **1** on the dial pad to call it, like a
+  stock dialer (a stored speed dial on 1 still wins).
+- SRTP is now applied per call (outgoing params + `acceptWithParams` on answer) because
+  `AccountParams` in linphone-sdk 5.4 has no media-encryption setter.
+
 ## v1.5.18 — privacy & convenience pack
 
 - Swipe a recent call right to call it, left to delete it from the call log.

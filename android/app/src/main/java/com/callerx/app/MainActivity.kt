@@ -36,6 +36,7 @@ import android.provider.Settings
 import android.provider.Telephony
 import android.telecom.PhoneAccount
 import android.telecom.TelecomManager
+import android.telephony.SmsManager
 import android.telephony.SubscriptionManager
 import android.view.View
 import android.view.WindowManager
@@ -384,6 +385,10 @@ object SipEngine {
     private var activeCall: Call? = null
     private var sipCallIncoming = false
     private var sipCallLogged = true
+    /* Missed-call auto-reply bookkeeping (item: voicemail / auto-SMS). */
+    private var incomingCallerNumber = ""
+    private var incomingCallAnswered = false
+    private var missedReplyDone = true
     private var regFailCount = 0
     private var regRetryPending = false
     private var incomingVibrationOn = false
@@ -466,11 +471,16 @@ object SipEngine {
                                     a.callStartedAt = 0L; a.recording = false
                                 }
                                 sipCallIncoming = true; sipCallLogged = false
+                                incomingCallerNumber = remoteNumber
+                                incomingCallAnswered = false
+                                missedReplyDone = false
                                 acquireCallLocks()
                                 acquireAudioFocus()
                                 routeAudio(false)
                                 val ctx = appContext
                                 if (ctx != null && isBlockedNumber(ctx, remoteNumber)) {
+                                    incomingCallerNumber = ""
+                                    missedReplyDone = true
                                     try { call.decline(Reason.Busy) } catch (_: Exception) { }
                                 } else { startIncomingVibration(); startIncomingRingtone() }
                             }
@@ -488,6 +498,7 @@ object SipEngine {
                             }
                             Call.State.StreamsRunning -> {
                                 if (a != null) { a.callConnected = true; if (a.callStartedAt == 0L) a.callStartedAt = System.currentTimeMillis() }
+                                if (sipCallIncoming) incomingCallAnswered = true
                                 stopIncomingVibration()
                                 acquireCallLocks()
                                 acquireAudioFocus()
@@ -499,6 +510,10 @@ object SipEngine {
                                     val dur = if (a.callStartedAt > 0L) ((System.currentTimeMillis() - a.callStartedAt) / 1000L).coerceAtLeast(0L) else 0L
                                     a.logSipCall(a.activeNumber, a.activeCallName, sipCallIncoming, a.callConnected, dur)
                                     sipCallLogged = true
+                                }
+                                if (sipCallIncoming && !incomingCallAnswered && !missedReplyDone) {
+                                    missedReplyDone = true
+                                    autoReplyToMissedCall(incomingCallerNumber)
                                 }
                                 if (a != null) { a.callStartedAt = 0L; a.recording = false; a.callConnected = false }
                                 releaseCallLocks()
@@ -1110,6 +1125,92 @@ object SipEngine {
         val ctx = appContext ?: return
         if (!ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getBoolean("setting:autoRecord", false)) return
         toggleCallRecording()
+    }
+
+    /* ---------- DTMF keypad during a call (IVR menus, PIN codes) ---------- */
+    fun sendDtmf(digit: Char) {
+        val call = core?.currentCall ?: activeCall ?: return
+        try { call.sendDtmf(digit) } catch (_: Exception) { }
+    }
+
+    /* ---------- Call transfer: blind (REFER) and attended (between two calls) ---------- */
+    private fun sipUriFor(c: Core, target: String): Address? {
+        val clean = target.trim()
+        if (clean.isEmpty()) return null
+        if (clean.startsWith("sip:") || clean.startsWith("sips:") || clean.contains("@")) return try { c.interpretUrl(clean) } catch (_: Exception) { null }
+        val domain = c.defaultAccount?.params?.identityAddress?.domain.orEmpty()
+        if (domain.isBlank()) return null
+        return try { c.interpretUrl("sip:$clean@$domain") } catch (_: Exception) { null }
+    }
+
+    /** Blind transfer: the far end is asked (REFER) to call [target]; our leg drops. */
+    fun blindTransfer(target: String): Boolean {
+        val c = core ?: run { CallBridge.activity?.errorMessage = "VoIP engine is not ready."; return false }
+        val call = c.currentCall ?: activeCall ?: run { CallBridge.activity?.errorMessage = "There is no active call to transfer."; return false }
+        val address = sipUriFor(c, target) ?: run {
+            CallBridge.activity?.errorMessage = "Enter the number or SIP address to transfer the call to."
+            return false
+        }
+        return try {
+            val ok = call.transferTo(address) == 0
+            if (ok) CallBridge.activity?.errorMessage = "Transferring the call to ${target.trim()}…"
+            else CallBridge.activity?.errorMessage = "The SIP server refused the transfer. Some providers disable REFER."
+            ok
+        } catch (e: Exception) {
+            CallBridge.activity?.errorMessage = "Transfer failed: ${e.message ?: "unknown error"}"
+            false
+        }
+    }
+
+    /**
+     * Attended transfer: the second (held) call is transferred to the active call's
+     * far end, so both remote parties talk to each other and CallerX drops out.
+     * Add a call first (Add call), then press Transfer → "Attended".
+     */
+    fun attendedTransfer(): Boolean {
+        val c = core ?: return false
+        val calls = try { c.calls.toList() } catch (_: Exception) { emptyList() }
+        if (calls.size < 2) {
+            CallBridge.activity?.errorMessage = "Attended transfer needs two calls. Use “Add call”, then press Transfer → Attended."
+            return false
+        }
+        val active = calls.firstOrNull { it.state == Call.State.StreamsRunning } ?: c.currentCall
+        val other = calls.firstOrNull { it != active }
+        if (active == null || other == null) {
+            CallBridge.activity?.errorMessage = "Attended transfer needs one active and one held call."
+            return false
+        }
+        return try {
+            val ok = other.transferToAnother(active) == 0
+            if (ok) CallBridge.activity?.errorMessage = "Attended transfer started — the two other parties are being connected."
+            else CallBridge.activity?.errorMessage = "The SIP server refused the attended transfer."
+            ok
+        } catch (e: Exception) {
+            CallBridge.activity?.errorMessage = "Attended transfer failed: ${e.message ?: "unknown error"}"
+            false
+        }
+    }
+
+    /* ---------- Missed-call auto-SMS (Voicemail / away reply) ---------- */
+    private fun autoReplyToMissedCall(number: String) {
+        val ctx = appContext ?: return
+        val clean = number.trim()
+        if (clean.isEmpty() || clean.none { it.isDigit() }) return
+        val p = ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE)
+        if (!p.getBoolean("setting:missedSms", false)) return
+        if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
+            CallBridge.activity?.errorMessage = "Auto-SMS is on but Android has not allowed SMS sending. Enable it in Settings → Permissions."
+            return
+        }
+        val text = p.getString("setting:missedSmsText", "")?.takeIf { it.isNotBlank() }
+            ?: "Sorry, I can't take your call right now. I'll call you back soon."
+        try {
+            val sms = if (Build.VERSION.SDK_INT >= 31) ctx.getSystemService(SmsManager::class.java) else SmsManager.getDefault()
+            sms?.sendTextMessage(clean, null, text, null, null)
+            CallBridge.activity?.errorMessage = "Missed call from $clean · auto-reply SMS sent"
+        } catch (e: Exception) {
+            CallBridge.activity?.errorMessage = "Auto-reply SMS failed: ${e.message ?: "unknown error"}"
+        }
     }
 
     /* ---------- Ongoing-call notification (full-screen over the lock screen) ---------- */
@@ -1897,6 +1998,21 @@ class MainActivity : ComponentActivity() {
 
     fun toggleCallRecording() { SipEngine.toggleCallRecording() }
 
+    /* ---------- In-call extras: DTMF keypad, transfer, voicemail ---------- */
+    fun sendDtmf(digit: Char) { SipEngine.sendDtmf(digit) }
+    fun blindTransfer(target: String): Boolean = SipEngine.blindTransfer(target)
+    fun attendedTransfer(): Boolean = SipEngine.attendedTransfer()
+    fun requestSmsPermission() { runtimePermissionLauncher.launch(arrayOf(Manifest.permission.SEND_SMS)) }
+
+    fun dialVoicemail() {
+        val num = prefs().getString("setting:voicemail", "").orEmpty().trim()
+        if (num.isBlank()) {
+            errorMessage = "No voicemail number saved. Add it in Settings → Voicemail number."
+            return
+        }
+        startCellCall(num, 0)
+    }
+
     fun recordingCount(): Int = try { File(filesDir, "recordings").listFiles()?.size ?: 0 } catch (_: Exception) { 0 }
 
     /* ---------- Ongoing-call notification (owned by SipEngine) ---------- */
@@ -2077,7 +2193,7 @@ private fun CallerXApp(activity: MainActivity) {
             SipFormScreen(activity, sipFormIndex, onBack = { screen = "sip" },
                 onSave = { entry, idx -> activity.upsertAccount(entry, idx); screen = "sip" })
         } else if (screen == "dialer") {
-            DialerScreen(number, { number = it }, contacts, onBack = { screen = "home" }, onCall = { requestCall(number, "Dialed number") }, onCallPerson = { p -> requestCall(p.number, p.name) })
+            DialerScreen(number, { number = it }, contacts, onBack = { screen = "home" }, onCall = { requestCall(number, "Dialed number") }, onCallPerson = { p -> requestCall(p.number, p.name) }, onVoicemail = { activity.dialVoicemail() })
         } else if (screen == "contact" && selected != null) {
             ContactDetailScreen(activity, selected!!, recentCalls,
                 onBack = { selected = null; screen = "home" },
@@ -2860,6 +2976,10 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
     var hold by remember { mutableStateOf(false) }
     var showAddCall by remember { mutableStateOf(false) }
     var addNumber by remember { mutableStateOf("") }
+    var showKeypad by remember { mutableStateOf(false) }
+    var dtmfSent by remember { mutableStateOf("") }
+    var showTransfer by remember { mutableStateOf(false) }
+    var transferNumber by remember { mutableStateOf("") }
     val isCell = TelecomCallBridge.currentCall != null
     /* live list of SIP calls: more than one means "add call" was used */
     val sipCalls = if (isCell) emptyList() else activity.sipCallSummaries()
@@ -2960,17 +3080,93 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
                     }
                 }
             } else {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally)) {
                     CallControl(Icons.Filled.MicOff, "Mute", activity.muted, dark, secondaryText) { activity.toggleMute(!activity.muted) }
+                    /* DTMF keypad: only SIP legs carry in-band RFC2833 tones we can send. */
+                    if (!isCell) CallControl(Icons.Filled.Dialpad, "Keypad", showKeypad, dark, secondaryText) { showKeypad = true }
                     CallControl(Icons.Filled.VolumeUp, "Speaker", activity.speaker, dark, secondaryText) { activity.setSpeakerOn(!activity.speaker) }
                     CallControl(Icons.Filled.Pause, if (hold) "Resume" else "Hold", hold, dark, secondaryText) { hold = !hold; activity.toggleHold(hold) }
-                    if (!isCell) CallControl(Icons.Filled.PersonAdd, "Add call", false, dark, secondaryText) { showAddCall = true }
-                    if (!isCell) CallControl(Icons.Filled.FiberManualRecord, if (activity.recording) "Stop" else "Record", activity.recording, dark, secondaryText) { activity.toggleCallRecording() }
+                }
+                if (!isCell) {
+                    Spacer(Modifier.height(14.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally)) {
+                        CallControl(Icons.Filled.PersonAdd, "Add call", false, dark, secondaryText) { showAddCall = true }
+                        CallControl(Icons.Filled.SwapHoriz, "Transfer", showTransfer, dark, secondaryText) { showTransfer = true }
+                        CallControl(Icons.Filled.FiberManualRecord, if (activity.recording) "Stop" else "Record", activity.recording, dark, secondaryText) { activity.toggleCallRecording() }
+                    }
                 }
                 Spacer(Modifier.height(20.dp))
                 FilledIconButton(onClick = onEnd, modifier = Modifier.size(66.dp), colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFFDC3F45), contentColor = Color.White)) { Icon(Icons.Filled.CallEnd, "End call", modifier = Modifier.size(29.dp)) }
                 Text("End call", color = primaryText, fontSize = 12.sp, modifier = Modifier.padding(top = 7.dp, bottom = 22.dp))
             }
+        }
+        /* DTMF keypad sheet (IVR menus, conference PINs, extension dialling). */
+        if (showKeypad) {
+            val tone = LocalHapticFeedback.current
+            val padKeys = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#")
+            Dialog(onDismissRequest = { showKeypad = false }) {
+                Surface(shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surface, tonalElevation = 4.dp) {
+                    Column(Modifier.padding(horizontal = 16.dp, vertical = 18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("Keypad", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        Text(
+                            if (dtmfSent.isBlank()) "Tones are sent straight to the other side" else dtmfSent,
+                            fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+                        )
+                        padKeys.chunked(3).forEach { row ->
+                            Row(Modifier.fillMaxWidth()) {
+                                row.forEach { d ->
+                                    DialKey(
+                                        digit = d, letters = "", modifier = Modifier.weight(1f),
+                                        onTap = {
+                                            tone.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            activity.sendDtmf(d[0])
+                                            dtmfSent = (dtmfSent + d).takeLast(24)
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            TextButton(onClick = { dtmfSent = "" }) { Text("Clear") }
+                            TextButton(onClick = { showKeypad = false; dtmfSent = "" }) { Text("Close") }
+                        }
+                    }
+                }
+            }
+        }
+        /* Transfer sheet: blind (REFER) or attended (needs the held second call). */
+        if (showTransfer) {
+            AlertDialog(
+                onDismissRequest = { showTransfer = false },
+                title = { Text("Transfer call") },
+                text = {
+                    Column {
+                        Text("Blind: your provider dials the new number and you drop out of the call.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Attended: add a second call first, then the two other parties are connected together.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp))
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = transferNumber,
+                            onValueChange = { transferNumber = it.filter { c -> c.isDigit() || c == '+' || c == '*' || c == '#' || c == '@' || c.isLetter() || c == '.' || c == ':' } },
+                            singleLine = true,
+                            label = { Text("Number or SIP address") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                            shape = RoundedCornerShape(14.dp)
+                        )
+                    }
+                },
+                confirmButton = {
+                    Row {
+                        TextButton(onClick = {
+                            if (activity.blindTransfer(transferNumber)) { showTransfer = false; transferNumber = "" }
+                        }) { Text("Blind") }
+                        if (sipCalls.size > 1) TextButton(onClick = {
+                            if (activity.attendedTransfer()) { showTransfer = false; transferNumber = "" }
+                        }) { Text("Attended") }
+                    }
+                },
+                dismissButton = { TextButton(onClick = { showTransfer = false }) { Text("Cancel") } }
+            )
         }
         /* Add-call sheet: hold the current call, then dial the second one. */
         if (showAddCall) {
@@ -3300,6 +3496,11 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     var pinDraft by remember { mutableStateOf(prefs.getString("applock:pin", "") ?: "") }
     var showVibration by remember { mutableStateOf(false) }
     val vibrationStyle = prefs.getInt("setting:vibration", 1)
+    var missedSms by remember { mutableStateOf(prefs.getBoolean("setting:missedSms", false)) }
+    var missedText by remember { mutableStateOf(prefs.getString("setting:missedSmsText", "") ?: "") }
+    var voicemail by remember { mutableStateOf(prefs.getString("setting:voicemail", "") ?: "") }
+    var showMissedText by remember { mutableStateOf(false) }
+    var showVoicemail by remember { mutableStateOf(false) }
     val accounts = activity.accountsList()
     val defaultAcc = accounts.firstOrNull { it.isDefault }
     val route = activity.defaultRoute()
@@ -3362,6 +3563,65 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 confirmButton = { TextButton(onClick = { showVibration = false }) { Text("Close") } }
             )
         }
+        if (showMissedText) {
+            AlertDialog(
+                onDismissRequest = { showMissedText = false },
+                title = { Text("Auto-reply message") },
+                text = {
+                    Column {
+                        Text("Sent as a normal SMS (SIM rates apply) when a SIP call is missed. Leave empty to use the default text.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = missedText,
+                            onValueChange = { missedText = it.take(300) },
+                            minLines = 3, maxLines = 5,
+                            label = { Text("Message") },
+                            shape = RoundedCornerShape(14.dp)
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        prefs.edit().putString("setting:missedSmsText", missedText.trim()).apply()
+                        showMissedText = false
+                    }) { Text("Save") }
+                },
+                dismissButton = { TextButton(onClick = { showMissedText = false }) { Text("Cancel") } }
+            )
+        }
+        if (showVoicemail) {
+            AlertDialog(
+                onDismissRequest = { showVoicemail = false },
+                title = { Text("Voicemail number") },
+                text = {
+                    Column {
+                        Text("Hold 1 on the dial pad to call this number, exactly like the stock dialer.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = voicemail,
+                            onValueChange = { voicemail = it.filter { c -> c.isDigit() || c == '+' || c == '*' || c == '#' } },
+                            singleLine = true, label = { Text("Voicemail number") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                            shape = RoundedCornerShape(14.dp)
+                        )
+                    }
+                },
+                confirmButton = {
+                    Row {
+                        TextButton(onClick = {
+                            prefs.edit().putString("setting:voicemail", voicemail.trim()).apply()
+                            showVoicemail = false
+                            activity.dialVoicemail()
+                        }) { Text("Save & call") }
+                        TextButton(onClick = {
+                            prefs.edit().putString("setting:voicemail", voicemail.trim()).apply()
+                            showVoicemail = false
+                        }) { Text("Save") }
+                    }
+                },
+                dismissButton = { TextButton(onClick = { showVoicemail = false }) { Text("Cancel") } }
+            )
+        }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
             SectionTitle("ACCOUNT")
             SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "Profile & Backup Account", if (activity.googleBackupAccount().isNotBlank()) "Google · ${activity.googleBackupAccount()}" else "Profile, Google account backup & phone storage", onProfile)
@@ -3374,6 +3634,20 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.SwapCalls, MaterialTheme.colorScheme.primary, "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else "Use the default route automatically", toggle = true, checked = ask, onClick = { ask = !ask; prefs.edit().putBoolean("setting:Ask before each call", ask).apply() })
             SettingRow(Icons.Filled.Mic, MaterialTheme.colorScheme.primary, "Auto Call Recording", if (autoRec) "On · every call is recorded (${activity.recordingCount()} saved)" else "Off · ${activity.recordingCount()} recordings saved", toggle = true, checked = autoRec, onClick = { autoRec = !autoRec; prefs.edit().putBoolean("setting:autoRecord", autoRec).apply() })
             SettingRow(Icons.Filled.Call, MaterialTheme.colorScheme.primary, "Default call route", if (route.isBlank()) "Not set — you are asked every time" else "All calls go via $route", onRoute)
+            SectionTitle("MISSED CALLS & VOICEMAIL")
+            SettingRow(Icons.Filled.Message, MaterialTheme.colorScheme.primary, "Auto-SMS on missed call",
+                if (missedSms) "On · the caller gets a text when you miss a SIP call" else "Off · missed SIP calls are only logged",
+                toggle = true, checked = missedSms, onClick = {
+                    missedSms = !missedSms
+                    prefs.edit().putBoolean("setting:missedSms", missedSms).apply()
+                    if (missedSms) activity.requestSmsPermission()
+                })
+            SettingRow(Icons.AutoMirrored.Filled.Message, MaterialTheme.colorScheme.primary, "Auto-reply message",
+                if (missedText.isBlank()) "Default: “Sorry, I can't take your call right now…”" else missedText.take(60),
+                onClick = { showMissedText = true })
+            SettingRow(Icons.Filled.Voicemail, MaterialTheme.colorScheme.primary, "Voicemail number",
+                if (voicemail.isBlank()) "Not set · hold 1 on the dial pad to call it" else "$voicemail · hold 1 to call",
+                onClick = { showVoicemail = true })
             SectionTitle("GENERAL & SYSTEM")
             SettingRow(Icons.Filled.Phone, MaterialTheme.colorScheme.primary, "Dialer & Default Permission", if (activity.isDefaultDialer()) "CallerX is the default dialer" else "Set as default dialer · grant permissions", onDialer)
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Blocked numbers", "${activity.blockedNumbers().size} numbers · calls are rejected", onBlocked)
@@ -3446,7 +3720,7 @@ private fun BlockedScreen(activity: MainActivity, onBack: () -> Unit) {
 private fun TopBar(title: String, onBack: () -> Unit) { Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primary).statusBarsPadding().padding(top = 6.dp).padding(horizontal = 8.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = MaterialTheme.colorScheme.onPrimary) }; Text(title, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onPrimary) } }
 
 @Composable
-private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: List<Person>, onBack: () -> Unit, onCall: () -> Unit, onCallPerson: (Person) -> Unit) {
+private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: List<Person>, onBack: () -> Unit, onCall: () -> Unit, onCallPerson: (Person) -> Unit, onVoicemail: () -> Unit = {}) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
@@ -3472,7 +3746,12 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
     fun speedDial(digit: String) {
         val num = speedPrefs.getString("speed:$digit", "") ?: ""
         if (num.isBlank()) {
-            Toast.makeText(context, "No speed dial on $digit · set one from a recent call's ⋮ menu", Toast.LENGTH_SHORT).show()
+            /* Like a normal dialer: holding 1 dials voicemail when no speed dial is stored there. */
+            if (digit == "1") {
+                val vm = speedPrefs.getString("setting:voicemail", "") ?: ""
+                if (vm.isNotBlank()) { haptic.performHapticFeedback(HapticFeedbackType.LongPress); onVoicemail(); return }
+            }
+            Toast.makeText(context, if (digit == "1") "No speed dial or voicemail number on 1 · set one in Settings" else "No speed dial on $digit · set one from a recent call's ⋮ menu", Toast.LENGTH_SHORT).show()
         } else {
             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
             onNumber(num)
