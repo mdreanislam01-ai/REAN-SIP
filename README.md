@@ -49,6 +49,17 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.36 — silent headset fix (liblinphone route + audio stream rebuild)
+
+- `routeLinphoneDevices` no longer falls back to the **earpiece** when Android reports a headset
+  that liblinphone's own device list does not contain. That fallback was overriding the USB-C
+  route after AudioManager had already been moved, which is why the headset stayed silent in
+  CallerX while other dialers worked.
+- Picking a route during a call now **rebuilds the SIP audio stream** (`pause()` → `resume()`), so
+  the audio track that was already running on the speaker moves to the headset (~1 s of silence).
+- New **Restart call audio** button in ⋮ → Audio output, and a setting *Move audio to a new headset
+  automatically* (on by default) that rebuilds the stream when a headset is plugged in mid-call.
+
 ## v1.5.35 — in-app updates (no more GitHub downloads)
 
 - On start (at most every 6 hours) CallerX asks the GitHub release feed for `callerx-v*` and, if
