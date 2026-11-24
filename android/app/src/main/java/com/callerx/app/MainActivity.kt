@@ -1970,6 +1970,13 @@ class MainActivity : ComponentActivity() {
     var waitingNumber by mutableStateOf("")
     /* Home-screen widget / Quick Settings tile requests. */
     var widgetRequest by mutableStateOf("")
+    /* ---------- in-app updater ---------- */
+    var updateInfo by mutableStateOf<UpdateInfo?>(null)
+    var updateBusy by mutableStateOf(false)          // checking or downloading
+    var updateDownloading by mutableStateOf(false)
+    var updateProgress by mutableStateOf(0f)
+    var showUpdateDialog by mutableStateOf(false)
+    var updateNeedsPermission by mutableStateOf(false)
     /* Global text scale (Settings → Text size), applied to the whole Compose tree. */
     var uiFontScale by mutableFloatStateOf(1f)
     var dialerRoleTick by mutableIntStateOf(0)
@@ -2892,6 +2899,7 @@ class MainActivity : ComponentActivity() {
         maybeAutoBackup()
         maybeFolderAutoBackup()
         handleWidgetIntent(intent)
+        maybeCheckForUpdates()
         uiFontScale = prefs().getFloat("font:scale", 1f)
         registerDataObservers()
         refreshData()
@@ -3032,6 +3040,89 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Marks the missed calls as seen (badge + notification disappear). */
+    /* ---------- In-app updates ---------- */
+
+    fun autoUpdateEnabled(): Boolean = prefs().getBoolean("setting:autoUpdate", true)
+
+    fun setAutoUpdate(on: Boolean) {
+        prefs().edit().putBoolean("setting:autoUpdate", on).apply()
+        resumeTick++
+    }
+
+    fun installedVersion(): String = UpdateChecker.currentVersion(this)
+
+    /** Once every six hours on app start; the manual row always checks. */
+    fun maybeCheckForUpdates() {
+        if (!autoUpdateEnabled()) return
+        val last = prefs().getLong("update:lastCheck", 0L)
+        if (System.currentTimeMillis() - last < 6L * 3600 * 1000) return
+        checkForUpdates(manual = false)
+    }
+
+    fun checkForUpdates(manual: Boolean) {
+        if (updateBusy) return
+        updateBusy = true
+        lifecycleScope.launch {
+            val found = withContext(Dispatchers.IO) { try { UpdateChecker.check(this@MainActivity) } catch (_: Exception) { null } }
+            prefs().edit().putLong("update:lastCheck", System.currentTimeMillis()).apply()
+            updateBusy = false
+            if (found == null) {
+                updateInfo = null
+                if (manual) errorMessage = "You are on the newest version (v${installedVersion()})."
+            } else {
+                updateInfo = found
+                val snoozed = prefs().getString("update:snoozed", "").orEmpty()
+                showUpdateDialog = snoozed != found.version
+                if (manual) showUpdateDialog = true
+            }
+        }
+    }
+
+    fun snoozeUpdate() {
+        prefs().edit().putString("update:snoozed", updateInfo?.version.orEmpty()).apply()
+        showUpdateDialog = false
+    }
+
+    /** Permission screen for "install unknown apps" (Android 8+ always asks once). */
+    fun openInstallPermission() {
+        try { startActivity(UpdateChecker.installPermissionIntent(this)) } catch (_: Exception) {
+            errorMessage = "Open Settings → Apps → CallerX → Install unknown apps to allow updates."
+        }
+    }
+
+    fun startUpdateDownload() {
+        val info = updateInfo ?: return
+        if (updateBusy || updateDownloading) return
+        if (!UpdateChecker.canInstall(this)) { updateNeedsPermission = true; return }
+        updateDownloading = true
+        updateProgress = 0f
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                try {
+                    UpdateChecker.prune(this@MainActivity)
+                    val file = UpdateChecker.download(this@MainActivity, info) { p -> updateProgress = p }
+                    val problem = UpdateChecker.verify(this@MainActivity, file, info)
+                    if (problem != null) problem else file.absolutePath
+                } catch (e: Exception) {
+                    "Update download failed: ${e.message ?: "network error"}"
+                }
+            }
+            updateDownloading = false
+            if (result.endsWith(".apk")) {
+                updateProgress = 1f
+                showUpdateDialog = false
+                try {
+                    startActivity(UpdateChecker.installIntent(this@MainActivity, java.io.File(result)))
+                    errorMessage = "Tap Install in the Android screen to finish updating to v${info.version}."
+                } catch (e: Exception) {
+                    errorMessage = "Could not open the installer: ${e.message}"
+                }
+            } else {
+                errorMessage = result
+            }
+        }
+    }
+
     fun markMissedCallsSeen() {
         SipEngine.clearMissed(this)
         resumeTick++
@@ -3718,6 +3809,58 @@ private fun CallerXApp(activity: MainActivity) {
             dismissButton = { TextButton(onClick = { showWelcome = false; prefs.edit().putBoolean("permission-intro-seen", true).apply() }) { Text("Not now") } }
         )
 
+        /* Update available: shown once per version, dismissible, with progress while downloading. */
+        if (activity.showUpdateDialog) {
+            val info = activity.updateInfo
+            AlertDialog(
+                onDismissRequest = { activity.snoozeUpdate() },
+                title = { Text(if (info != null) "Update available · v${info.version}" else "Update") },
+                text = {
+                    Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                        Text(
+                            "Installed: v${activity.installedVersion()}. The APK is downloaded inside CallerX and handed to the Android installer — your SIP accounts, recordings and backups stay untouched.",
+                            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (info != null && info.notes.isNotBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                            Text(info.notes.take(1200), fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurface)
+                        }
+                        if (activity.updateDownloading) {
+                            Spacer(Modifier.height(10.dp))
+                            LinearProgressIndicator(progress = { activity.updateProgress }, modifier = Modifier.fillMaxWidth())
+                            Text("Downloading… ${(activity.updateProgress * 100).toInt()}%", fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 4.dp))
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(enabled = !activity.updateDownloading, onClick = { activity.startUpdateDownload() }) {
+                        Text(if (activity.updateDownloading) "Downloading…" else "Update now")
+                    }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton(onClick = { activity.snoozeUpdate() }) { Text("Later") }
+                        if (info != null) TextButton(onClick = {
+                            try {
+                                activity.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(info.pageUrl)))
+                            } catch (_: Exception) { }
+                        }) { Text("Release page") }
+                    }
+                }
+            )
+        }
+        /* Android asks once for "install unknown apps" before any in-app update can run. */
+        if (activity.updateNeedsPermission) {
+            AlertDialog(
+                onDismissRequest = { activity.updateNeedsPermission = false },
+                title = { Text("Allow CallerX to install updates") },
+                text = { Text("Android requires one extra permission for in-app updates. Tap Open settings → allow \"Install unknown apps\" for CallerX → come back and press Update now. After this, updating takes two taps.", fontSize = 12.5.sp) },
+                confirmButton = {
+                    TextButton(onClick = { activity.updateNeedsPermission = false; activity.openInstallPermission() }) { Text("Open settings") }
+                },
+                dismissButton = { TextButton(onClick = { activity.updateNeedsPermission = false }) { Text("Cancel") } }
+            )
+        }
         /* PIN lock sits on top of everything except a live call: an incoming or ongoing call
            must never be hidden behind the app-lock keypad. */
         if (appPin.isNotBlank() && !unlocked && !(screen == "call" && activity.pinSkipDuringCall())) {
@@ -5339,6 +5482,20 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.NotificationsActive, MaterialTheme.colorScheme.primary, "Full-screen call alerts",
                 if (activity.fullScreenCallAlertsAllowed()) "Allowed · Android shows the call screen instantly" else "Blocked by Android · tap to allow (needed for calls on the lock screen)",
                 onClick = { activity.openFullScreenAlertSettings() })
+            val upd = activity.updateInfo
+            SettingRow(Icons.Filled.SystemUpdate, MaterialTheme.colorScheme.primary, "App updates",
+                when {
+                    activity.updateDownloading -> "Downloading… ${(activity.updateProgress * 100).toInt()}%"
+                    activity.updateBusy -> "Checking for updates…"
+                    upd != null -> "v${upd.version} available · tap to update"
+                    else -> "v${activity.installedVersion()} · tap to check for a newer version"
+                },
+                onClick = {
+                    if (activity.updateInfo != null) activity.showUpdateDialog = true else activity.checkForUpdates(manual = true)
+                })
+            SettingRow(Icons.Filled.WifiTethering, MaterialTheme.colorScheme.primary, "Check for updates automatically",
+                if (activity.autoUpdateEnabled()) "On · checked on start (at most every 6 hours)" else "Off · only when you tap App updates",
+                toggle = true, checked = activity.autoUpdateEnabled(), onClick = { activity.setAutoUpdate(!activity.autoUpdateEnabled()) })
             SettingRow(Icons.Filled.BugReport, MaterialTheme.colorScheme.primary, "Crash log",
                 if (activity.hasCrashLog()) "An error was recorded · tap to share the log" else "No error recorded",
                 onClick = { activity.shareCrashLog() })

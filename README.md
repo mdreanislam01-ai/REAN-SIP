@@ -49,6 +49,20 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.35 — in-app updates (no more GitHub downloads)
+
+- On start (at most every 6 hours) CallerX asks the GitHub release feed for `callerx-v*` and, if
+  the build is older, shows **"Update available · vX"** with the release notes.
+- **Update now**: the APK for this phone's ABI is downloaded inside the app
+  (`cache/updates/`), then checked before the installer opens —
+  package name, `versionName` newer than the installed one, and the **APK signature must match
+  the installed app's certificate** (a tampered or foreign APK is refused).
+- Android needs **"Install unknown apps"** for CallerX once (Settings → App updates leads there);
+  after that an update is: tap *Update now* → tap *Install* in the system dialog. Android does not
+  allow a sideloaded app to install silently — that last confirmation cannot be removed without
+  Play Store or a system signature.
+- Settings → *App updates* (manual check) and *Check for updates automatically*.
+
 ## v1.5.34 — the headset actually gets the call audio
 
 - **Root cause found**: the in-call route poller passed the engine's `speakerPreferred` flag,
