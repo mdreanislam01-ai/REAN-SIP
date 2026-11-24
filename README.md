@@ -49,6 +49,16 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.33 — headset feedback, headset-only audio, test tone
+
+- **Plug / unplug toast**: "USB-C headset connected · call audio routed" (or Bluetooth / wired,
+  and "Headset disconnected · call audio on the phone"). Works during a call via the route poller
+  and while the app is open via a light foreground watcher.
+- **Call audio only through headset** (Settings): speaker and earpiece are skipped for call
+  audio; pressing Speaker explains instead of switching.
+- **Test tone** in Settings → Audio diagnostics: plays 1.5 s of DTMF through the selected route,
+  so you can hear immediately whether the headset is really receiving call audio.
+
 ## v1.5.32 — Type-C (USB-C) headset audio
 
 - **USB-C earphones now route for calls**: `USB_HEADSET`, `USB_DEVICE`, `USB_ACCESSORY`,

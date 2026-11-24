@@ -904,6 +904,26 @@ object SipEngine {
     }
 
     /** Everything the phone reports about call audio — shown in Settings → Audio diagnostics. */
+    private var testTone: ToneGenerator? = null
+
+    /** Plays 1.5 s of DTMF through whatever route is selected, so a silent headset is obvious. */
+    fun playTestTone() {
+        try {
+            testTone?.let { runCatching { it.release() } }
+            val am = appContext?.getSystemService(AudioManager::class.java)
+            val inCall = callActive
+            if (!inCall) { try { am?.mode = AudioManager.MODE_IN_COMMUNICATION } catch (_: Exception) { } }
+            val gen = ToneGenerator(if (inCall) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC, 85)
+            testTone = gen
+            gen.startTone(ToneGenerator.TONE_DTMF_5, 1500)
+            mainHandler.postDelayed({
+                try { gen.release() } catch (_: Exception) { }
+                testTone = null
+                if (!inCall) try { am?.mode = AudioManager.MODE_NORMAL } catch (_: Exception) { }
+            }, 1900L)
+        } catch (t: Throwable) { recordNonFatal("playTestTone", t) }
+    }
+
     fun audioDiagnostics(): String {
         val ctx = appContext ?: return "Audio engine not running"
         return try {
@@ -927,6 +947,60 @@ object SipEngine {
         } catch (t: Throwable) { "Diagnostics failed: ${t.message}" }
     }
 
+    /* ---------- ② headset-only mode ---------- */
+    fun headsetOnly(): Boolean = try {
+        appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getBoolean("setting:headsetOnly", false) ?: false
+    } catch (_: Exception) { false }
+
+    /** Which external devices are attached right now, e.g. "usb|wired|bt". */
+    fun currentRouteSignature(): String = try {
+        val am = appContext?.getSystemService(AudioManager::class.java) ?: return ""
+        val types = if (Build.VERSION.SDK_INT >= 31) {
+            try { am.availableCommunicationDevices.map { it.type } } catch (_: Exception) { emptyList() }
+        } else {
+            buildList {
+                if (try { am.isWiredHeadsetOn } catch (_: Exception) { false }) add(AudioDeviceInfo.TYPE_WIRED_HEADSET)
+                if (try { am.isBluetoothScoOn || am.isBluetoothA2dpOn } catch (_: Exception) { false }) add(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
+            }
+        }
+        types.filter { it in EXTERNAL_ROUTE_TYPES }.sorted().joinToString("|")
+    } catch (_: Exception) { "" }
+
+    /** Friendly name for the plugged-in device, used by the toast. */
+    fun externalRouteLabel(): String = try {
+        val am = appContext?.getSystemService(AudioManager::class.java) ?: return ""
+        val types = if (Build.VERSION.SDK_INT >= 31) {
+            try { am.availableCommunicationDevices.map { it.type } } catch (_: Exception) { emptyList() }
+        } else emptyList()
+        when {
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO in types || AudioDeviceInfo.TYPE_HEARING_AID in types -> "Bluetooth headset"
+            AudioDeviceInfo.TYPE_USB_HEADSET in types || AudioDeviceInfo.TYPE_USB_DEVICE in types || AudioDeviceInfo.TYPE_USB_ACCESSORY in types -> "USB-C headset"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET in types || AudioDeviceInfo.TYPE_WIRED_HEADPHONES in types ||
+                AudioDeviceInfo.TYPE_LINE_ANALOG in types || AudioDeviceInfo.TYPE_AUX_LINE in types -> "Wired headset"
+            else -> ""
+        }
+    } catch (_: Exception) { "" }
+
+    private var announcedRoute = ""
+
+    /** Call audio now goes through [externalRouteLabel] (or back to the phone). */
+    private fun announceRouteIfChanged(ctx: Context) {
+        try {
+            val sig = currentRouteSignature()
+            if (sig == announcedRoute) return
+            announcedRoute = sig
+            val label = externalRouteLabel()
+            val msg = if (label.isBlank()) "Headset disconnected · call audio on the phone" else "$label connected · call audio routed"
+            mainHandler.post { try { android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show() } catch (_: Exception) { } }
+        } catch (_: Exception) { }
+    }
+
+    /** Called by the Activity while it is on screen so plug/unplug is noticed outside calls. */
+    fun checkHeadsetChange(context: Context) {
+        if (callActive) return                     // the route poller already announces during calls
+        announceRouteIfChanged(context)
+    }
+
     fun routeAudio(preferSpeaker: Boolean) {
         speakerPreferred = preferSpeaker
         val ctx = appContext ?: return
@@ -935,6 +1009,7 @@ object SipEngine {
             val am = ctx.getSystemService(AudioManager::class.java) ?: return
             am.mode = AudioManager.MODE_IN_COMMUNICATION
             val choice = when {
+                headsetOnly() -> "auto"        // never fall back to the loudspeaker
                 preferSpeaker -> "speaker"
                 else -> forcedRoute()
             }
@@ -984,6 +1059,7 @@ object SipEngine {
             }
 
             routeLinphoneDevices(choice, c)
+            announceRouteIfChanged(ctx)
         } catch (t: Throwable) { recordNonFatal("routeAudio", t) }
     }
 
@@ -1406,6 +1482,13 @@ object SipEngine {
         } catch (e: Exception) { CallBridge.activity?.errorMessage = "Could not ${if (held) "hold" else "resume"} call: ${e.message}" }
     }
     fun setSpeakerOn(enabled: Boolean) {
+        if (enabled && headsetOnly()) {
+            val ctx = appContext
+            if (ctx != null) mainHandler.post { try { android.widget.Toast.makeText(ctx, "Headset-only mode is on — turn it off in Settings to use the speaker", android.widget.Toast.LENGTH_SHORT).show() } catch (_: Exception) { } }
+            CallBridge.activity?.speaker = false
+            routeAudio(false)
+            return
+        }
         CallBridge.activity?.speaker = enabled
         if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setSpeakerRoute(enabled); showCallNotification(); return }
         routeAudio(enabled)
@@ -2811,6 +2894,13 @@ class MainActivity : ComponentActivity() {
         /* Coming back to the app while a call runs (notification tap, recents, unlock) must
            land on the call screen instead of the last tab. */
         if (SipEngine.callActive || TelecomCallBridge.currentCall != null) callUiRequested = true
+        headsetWatchHandler.removeCallbacks(headsetWatch)
+        headsetWatchHandler.postDelayed(headsetWatch, 1500L)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        headsetWatchHandler.removeCallbacks(headsetWatch)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -2952,6 +3042,25 @@ class MainActivity : ComponentActivity() {
     fun prefsRouteChoice(): String = prefs().getString("setting:callRoute", "auto") ?: "auto"
 
     fun audioDiagnosticsText(): String = SipEngine.audioDiagnostics()
+
+    fun playTestTone() { SipEngine.playTestTone() }
+
+    fun headsetOnlyEnabled(): Boolean = SipEngine.headsetOnly()
+
+    fun setHeadsetOnly(on: Boolean) {
+        prefs().edit().putBoolean("setting:headsetOnly", on).apply()
+        if (on) { speaker = false; SipEngine.setSpeakerOn(false) }
+        resumeTick++
+    }
+
+    /* Plug / unplug while the app is open: a toast tells the user where call audio went. */
+    private val headsetWatchHandler = Handler(Looper.getMainLooper())
+    private val headsetWatch = object : Runnable {
+        override fun run() {
+            try { SipEngine.checkHeadsetChange(this@MainActivity) } catch (_: Exception) { }
+            headsetWatchHandler.postDelayed(this, 3000L)
+        }
+    }
 
     /** Android 12+ needs the runtime Bluetooth permission before a headset can carry call audio. */
     fun needsBluetoothPermission(): Boolean = Build.VERSION.SDK_INT >= 31 &&
@@ -5060,12 +5169,15 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                     }
                 },
                 confirmButton = {
-                    TextButton(onClick = {
-                        try {
-                            val share = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }
-                            activity.startActivity(Intent.createChooser(share, "Share audio diagnostics"))
-                        } catch (_: Exception) { }
-                    }) { Text("Share") }
+                    Row {
+                        TextButton(onClick = { activity.playTestTone() }) { Text("Test tone") }
+                        TextButton(onClick = {
+                            try {
+                                val share = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }
+                                activity.startActivity(Intent.createChooser(share, "Share audio diagnostics"))
+                            } catch (_: Exception) { }
+                        }) { Text("Share") }
+                    }
                 },
                 dismissButton = { TextButton(onClick = { showAudioDiag = false }) { Text("Close") } }
             )
@@ -5180,6 +5292,9 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
                 if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
                 toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })
+            SettingRow(Icons.Filled.VolumeOff, MaterialTheme.colorScheme.primary, "Call audio only through headset",
+                if (activity.headsetOnlyEnabled()) "On · never plays call audio on the phone speaker" else "Off · speaker and earpiece are allowed",
+                toggle = true, checked = activity.headsetOnlyEnabled(), onClick = { activity.setHeadsetOnly(!activity.headsetOnlyEnabled()) })
             SettingRow(Icons.Filled.Headset, MaterialTheme.colorScheme.primary, "Audio output",
                 "Now: ${activity.callRouteLabel()} · tap to choose (also shown in the in-call ⋮ menu)",
                 onClick = { showAudioRouteSettings = true })

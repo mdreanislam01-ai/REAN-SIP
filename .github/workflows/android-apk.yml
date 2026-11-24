@@ -99,11 +99,19 @@ jobs:
       - name: Publish installable APK download
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: callerx-v1.5.32
-          name: CallerX Android APK v1.5.32
+          tag_name: callerx-v1.5.33
+          name: CallerX Android APK v1.5.33
           target_commitish: ${{ github.sha }}
           body: |
             Installable CallerX Android debug APK.
+
+            v1.5.33 — headset feedback and control:
+            - Plugging or unplugging a headset shows a toast ("USB-C headset connected · call
+              audio routed" / "Headset disconnected …") — in a call and while the app is open.
+            - New setting "Call audio only through headset": the phone speaker is never used for
+              call audio, and the Speaker button politely refuses.
+            - Settings → Audio diagnostics now has a "Test tone" button that plays 1.5 s through
+              the selected route, so a silent headset is obvious immediately.
 
             v1.5.32 — USB-C (Type-C) headset audio:
             - USB-C earphones are now routed for calls: USB_HEADSET / USB_DEVICE / USB_ACCESSORY /
