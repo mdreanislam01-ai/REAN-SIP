@@ -485,6 +485,9 @@ object SipEngine {
     /* true while a headset (wired or Bluetooth) is the active route */
     var headsetActive by mutableStateOf(false)
     private var speakerPreferred = false
+    /* True only when the user pressed the Speaker button during the current call; a headset
+       that shows up later must be allowed to steal the audio back from the speaker. */
+    private var speakerChosenByUser = false
     var lastRegistrationMessage by mutableStateOf("SIP Offline")
     var lastCallState by mutableStateOf("")
     var callActive by mutableStateOf(false)
@@ -496,7 +499,18 @@ object SipEngine {
     }
 
     private val netCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) { scheduleRefresh(800) }
+        override fun onAvailable(network: Network) {
+            /* New Wi-Fi / mobile data / hotspot: re-register once the interface settles. */
+            scheduleRefresh(if (callActive) 3000 else 800)
+        }
+        override fun onCapabilitiesChanged(network: Network, caps: android.net.NetworkCapabilities) {
+            /* Handover between Wi-Fi and mobile data (same network object, new capabilities).
+               Never touch SIP while a call is running; otherwise re-register quietly. */
+            if (!callActive) scheduleRefresh(1500)
+            if (!caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                lastRegistrationMessage = "Waiting for internet…"
+            }
+        }
         /* onLost intentionally does nothing: refreshing on lost only causes
            register flapping when switching between Wi-Fi and mobile data. */
     }
@@ -554,6 +568,10 @@ object SipEngine {
                 }
                 override fun onCallStateChanged(core: Core, call: Call, state: Call.State, message: String) {
                     mainHandler.post {
+                      /* Anything thrown in here used to kill the whole app ("CallerX force closed
+                         due to an internal error") because a posted Runnable runs on the main
+                         looper. One bad state change must never close the call UI. */
+                      try {
                         val a = CallBridge.activity
                         activeCall = if (state == Call.State.End || state == Call.State.Error || state == Call.State.Released) null else call
                         when (state) {
@@ -565,6 +583,8 @@ object SipEngine {
                                 val others = try { core.calls.count { it != call && it.state != Call.State.End && it.state != Call.State.Released } } catch (_: Exception) { 0 }
                                 val waiting = others > 0
                                 if (a != null && !waiting) {
+                                    speakerPreferred = false
+                                    speakerChosenByUser = false
                                     a.activeCallName = remoteName
                                     a.activeNumber = remoteNumber
                                     a.callConnected = false
@@ -591,11 +611,15 @@ object SipEngine {
                                 } else if (!applyForwarding(call, waiting)) { startIncomingVibration(); startIncomingRingtone() }
                             }
                             Call.State.OutgoingInit, Call.State.OutgoingProgress -> {
+                                speakerPreferred = false
+                                speakerChosenByUser = false
                                 if (a != null) { a.callConnected = false; a.muted = false; a.speaker = false; a.callStartedAt = 0L; a.recording = false }
                                 sipCallIncoming = false; sipCallLogged = false
                                 acquireCallLocks()
                                 acquireAudioFocus()
-                                routeAudio(a?.speaker ?: false)
+                                /* Routing is done once the streams are up (Connected / StreamsRunning):
+                                   touching the communication device while liblinphone is still
+                                   negotiating used to race the audio HAL and could kill the app. */
                             }
                             Call.State.Connected -> {
                                 if (a != null) { a.callConnected = true; if (a.callStartedAt == 0L) a.callStartedAt = System.currentTimeMillis() }
@@ -616,6 +640,7 @@ object SipEngine {
                                 stopIncomingVibration()
                                 acquireCallLocks()
                                 acquireAudioFocus()
+                                mainHandler.postDelayed({ routeAudio(a?.speaker ?: speakerPreferred) }, if (state == Call.State.Connected) 300 else 150)
                                 maybeAutoRecord()
                             }
                             Call.State.End, Call.State.Released, Call.State.Error -> {
@@ -659,7 +684,10 @@ object SipEngine {
                             state == Call.State.OutgoingEarlyMedia || state == Call.State.Connected ||
                             state == Call.State.StreamsRunning || state == Call.State.Paused || state == Call.State.Resuming
                         callActive = active
-                        if (active) showCallNotification() else cancelCallNotification()
+                        if (active) { showCallNotification(); startRoutePolling() } else { cancelCallNotification(); stopRoutePolling() }
+                      } catch (t: Throwable) {
+                        recordNonFatal("call state \${state.name}", t)
+                      }
                     }
                 }
             })
@@ -679,6 +707,17 @@ object SipEngine {
         core = null
         activeCall = null
         callActive = false
+    }
+
+    /** Writes a non-fatal problem next to the crash log so it can be shared from Settings. */
+    private fun recordNonFatal(where: String, t: Throwable) {
+        try {
+            val ctx = appContext ?: return
+            val sw = java.io.StringWriter()
+            t.printStackTrace(java.io.PrintWriter(sw))
+            val stamp = android.text.format.DateFormat.format("yyyy-MM-dd HH:mm:ss", java.util.Date()).toString()
+            File(ctx.filesDir, "crash-log.txt").appendText("CallerX non-fatal · $stamp · $where\n$sw\n")
+        } catch (_: Exception) { }
     }
 
     fun refreshRegisters() { scheduleRefresh(800) }
@@ -730,6 +769,7 @@ object SipEngine {
     }
 
     private fun releaseCallLocks() {
+        try { stopRoutePolling() } catch (_: Exception) { }
         try { callWakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
         callWakeLock = null
         try { callWifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) { }
@@ -772,78 +812,336 @@ object SipEngine {
     }
 
     /* Audio routing.
-       Linphone's own device list is not enough: on many phones the wired
-       headset / Bluetooth SCO device only appears through the system
-       AudioManager, which is why headphones stayed silent before.
-       Order of preference (no manual choice): Bluetooth > wired/USB headset >
-       earpiece, and the speaker toggle wins over everything when it is on. */
+       Three layers decide where call audio goes and they used to fight each other:
+         1. AudioManager (the only one that can pick a Bluetooth SCO / wired headset),
+         2. liblinphone's own device chooser,
+         3. this app's speaker switch.
+       Rules now:
+         - a user-chosen route (⋮ → Audio output) always wins,
+         - otherwise Bluetooth > wired > earpiece, speaker switch beats everything,
+         - liblinphone's device is only overridden when it actually lists a matching device;
+           when it does not (common for Bluetooth), AudioManager stays in charge,
+         - Bluetooth SCO is (re)started on API < 31 and retried when the SCO device is not
+           ready yet, which is why headset audio used to stay on the phone speaker. */
+    private fun forcedRoute(): String {
+        val ctx = appContext ?: return ""
+        return try { ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getString("setting:callRoute", "auto") ?: "auto" } catch (_: Exception) { "auto" }
+    }
+
+    fun setCallRoute(route: String) {
+        try {
+            appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.edit()?.putString("setting:callRoute", route)?.apply()
+        } catch (_: Exception) { }
+        speakerPreferred = route == "speaker"
+        routeAudio(speakerPreferred)
+    }
+
+    /** Bluetooth is connected but exposes no call (HFP/SCO) profile — headset audio is impossible. */
+    fun bluetoothCallAudioReady(): Boolean = try {
+        val am = appContext?.getSystemService(AudioManager::class.java) ?: return true
+        if (Build.VERSION.SDK_INT >= 31) {
+            am.availableCommunicationDevices.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+        } else {
+            am.isBluetoothScoAvailableOffCall
+        }
+    } catch (_: Exception) { true }
+
+    /** True when something is paired/connected over Bluetooth audio at all (A2DP or SCO). */
+    fun bluetoothConnected(): Boolean = try {
+        val am = appContext?.getSystemService(AudioManager::class.java) ?: return false
+        am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+        }
+    } catch (_: Exception) { false }
+
+    /* Every device type that can carry a headset/speakerphone call. USB-C earphones show up
+       as USB_HEADSET (digital), USB_DEVICE (DAC/AUX) or even WIRED_HEADPHONES on some ROMs. */
+    private val EXTERNAL_ROUTE_TYPES = setOf(
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_USB_DEVICE,
+        AudioDeviceInfo.TYPE_USB_ACCESSORY,
+        AudioDeviceInfo.TYPE_LINE_ANALOG,
+        AudioDeviceInfo.TYPE_AUX_LINE,
+        AudioDeviceInfo.TYPE_HEARING_AID
+    )
+
+    private fun communicationTarget(am: AudioManager, choice: String): AudioDeviceInfo? {
+        val devices = try { am.availableCommunicationDevices } catch (_: Exception) { emptyList<AudioDeviceInfo>() }
+        if (devices.isEmpty()) return null
+        fun pick(type: Int) = devices.firstOrNull { it.type == type }
+        val sco = pick(AudioDeviceInfo.TYPE_BLUETOOTH_SCO) ?: pick(AudioDeviceInfo.TYPE_HEARING_AID)
+        val usb = pick(AudioDeviceInfo.TYPE_USB_HEADSET)
+            ?: pick(AudioDeviceInfo.TYPE_USB_DEVICE)
+            ?: pick(AudioDeviceInfo.TYPE_USB_ACCESSORY)
+        val wired = pick(AudioDeviceInfo.TYPE_WIRED_HEADSET)
+            ?: pick(AudioDeviceInfo.TYPE_WIRED_HEADPHONES)
+            ?: pick(AudioDeviceInfo.TYPE_LINE_ANALOG)
+            ?: pick(AudioDeviceInfo.TYPE_AUX_LINE)
+        return when (choice) {
+            "speaker" -> pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) ?: devices.firstOrNull()
+            "earpiece" -> pick(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+            "bluetooth" -> sco
+            "usb" -> usb
+            "wired" -> wired ?: usb
+            else -> sco ?: (wired ?: usb) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)
+        }
+    }
+
+    /** Readable name for an AudioDeviceInfo type (used by the diagnostics dialog). */
+    fun audioTypeName(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "Earpiece"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Speaker"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired headset (mic)"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired headphones"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth SCO (call)"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth A2DP (music)"
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "USB device (DAC / AUX)"
+        AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USB accessory"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB-C headset"
+        AudioDeviceInfo.TYPE_LINE_ANALOG -> "Line analog"
+        AudioDeviceInfo.TYPE_LINE_DIGITAL -> "Line digital"
+        AudioDeviceInfo.TYPE_AUX_LINE -> "AUX line"
+        AudioDeviceInfo.TYPE_HEARING_AID -> "Hearing aid"
+        AudioDeviceInfo.TYPE_BLE_HEADSET -> "BLE headset"
+        AudioDeviceInfo.TYPE_BLE_SPEAKER -> "BLE speaker"
+        else -> "type $type"
+    }
+
+    /** Everything the phone reports about call audio — shown in Settings → Audio diagnostics. */
+    private var testTone: ToneGenerator? = null
+
+    /** Plays 1.5 s of DTMF through whatever route is selected, so a silent headset is obvious. */
+    fun playTestTone() {
+        try {
+            testTone?.let { runCatching { it.release() } }
+            val am = appContext?.getSystemService(AudioManager::class.java)
+            val inCall = callActive
+            if (!inCall) { try { am?.mode = AudioManager.MODE_IN_COMMUNICATION } catch (_: Exception) { } }
+            val gen = ToneGenerator(if (inCall) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC, 85)
+            testTone = gen
+            gen.startTone(ToneGenerator.TONE_DTMF_5, 1500)
+            mainHandler.postDelayed({
+                try { gen.release() } catch (_: Exception) { }
+                testTone = null
+                if (!inCall) try { am?.mode = AudioManager.MODE_NORMAL } catch (_: Exception) { }
+            }, 1900L)
+        } catch (t: Throwable) { recordNonFatal("playTestTone", t) }
+    }
+
+    fun audioDiagnostics(): String {
+        val ctx = appContext ?: return "Audio engine not running"
+        return try {
+            val am = ctx.getSystemService(AudioManager::class.java) ?: return "AudioManager missing"
+            val sb = StringBuilder()
+            sb.appendLine("CallerX audio diagnostics")
+            sb.appendLine("Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) · ${Build.MANUFACTURER} ${Build.MODEL}")
+            sb.appendLine("preferred route: ${forcedRoute()} · speaker toggle: $speakerPreferred")
+            sb.appendLine("mode: ${am.mode} · speakerphone: ${am.isSpeakerphoneOn}")
+            sb.appendLine("bluetooth: connected=${bluetoothConnected()} hfpReady=${bluetoothCallAudioReady()}")
+            if (Build.VERSION.SDK_INT >= 31) {
+                sb.appendLine("current communication device: " + (am.communicationDevice?.let { audioTypeName(it.type) } ?: "none (Android decides)"))
+                sb.appendLine("available for calls:")
+                am.availableCommunicationDevices.forEach { sb.appendLine("  • ${audioTypeName(it.type)} — ${it.productName}") }
+            }
+            sb.appendLine("outputs:")
+            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).forEach { sb.appendLine("  • ${audioTypeName(it.type)} — ${it.productName}") }
+            sb.appendLine("liblinphone devices:")
+            try {
+                core?.audioDevices?.forEach { d -> sb.appendLine("  • ${d.type} — id=${d.id}") }
+                sb.appendLine("  output now: " + (core?.outputAudioDevice?.let { "${it.type} id=${it.id}" } ?: "unset"))
+            } catch (_: Exception) { }
+            sb.appendLine("inputs:")
+            am.getDevices(AudioManager.GET_DEVICES_INPUTS).forEach { sb.appendLine("  • ${audioTypeName(it.type)} — ${it.productName}") }
+            sb.toString()
+        } catch (t: Throwable) { "Diagnostics failed: ${t.message}" }
+    }
+
+    /* ---------- ② headset-only mode ---------- */
+    fun headsetOnly(): Boolean = try {
+        appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getBoolean("setting:headsetOnly", false) ?: false
+    } catch (_: Exception) { false }
+
+    /** Which external devices are attached right now, e.g. "usb|wired|bt". */
+    fun currentRouteSignature(): String = try {
+        val am = appContext?.getSystemService(AudioManager::class.java) ?: return ""
+        val types = if (Build.VERSION.SDK_INT >= 31) {
+            try { am.availableCommunicationDevices.map { it.type } } catch (_: Exception) { emptyList() }
+        } else {
+            buildList {
+                if (try { am.isWiredHeadsetOn } catch (_: Exception) { false }) add(AudioDeviceInfo.TYPE_WIRED_HEADSET)
+                if (try { am.isBluetoothScoOn || am.isBluetoothA2dpOn } catch (_: Exception) { false }) add(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
+            }
+        }
+        types.filter { it in EXTERNAL_ROUTE_TYPES }.sorted().joinToString("|")
+    } catch (_: Exception) { "" }
+
+    /** Friendly name for the plugged-in device, used by the toast. */
+    fun externalRouteLabel(): String = try {
+        val am = appContext?.getSystemService(AudioManager::class.java) ?: return ""
+        val types = if (Build.VERSION.SDK_INT >= 31) {
+            try { am.availableCommunicationDevices.map { it.type } } catch (_: Exception) { emptyList() }
+        } else emptyList()
+        when {
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO in types || AudioDeviceInfo.TYPE_HEARING_AID in types -> "Bluetooth headset"
+            AudioDeviceInfo.TYPE_USB_HEADSET in types || AudioDeviceInfo.TYPE_USB_DEVICE in types || AudioDeviceInfo.TYPE_USB_ACCESSORY in types -> "USB-C headset"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET in types || AudioDeviceInfo.TYPE_WIRED_HEADPHONES in types ||
+                AudioDeviceInfo.TYPE_LINE_ANALOG in types || AudioDeviceInfo.TYPE_AUX_LINE in types -> "Wired headset"
+            else -> ""
+        }
+    } catch (_: Exception) { "" }
+
+    private var announcedRoute = ""
+
+    /** Call audio now goes through [externalRouteLabel] (or back to the phone). */
+    private fun announceRouteIfChanged(ctx: Context) {
+        try {
+            val sig = currentRouteSignature()
+            if (sig == announcedRoute) return
+            announcedRoute = sig
+            val label = externalRouteLabel()
+            val msg = if (label.isBlank()) "Headset disconnected · call audio on the phone" else "$label connected · call audio routed"
+            mainHandler.post { try { android.widget.Toast.makeText(ctx, msg, android.widget.Toast.LENGTH_SHORT).show() } catch (_: Exception) { } }
+        } catch (_: Exception) { }
+    }
+
+    /** Called by the Activity while it is on screen so plug/unplug is noticed outside calls. */
+    fun checkHeadsetChange(context: Context) {
+        if (callActive) return                     // the route poller already announces during calls
+        announceRouteIfChanged(context)
+    }
+
+    /** The speaker state shown in the UI (not a leftover flag from the previous call). */
+    private fun currentSpeakerWanted(): Boolean = CallBridge.activity?.speaker ?: speakerPreferred
+
     fun routeAudio(preferSpeaker: Boolean) {
-        speakerPreferred = preferSpeaker
+        /* A headset that appears mid-call takes the audio back from the speaker unless the user
+           explicitly pressed Speaker after the headset was connected. This is what other dialers
+           do, and it fixes "headset detected but sound stayed on the phone speaker". */
+        var prefer = preferSpeaker
+        if (prefer && !speakerChosenByUser && externalRouteLabel().isNotBlank()) {
+            prefer = false
+            CallBridge.activity?.speaker = false
+        }
+        speakerPreferred = prefer
         val ctx = appContext ?: return
         val c = core
         try {
             val am = ctx.getSystemService(AudioManager::class.java) ?: return
             am.mode = AudioManager.MODE_IN_COMMUNICATION
-
-            if (Build.VERSION.SDK_INT >= 31) {
-                val devices = try { am.availableCommunicationDevices } catch (_: Exception) { emptyList<AudioDeviceInfo>() }
-                fun pick(type: Int) = devices.firstOrNull { it.type == type }
-                val bluetooth = pick(AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
-                val wired = pick(AudioDeviceInfo.TYPE_WIRED_HEADSET)
-                    ?: pick(AudioDeviceInfo.TYPE_WIRED_HEADPHONES)
-                    ?: pick(AudioDeviceInfo.TYPE_USB_HEADSET)
-                val target = when {
-                    preferSpeaker -> pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) ?: devices.firstOrNull()
-                    bluetooth != null -> bluetooth
-                    wired != null -> wired
-                    else -> pick(AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) ?: pick(AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) ?: devices.firstOrNull()
-                }
-                if (target != null) try { am.setCommunicationDevice(target) } catch (_: Exception) { }
-                headsetActive = !preferSpeaker && (bluetooth != null || wired != null)
-            } else {
-                val wired = try { am.isWiredHeadsetOn } catch (_: Exception) { false }
-                val bluetooth = try { am.isBluetoothScoOn || am.isBluetoothA2dpOn } catch (_: Exception) { false }
-                if (!preferSpeaker && bluetooth) { try { am.startBluetoothSco() } catch (_: Exception) { } }
-                else { try { am.stopBluetoothSco() } catch (_: Exception) { } }
-                @Suppress("DEPRECATION")
-                try { am.isBluetoothScoOn = !preferSpeaker && bluetooth } catch (_: Exception) { }
-                try { am.isSpeakerphoneOn = preferSpeaker } catch (_: Exception) { }
-                headsetActive = !preferSpeaker && (wired || bluetooth)
+            val choice = when {
+                headsetOnly() -> "auto"        // never fall back to the loudspeaker
+                prefer -> "speaker"
+                else -> forcedRoute()
             }
 
-            /* Keep the Linphone side in sync as well, so its own echo canceller
-               and device chooser use the same route. */
-            routeLinphoneDevices(preferSpeaker, c)
-        } catch (_: Exception) { }
+            if (Build.VERSION.SDK_INT >= 31) {
+                val target = communicationTarget(am, choice)
+                if (target != null) try { am.setCommunicationDevice(target) } catch (_: Exception) { }
+                try { am.isSpeakerphoneOn = choice == "speaker" } catch (_: Exception) { }
+                headsetActive = choice == "bluetooth" || choice == "wired" ||
+                    (choice == "auto" && (target?.type ?: 0) in EXTERNAL_ROUTE_TYPES)
+                /* Attach order is not guaranteed (USB-C headsets especially): re-apply the route
+                   a few times so a headset that appears 0.3–2 s after the call still wins. */
+                listOf(250L, 800L, 1600L).forEach { delayMs ->
+                    mainHandler.postDelayed({
+                        try {
+                            if (!callActive) return@postDelayed
+                            val fresh = communicationTarget(am, choice)
+                            if (fresh != null && am.communicationDevice?.type != fresh.type) am.setCommunicationDevice(fresh)
+                        } catch (_: Exception) { }
+                    }, delayMs)
+                }
+                /* Some headsets only expose SCO after startBluetoothSco(), so verify and retry. */
+                if (choice == "bluetooth" || (choice == "auto" && bluetoothConnected() && choice != "earpiece")) {
+                    mainHandler.postDelayed({
+                        try {
+                            val now = try { am.communicationDevice?.type } catch (_: Exception) { null }
+                            if (now != AudioDeviceInfo.TYPE_BLUETOOTH_SCO && callActive) {
+                                try { @Suppress("DEPRECATION") am.startBluetoothSco() } catch (_: Exception) { }
+                                mainHandler.postDelayed({
+                                    try {
+                                        val again = am.availableCommunicationDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                                        if (again != null) am.setCommunicationDevice(again)
+                                    } catch (_: Exception) { }
+                                }, 700)
+                            }
+                        } catch (_: Exception) { }
+                    }, 700)
+                }
+            } else {
+                val wired = try { am.isWiredHeadsetOn } catch (_: Exception) { false }
+                val wantBt = choice == "bluetooth" || (choice == "auto" && try { am.isBluetoothScoAvailableOffCall } catch (_: Exception) { false } && !preferSpeaker)
+                if (wantBt) { try { am.startBluetoothSco() } catch (_: Exception) { } } else { try { am.stopBluetoothSco() } catch (_: Exception) { } }
+                @Suppress("DEPRECATION")
+                try { am.isBluetoothScoOn = wantBt } catch (_: Exception) { }
+                try { am.isSpeakerphoneOn = choice == "speaker" } catch (_: Exception) { }
+                headsetActive = wantBt || (choice != "speaker" && wired)
+            }
+
+            routeLinphoneDevices(choice, c)
+            announceRouteIfChanged(ctx)
+        } catch (t: Throwable) { recordNonFatal("routeAudio", t) }
     }
 
-    private fun routeLinphoneDevices(preferSpeaker: Boolean, c: Core?) {
+    private fun routeLinphoneDevices(choice: String, c: Core?) {
         if (c == null) return
         try {
             val devices = c.audioDevices
             fun pick(vararg names: String): AudioDevice? =
                 devices.firstOrNull { d -> names.any { n -> d.type.name.equals(n, ignoreCase = true) } }
-            val headset = pick("Bluetooth", "Headset", "Headphones", "HearingAid")
-            val target = if (preferSpeaker) (pick("Speaker") ?: headset)
-                else (headset ?: pick("Earpiece") ?: pick("Speaker") ?: devices.firstOrNull())
-            if (target != null) {
-                c.outputAudioDevice = target
-                val isHeadset = target.type.name.equals("Bluetooth", true) ||
-                    target.type.name.equals("Headset", true) || target.type.name.equals("Headphones", true)
-                if (isHeadset) try { c.inputAudioDevice = target } catch (_: Exception) { }
+            val bt = pick("Bluetooth", "BluetoothSco", "BluetoothA2DP")
+            val wired = pick("Headset", "Headphones", "HearingAid", "USB", "USBHeadset", "Usb", "AuxLine", "Line")
+            val target = when (choice) {
+                "speaker" -> pick("Speaker")
+                "earpiece" -> pick("Earpiece")
+                "bluetooth" -> bt
+                "wired" -> wired
+                else -> bt ?: wired ?: pick("Earpiece")
             }
-        } catch (_: Exception) { }
+            /* No matching liblinphone device: leave the routing to AudioManager instead of
+               forcing the earpiece speaker, which is what silenced headsets before. */
+            if (target == null) return
+            c.outputAudioDevice = target
+            val isHeadset = bt === target || wired === target
+            if (isHeadset) try { c.inputAudioDevice = target } catch (_: Exception) { }
+        } catch (t: Throwable) { recordNonFatal("routeLinphoneDevices", t) }
     }
 
     /* Re-routes as soon as a headset is plugged in / removed or a Bluetooth
        device connects, even in the middle of a call. */
+    /* ACTION_HEADSET_PLUG does not fire for USB-C earphones on many ROMs (Xiaomi/HyperOS
+       included), so while a call is running the device list is polled instead — that is what
+       makes a Type-C headset that is plugged in during a call take over the audio. */
+    private var routePolling = false
+    private val routePoll = object : Runnable {
+        override fun run() {
+            if (!callActive) { routePolling = false; return }
+            try { routeAudio(currentSpeakerWanted()) } catch (_: Exception) { }
+            mainHandler.postDelayed(this, 1500L)
+        }
+    }
+
+    private fun startRoutePolling() {
+        if (routePolling) return
+        routePolling = true
+        mainHandler.postDelayed(routePoll, 1200L)
+    }
+
+    private fun stopRoutePolling() {
+        routePolling = false
+        try { mainHandler.removeCallbacks(routePoll) } catch (_: Exception) { }
+    }
+
     private var deviceReceiver: BroadcastReceiver? = null
     private fun registerDeviceReceiver(ctx: Context) {
         if (deviceReceiver != null) return
         deviceReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 mainHandler.postDelayed({
-                    if (callActive) try { routeAudio(speakerPreferred) } catch (_: Exception) { }
+                    if (callActive) try { routeAudio(currentSpeakerWanted()) } catch (_: Exception) { }
                 }, 400)
             }
         }
@@ -1207,6 +1505,14 @@ object SipEngine {
         } catch (e: Exception) { CallBridge.activity?.errorMessage = "Could not ${if (held) "hold" else "resume"} call: ${e.message}" }
     }
     fun setSpeakerOn(enabled: Boolean) {
+        speakerChosenByUser = true
+        if (enabled && headsetOnly()) {
+            val ctx = appContext
+            if (ctx != null) mainHandler.post { try { android.widget.Toast.makeText(ctx, "Headset-only mode is on — turn it off in Settings to use the speaker", android.widget.Toast.LENGTH_SHORT).show() } catch (_: Exception) { } }
+            CallBridge.activity?.speaker = false
+            routeAudio(false)
+            return
+        }
         CallBridge.activity?.speaker = enabled
         if (TelecomCallBridge.currentCall != null) { TelecomCallBridge.service?.setSpeakerRoute(enabled); showCallNotification(); return }
         routeAudio(enabled)
@@ -1491,24 +1797,68 @@ object SipEngine {
     }
 
     /* Missed SIP call → its own notification channel, so it can be muted separately. */
+    /* Missed calls are collected in one list ("missed:pending") so the notification can say
+       "3 missed calls" instead of overwriting itself, and so the badge knows what is unseen. */
+    private fun pendingMissed(ctx: Context): org.json.JSONArray = try {
+        org.json.JSONArray(ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getString("missed:pending", "[]") ?: "[]")
+    } catch (_: Exception) { org.json.JSONArray() }
+
+    fun missedSeenAt(): Long = try {
+        appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getLong("missed:seenAt", 0L) ?: 0L
+    } catch (_: Exception) { 0L }
+
+    fun unseenMissedCount(): Int = try {
+        val ctx = appContext ?: return 0
+        val seen = missedSeenAt()
+        val arr = pendingMissed(ctx)
+        var n = 0
+        for (i in 0 until arr.length()) if (arr.optJSONObject(i)?.optLong("ts", 0L) ?: 0L > seen) n++
+        n
+    } catch (_: Exception) { 0 }
+
+    /** The user looked at the missed calls: forget the badge and the notification. */
+    fun clearMissed(context: Context) {
+        try {
+            context.getSharedPreferences("callerx", Context.MODE_PRIVATE).edit()
+                .putString("missed:pending", "[]")
+                .putLong("missed:seenAt", System.currentTimeMillis())
+                .apply()
+            context.getSystemService(NotificationManager::class.java)?.cancel(9101)
+            CallBridge.activity?.resumeTick?.let { CallBridge.activity?.resumeTick = it + 1 }
+        } catch (_: Exception) { }
+    }
+
     private fun showMissedCallNotification(number: String, name: String) {
         val ctx = appContext ?: return
         try {
             ensureNotificationChannels(ctx)
             val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+            val prefs = ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE)
+            val arr = pendingMissed(ctx)
+            runCatching {
+                arr.put(org.json.JSONObject().apply {
+                    put("number", number); put("name", name); put("ts", System.currentTimeMillis())
+                })
+            }
+            val recent = org.json.JSONArray()
+            for (i in maxOf(0, arr.length() - 20) until arr.length()) recent.put(arr.optJSONObject(i))
+            prefs.edit().putString("missed:pending", recent.toString()).apply()
+            val count = unseenMissedCount().coerceAtLeast(1)
             val open = Intent(ctx, MainActivity::class.java).apply {
-                putExtra("callerx_widget", "dialer")
+                putExtra("callerx_widget", "missed")
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
             }
             val pi = PendingIntent.getActivity(ctx, 9101, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val builder = androidx.core.app.NotificationCompat.Builder(ctx, "callerx_missed")
                 .setSmallIcon(android.R.drawable.sym_call_missed)
-                .setContentTitle("Missed call · ${name.ifBlank { number }}")
-                .setContentText(number)
+                .setContentTitle(if (count > 1) "$count missed calls" else "Missed call · ${name.ifBlank { number }}")
+                .setContentText(if (count > 1) "Last: ${name.ifBlank { number }} · $number" else number)
                 .setContentIntent(pi)
                 .setAutoCancel(true)
+                .setNumber(count)
                 .setPriority(androidx.core.app.NotificationCompat.PRIORITY_DEFAULT)
             nm.notify(9101, builder.build())
+            CallBridge.activity?.resumeTick?.let { CallBridge.activity?.resumeTick = it + 1 }
         } catch (_: Exception) { }
     }
 
@@ -2531,6 +2881,11 @@ class MainActivity : ComponentActivity() {
             callState = SipEngine.lastCallState
             callUiRequested = true
         }
+        /* Recreated while ringing/in a call (lock screen, task swipe): come back on top of
+           the keyguard instead of hiding behind it. */
+        if (callUiRequested || SipEngine.callActive || TelecomCallBridge.currentCall != null) {
+            applyCallWindow(true)
+        }
         /* The engine runs in the foreground service, not here: locking the
            phone or destroying this Activity must never stop the mic/call. */
         startKeepAliveService()
@@ -2563,6 +2918,13 @@ class MainActivity : ComponentActivity() {
         /* Coming back to the app while a call runs (notification tap, recents, unlock) must
            land on the call screen instead of the last tab. */
         if (SipEngine.callActive || TelecomCallBridge.currentCall != null) callUiRequested = true
+        headsetWatchHandler.removeCallbacks(headsetWatch)
+        headsetWatchHandler.postDelayed(headsetWatch, 1500L)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        headsetWatchHandler.removeCallbacks(headsetWatch)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -2611,6 +2973,129 @@ class MainActivity : ComponentActivity() {
     fun mergeSipCalls(): Boolean = SipEngine.mergeCalls()
 
     /* ---------- Call metrics: duration, quality, network, recording ---------- */
+    /* ---------- Lock screen behaviour during calls ---------- */
+
+    /** Settings → "Show calls over the lock screen" (default on). */
+    fun callOverLockEnabled(): Boolean = try {
+        prefs().getBoolean("setting:callOverLock", true)
+    } catch (_: Exception) { true }
+
+    /** Settings → "Skip app PIN during calls" (default on). */
+    fun pinSkipDuringCall(): Boolean = try {
+        prefs().getBoolean("setting:pinSkipCall", true)
+    } catch (_: Exception) { true }
+
+    /**
+     * Shows this Activity above the keyguard and wakes the screen while a call is live.
+     * A secure lock (PIN/pattern/fingerprint) is never bypassed: on those the system still
+     * asks the owner to unlock, we only make sure the call UI is what appears on top.
+     */
+    fun applyCallWindow(on: Boolean) {
+        try {
+            if (Build.VERSION.SDK_INT >= 27) {
+                setShowWhenLocked(on)
+                setTurnScreenOn(on)
+            } else {
+                @Suppress("DEPRECATION")
+                if (on) window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+                else window.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+            }
+            if (on && Build.VERSION.SDK_INT >= 26) {
+                val km = getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
+                if (km?.isKeyguardLocked == true && !km.isDeviceSecure) {
+                    /* requestDismissKeyguard only removes a non-secure keyguard; on a secure
+                       one Android shows the normal unlock prompt. Nothing is bypassed. */
+                    km.requestDismissKeyguard(this, null)
+                }
+            }
+        } catch (_: Exception) { }
+    }
+
+    /** True when Android 14+ lets CallerX use full-screen call alerts. */
+    fun fullScreenCallAlertsAllowed(): Boolean = try {
+        if (Build.VERSION.SDK_INT >= 34) {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager).canUseFullScreenIntent()
+        } else true
+    } catch (_: Exception) { true }
+
+    /** Opens the system screen where the user can allow full-screen call alerts. */
+    fun openFullScreenAlertSettings() {
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, android.net.Uri.parse("package:$packageName")))
+            } else {
+                errorMessage = "Android ${Build.VERSION.RELEASE} allows full-screen call alerts automatically."
+            }
+        } catch (_: Exception) {
+            errorMessage = "Open Settings → Apps → CallerX → Notifications to allow full-screen alerts."
+        }
+    }
+
+    /** Marks the missed calls as seen (badge + notification disappear). */
+    fun markMissedCallsSeen() {
+        SipEngine.clearMissed(this)
+        resumeTick++
+    }
+
+    fun unseenMissed(): Int = SipEngine.unseenMissedCount()
+
+    fun missedSeenAt(): Long = SipEngine.missedSeenAt()
+
+    fun setCallRoute(route: String) { SipEngine.setCallRoute(route); resumeTick++ }
+
+    fun callRouteLabel(): String = when (prefs().getString("setting:callRoute", "auto") ?: "auto") {
+        "speaker" -> "Speaker"
+        "earpiece" -> "Phone earpiece"
+        "bluetooth" -> "Bluetooth headset"
+        "usb" -> "USB-C headset"
+        "wired" -> "Wired headset (3.5 mm / adapter)"
+        else -> if (SipEngine.bluetoothConnected() && SipEngine.bluetoothCallAudioReady()) "Automatic · Bluetooth" else "Automatic"
+    }
+
+    fun audioRouteOptions(): List<Pair<String, String>> = buildList {
+        add("auto" to "Automatic (Bluetooth → wired → earpiece)")
+        add("earpiece" to "Phone earpiece")
+        add("speaker" to "Speaker")
+        if (SipEngine.bluetoothConnected()) {
+            add("bluetooth" to if (SipEngine.bluetoothCallAudioReady()) "Bluetooth headset" else "Bluetooth connected, but it has no call-audio (HFP) profile")
+        }
+        add("usb" to "USB-C headset")
+        add("wired" to "Wired headset (3.5 mm / adapter)")
+    }
+
+    fun prefsRouteChoice(): String = prefs().getString("setting:callRoute", "auto") ?: "auto"
+
+    fun audioDiagnosticsText(): String = SipEngine.audioDiagnostics()
+
+    fun playTestTone() { SipEngine.playTestTone() }
+
+    fun headsetOnlyEnabled(): Boolean = SipEngine.headsetOnly()
+
+    fun setHeadsetOnly(on: Boolean) {
+        prefs().edit().putBoolean("setting:headsetOnly", on).apply()
+        if (on) { speaker = false; SipEngine.setSpeakerOn(false) }
+        resumeTick++
+    }
+
+    /* Plug / unplug while the app is open: a toast tells the user where call audio went. */
+    private val headsetWatchHandler = Handler(Looper.getMainLooper())
+    private val headsetWatch = object : Runnable {
+        override fun run() {
+            try { SipEngine.checkHeadsetChange(this@MainActivity) } catch (_: Exception) { }
+            headsetWatchHandler.postDelayed(this, 3000L)
+        }
+    }
+
+    /** Android 12+ needs the runtime Bluetooth permission before a headset can carry call audio. */
+    fun needsBluetoothPermission(): Boolean = Build.VERSION.SDK_INT >= 31 &&
+        checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) != android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    fun requestBluetoothPermission() {
+        if (needsBluetoothPermission()) {
+            try { requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT), 4713) } catch (_: Exception) { }
+        }
+    }
+
     fun callQuality(): Float = SipEngine.callQuality()
 
     fun qualityLabel(q: Float): String = when {
@@ -2820,6 +3305,14 @@ private fun CallerXApp(activity: MainActivity) {
             request.startsWith("speed:") -> request.removePrefix("speed:").toIntOrNull()?.let { activity.dialSpeedSlot(it) }
             request == "recordings" -> screen = "recordings"
             request == "favorites" -> { tab = "Favorites"; screen = "home" }
+            request == "missed" -> { tab = "Calls"; filter = "Missed"; screen = "home" }
+        }
+    }
+    /* "I have seen them": half a second on the Calls tab (or the Missed filter) is enough. */
+    LaunchedEffect(tab, filter, screen, activity.resumeTick, recentCalls.size) {
+        if (screen == "home" && (tab == "Calls" || filter == "Missed") && activity.unseenMissed() > 0) {
+            delay(700)
+            activity.markMissedCallsSeen()
         }
     }
     LaunchedEffect(activity.errorMessage) { if (activity.errorMessage.isNotBlank()) showError = true }
@@ -2864,6 +3357,7 @@ private fun CallerXApp(activity: MainActivity) {
        Icons switch to white over the coloured header and to dark over the
        light call screen, so they are always readable. */
     val view = LocalView.current
+    val overLockScreen = remember(activity.resumeTick, screen) { activity.callOverLockEnabled() }
     SideEffect {
         val win = (view.context as? android.app.Activity)?.window
         if (win != null) {
@@ -2877,9 +3371,11 @@ private fun CallerXApp(activity: MainActivity) {
             /* Call screen must show over the lock screen and keep the screen on,
                otherwise locking the phone kills the visible call UI / mic. */
             if (screen == "call") {
-                win.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                win.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                activity.applyCallWindow(overLockScreen)
             } else {
-                win.clearFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                win.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                activity.applyCallWindow(false)
             }
         }
     }
@@ -2958,16 +3454,19 @@ private fun CallerXApp(activity: MainActivity) {
                 contentWindowInsets = WindowInsets(0, 0, 0, 0),
                 bottomBar = { NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                     // missed calls from the last 24 h get a badge, like the system dialer
-                    val missedCount = remember(recentCalls) {
+                    /* Badge = missed calls you have not looked at yet (last 24 h). Opening the
+                       Calls tab or tapping the missed notification clears it. */
+                    val missedSeen = remember(activity.resumeTick, recentCalls) { activity.missedSeenAt() }
+                    val missedCount = remember(recentCalls, missedSeen) {
                         val dayAgo = System.currentTimeMillis() - 24L * 3600 * 1000
-                        recentCalls.count { it.callType == CallLog.Calls.MISSED_TYPE && it.ts >= dayAgo }
+                        recentCalls.count { it.callType == CallLog.Calls.MISSED_TYPE && it.ts >= dayAgo && it.ts > missedSeen }
                     }
                     listOf("Calls" to Icons.Filled.Call, "Favorites" to Icons.Filled.Star, "Contacts" to Icons.Filled.Contacts, "Messages" to Icons.AutoMirrored.Filled.Message, "Settings" to Icons.Filled.Settings).forEach { (label, icon) ->
                         NavigationBarItem(
                             selected = tab == label,
                             onClick = { tab = label; query = "" },
                             icon = {
-                                if (label == "Calls" && missedCount > 0) {
+                                if (label == "Calls" && missedCount > 0 && tab != "Calls") {
                                     BadgedBox(badge = { Badge { Text("$missedCount", fontSize = 9.sp) } }) {
                                         Icon(icon, label, modifier = Modifier.size(20.dp))
                                     }
@@ -3219,8 +3718,9 @@ private fun CallerXApp(activity: MainActivity) {
             dismissButton = { TextButton(onClick = { showWelcome = false; prefs.edit().putBoolean("permission-intro-seen", true).apply() }) { Text("Not now") } }
         )
 
-        /* PIN lock sits on top of everything (SIP calls still ring in the background). */
-        if (appPin.isNotBlank() && !unlocked) {
+        /* PIN lock sits on top of everything except a live call: an incoming or ongoing call
+           must never be hidden behind the app-lock keypad. */
+        if (appPin.isNotBlank() && !unlocked && !(screen == "call" && activity.pinSkipDuringCall())) {
             LockScreen(
                 pinLength = appPin.length,
                 input = pinInput,
@@ -3793,6 +4293,7 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
     var showTransfer by remember { mutableStateOf(false) }
     var transferNumber by remember { mutableStateOf("") }
     var showMore by remember { mutableStateOf(false) }
+    var showAudioRoute by remember { mutableStateOf(false) }
     var qualitySamples by remember { mutableStateOf(listOf<Float>()) }
     val isCell = TelecomCallBridge.currentCall != null
     val callerPhoto = remember(activity.activeNumber, isCell) { if (isCell) "" else activity.photoForNumber(activity.activeNumber) }
@@ -3978,6 +4479,7 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
                 title = { Text("More actions") },
                 text = {
                     Column {
+                        entry(Icons.Filled.Headset, "Audio output", "Now: ${activity.callRouteLabel()}") { showAudioRoute = true }
                         if (!isCell) entry(Icons.Filled.Dialpad, "Keypad", "Send DTMF tones (IVR menus, PINs)") { showKeypad = true }
                         if (!isCell) entry(Icons.Filled.PersonAdd, "Add call", "Hold this call and dial a second number") { showAddCall = true }
                         if (!isCell) entry(Icons.Filled.SwapHoriz, "Transfer", "Blind (REFER) or attended transfer") { showTransfer = true }
@@ -3997,6 +4499,35 @@ private fun NativeCallScreen(activity: MainActivity, dark: Boolean, onTheme: (Bo
                     }
                 },
                 confirmButton = { TextButton(onClick = { showMore = false }) { Text("Close") } }
+            )
+        }
+        /* Audio output picker: the manual override for phones whose Bluetooth headset
+           never gets picked automatically. */
+        if (showAudioRoute) {
+            val selected = remember { activity.prefsRouteChoice() }
+            AlertDialog(
+                onDismissRequest = { showAudioRoute = false },
+                title = { Text("Audio output") },
+                text = {
+                    Column {
+                        activity.audioRouteOptions().forEach { (id, label) ->
+                            Row(
+                                Modifier.fillMaxWidth().clickable { activity.setCallRoute(id); showAudioRoute = false }.padding(vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(selected = selected == id, onClick = { activity.setCallRoute(id); showAudioRoute = false })
+                                Text(label, fontSize = 13.5.sp, color = MaterialTheme.colorScheme.onSurface)
+                            }
+                        }
+                        if (SipEngine.bluetoothConnected() && !SipEngine.bluetoothCallAudioReady()) {
+                            Text(
+                                "This headset is paired for music only (A2DP). For call audio it must support Hands-Free (HFP) — check the headset manual or pair it again as a headset.",
+                                fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showAudioRoute = false }) { Text("Close") } }
             )
         }
         /* DTMF keypad sheet (IVR menus, conference PINs, extension dialling). */
@@ -4428,6 +4959,8 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     var showFontSize by remember { mutableStateOf(false) }
     var showPbx by remember { mutableStateOf(false) }
     var showRestoreParts by remember { mutableStateOf(false) }
+    var showAudioDiag by remember { mutableStateOf(false) }
+    var showAudioRouteSettings by remember { mutableStateOf(false) }
     var restoreParts by remember { mutableStateOf(setOf("sip", "speed", "blocked", "settings")) }
     var parkCode by remember { mutableStateOf(prefs.getString("pbx:park", "*0") ?: "*0") }
     var pickupCode by remember { mutableStateOf(prefs.getString("pbx:pickup", "*8") ?: "*8") }
@@ -4629,6 +5162,50 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 dismissButton = { TextButton(onClick = { showPbx = false }) { Text("Cancel") } }
             )
         }
+        if (showAudioRouteSettings) {
+            val selected = activity.prefsRouteChoice()
+            AlertDialog(
+                onDismissRequest = { showAudioRouteSettings = false },
+                title = { Text("Audio output") },
+                text = {
+                    Column {
+                        Text("Applied to every call until you change it. During a call the same list is in ⋮ → Audio output.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        activity.audioRouteOptions().forEach { (id, label) ->
+                            Row(Modifier.fillMaxWidth().clickable { activity.setCallRoute(id); showAudioRouteSettings = false }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = selected == id, onClick = { activity.setCallRoute(id); showAudioRouteSettings = false })
+                                Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface)
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showAudioRouteSettings = false }) { Text("Close") } }
+            )
+        }
+        if (showAudioDiag) {
+            val text = remember(showAudioDiag) { activity.audioDiagnosticsText() }
+            AlertDialog(
+                onDismissRequest = { showAudioDiag = false },
+                title = { Text("Audio diagnostics") },
+                text = {
+                    Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) {
+                        Text(text, fontSize = 10.5.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                },
+                confirmButton = {
+                    Row {
+                        TextButton(onClick = { activity.playTestTone() }) { Text("Test tone") }
+                        TextButton(onClick = {
+                            try {
+                                val share = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }
+                                activity.startActivity(Intent.createChooser(share, "Share audio diagnostics"))
+                            } catch (_: Exception) { }
+                        }) { Text("Share") }
+                    }
+                },
+                dismissButton = { TextButton(onClick = { showAudioDiag = false }) { Text("Close") } }
+            )
+        }
         if (showRestoreParts) {
             AlertDialog(
                 onDismissRequest = { showRestoreParts = false },
@@ -4739,8 +5316,31 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
             SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
                 if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
                 toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })
+            SettingRow(Icons.Filled.VolumeOff, MaterialTheme.colorScheme.primary, "Call audio only through headset",
+                if (activity.headsetOnlyEnabled()) "On · never plays call audio on the phone speaker" else "Off · speaker and earpiece are allowed",
+                toggle = true, checked = activity.headsetOnlyEnabled(), onClick = { activity.setHeadsetOnly(!activity.headsetOnlyEnabled()) })
+            SettingRow(Icons.Filled.Headset, MaterialTheme.colorScheme.primary, "Audio output",
+                "Now: ${activity.callRouteLabel()} · tap to choose (also shown in the in-call ⋮ menu)",
+                onClick = { showAudioRouteSettings = true })
+            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio diagnostics",
+                "Lists every speaker / USB-C / Bluetooth device Android reports — share it if a headset stays silent",
+                onClick = { showAudioDiag = true })
+            if (Build.VERSION.SDK_INT >= 31) SettingRow(Icons.Filled.Bluetooth, MaterialTheme.colorScheme.primary, "Bluetooth call audio",
+                if (activity.needsBluetoothPermission()) "Permission needed · tap to allow headset calls" else "Allowed · headsets can carry call audio",
+                onClick = { activity.requestBluetoothPermission() })
+            SettingRow(Icons.Filled.LockOpen, MaterialTheme.colorScheme.primary, "Show calls over the lock screen",
+                if (activity.callOverLockEnabled()) "On · a ringing call appears on top of the lock screen" else "Off · calls only show as a notification",
+                toggle = true, checked = activity.callOverLockEnabled(),
+                onClick = { prefs.edit().putBoolean("setting:callOverLock", !activity.callOverLockEnabled()).apply(); activity.resumeTick++ })
+            SettingRow(Icons.Filled.Pin, MaterialTheme.colorScheme.primary, "Skip app PIN during calls",
+                if (activity.pinSkipDuringCall()) "On · the PIN keypad never covers an incoming call" else "Off · the PIN keypad also covers calls",
+                toggle = true, checked = activity.pinSkipDuringCall(),
+                onClick = { prefs.edit().putBoolean("setting:pinSkipCall", !activity.pinSkipDuringCall()).apply(); activity.resumeTick++ })
+            SettingRow(Icons.Filled.NotificationsActive, MaterialTheme.colorScheme.primary, "Full-screen call alerts",
+                if (activity.fullScreenCallAlertsAllowed()) "Allowed · Android shows the call screen instantly" else "Blocked by Android · tap to allow (needed for calls on the lock screen)",
+                onClick = { activity.openFullScreenAlertSettings() })
             SettingRow(Icons.Filled.BugReport, MaterialTheme.colorScheme.primary, "Crash log",
-                if (activity.hasCrashLog()) "A crash was recorded · tap to share the log" else "No crash recorded",
+                if (activity.hasCrashLog()) "An error was recorded · tap to share the log" else "No error recorded",
                 onClick = { activity.shareCrashLog() })
             SettingRow(Icons.Filled.FlashOn, MaterialTheme.colorScheme.primary, "Power Mode", "Unrestricted · best for background SIP", onPower)
             SettingRow(Icons.Filled.Palette, MaterialTheme.colorScheme.primary, "Theme color", "Accent applies to the whole app", onTheme)

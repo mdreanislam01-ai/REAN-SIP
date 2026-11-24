@@ -49,6 +49,73 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.34 — the headset actually gets the call audio
+
+- **Root cause found**: the in-call route poller passed the engine's `speakerPreferred` flag,
+  which was never reset between calls — so once Speaker had been used, every later call was
+  forced back onto the loudspeaker even though the UI showed Speaker off and a headset was
+  plugged in. The poller now follows the Speaker state on screen, and both flags reset when a
+  call starts.
+- A headset connected **during** a call takes the audio back from the speaker, unless the user
+  pressed Speaker *after* plugging it in (same behaviour as Google/Samsung dialers).
+- **Audio diagnostics** additionally lists liblinphone's own audio devices and its current output
+  device, which distinguishes "Android routed it but liblinphone didn't" from "Android never saw
+  the headset".
+
+## v1.5.33 — headset feedback, headset-only audio, test tone
+
+- **Plug / unplug toast**: "USB-C headset connected · call audio routed" (or Bluetooth / wired,
+  and "Headset disconnected · call audio on the phone"). Works during a call via the route poller
+  and while the app is open via a light foreground watcher.
+- **Call audio only through headset** (Settings): speaker and earpiece are skipped for call
+  audio; pressing Speaker explains instead of switching.
+- **Test tone** in Settings → Audio diagnostics: plays 1.5 s of DTMF through the selected route,
+  so you can hear immediately whether the headset is really receiving call audio.
+
+## v1.5.32 — Type-C (USB-C) headset audio
+
+- **USB-C earphones now route for calls**: `USB_HEADSET`, `USB_DEVICE`, `USB_ACCESSORY`,
+  `LINE_ANALOG`, `AUX_LINE` and hearing aids are treated as headsets, `USB-C headset` is its own
+  entry in the audio picker (Settings → Audio output and in-call ⋮), and the route is re-applied
+  0.25 s / 0.8 s / 1.6 s into a call because USB audio devices attach slowly.
+- **`AudioDeviceCallback`** is registered: plugging the Type-C headset in *during* a call reroutes
+  at once. `ACTION_HEADSET_PLUG` simply never fires for USB-C on Xiaomi/HyperOS and many ROMs.
+- **Settings → Audio diagnostics**: lists mode, SCO state, communication device and every output /
+  input device with its type and product name — shareable, so a silent headset can be diagnosed
+  from the phone itself.
+
+## v1.5.31 — missed calls disappear once you have seen them
+
+- The **Calls tab badge counts only unseen missed calls**; opening the Calls tab or the Missed
+  filter (≈0.7 s) clears the badge and cancels the missed-call notification.
+- Missed calls now go into **one aggregated notification** ("3 missed calls · Last: … · number")
+  instead of replacing each other, and tapping it opens the **Missed** list (it used to open the
+  dial pad).
+- The badge is hidden while the Calls tab itself is open, so it no longer flashes on launch.
+
+## v1.5.30 — no more force-close during calls, working Bluetooth audio
+
+- The `onCallStateChanged` handler runs inside `mainHandler.post`; **any** exception there killed
+  the app ("CallerX force closed due to an internal error"). It is now fully guarded and logged
+  to the shareable error log (Settings → Crash log).
+- **Audio routing rewritten**: a manual route (⋮ → *Audio output*: automatic / earpiece /
+  speaker / Bluetooth / wired) always wins, liblinphone only overrides when it actually lists
+  the headset, Bluetooth SCO is retried when the headset appears late, and routing starts after
+  the streams are up instead of while the audio HAL is still negotiating.
+- **Settings → Bluetooth call audio** requests the Android 12+ permission; the in-call picker
+  warns when the headset is music-only (A2DP, no HFP) — that case cannot carry call audio.
+- **Network handover**: Wi-Fi ⇄ mobile data re-registers SIP quietly and never during a call.
+
+## v1.5.29 — a ringing call shows up on the lock screen
+
+- `MainActivity` now declares `android:showWhenLocked`/`turnScreenOn` and applies
+  `setShowWhenLocked()`/`setTurnScreenOn()` + `requestDismissKeyguard()` for swipe locks, so a
+  call appears *over* the lock screen instead of leaving the phone on the lock screen.
+  A secure lock (PIN/pattern/biometric) is never bypassed — Android still asks the owner.
+- The app-lock PIN keypad no longer covers an incoming or ongoing call.
+- Settings → *Calls & lock screen*: **Show calls over the lock screen**, **Skip app PIN during
+  calls**, and **Full-screen call alerts** (opens the Android 14+ full-screen-intent screen).
+
 ## v1.5.28 — the call screen stays put, fewer buttons, contact search
 
 - **Call screen no longer disappears** while calling: the screen state now survives Activity
