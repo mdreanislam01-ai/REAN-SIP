@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CallerX</string>
+    <string name="callerx_widget_desc">SIP status with dial pad, speed dial and voicemail shortcuts.</string>
+    <string name="callerx_tile_label">CallerX dial pad</string>
+    <string name="shortcut_dialpad">New SIP call</string>
+    <string name="shortcut_voicemail">Voicemail</string>
+    <string name="shortcut_favorites">Favorites</string>
+    <string name="shortcut_recordings">Recordings</string>
+</resources>
