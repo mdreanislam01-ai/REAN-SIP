@@ -33,7 +33,17 @@ jobs:
         with:
           gradle-version: '8.7'
       - name: Build debug APK
-        run: gradle --no-daemon :app:assembleDebug --console=plain
+        run: |
+          set +e
+          gradle --no-daemon :app:assembleDebug --stacktrace --console=plain > build.log 2>&1
+          result=$?
+          if [ "$result" -ne 0 ]; then
+            tail -n 40 build.log
+            errors=$(grep -E 'e: |What went wrong|Could not|error:|FAILURE' -A2 build.log | sed 's#https://[^ ]*##g' | cut -c1-240)
+            printf '%s\n' "$errors" | head -n 60 | while IFS= read -r line; do echo "::error::$line"; done
+            exit "$result"
+          fi
+          tail -n 5 build.log
       - uses: actions/upload-artifact@v4
         with:
           name: REAN-Browser-debug-apk
