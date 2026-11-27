@@ -3,3 +3,7 @@
 keystore.properties
 *.jks
 *.keystore
+
+# REAN Browser (Android) build outputs
+browser/.gradle/
+browser/**/build/
