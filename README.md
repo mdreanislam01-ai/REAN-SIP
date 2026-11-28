@@ -49,6 +49,23 @@ Every push that touches `CallerX.html`, `android/**`, or the Gradle/workflow fil
 - The native Android app uses standard SIP (UDP/TCP/TLS). The `CallerX.html` prototype uses SIP over secure WebSocket (WSS) + WebRTC in the browser.
 - In-app purchases / cloud backup / remote update checks are UI previews; they are not wired to a backend.
 
+## v1.5.36 — Settings is split into 11 tappable groups
+
+- The Settings tab used to be one very long list (45+ rows). It now opens a short
+  list of groups — **SIP account & PBX**, **Calling & SIM**, **Audio & codec**,
+  **Security & privacy**, **Missed calls & voicemail**, **Recording & quality**,
+  **Backup & restore**, **Appearance**, **App lock & call alerts**,
+  **Dialer & permissions**, **App updates & support** — each showing its current
+  state underneath. Tapping one opens only that group's options, and system back
+  returns to the group list (the open group survives recreation).
+- Options that were only cosmetic before now really work: **Quiet hours** (silent window,
+  calls still arrive), **keypad tones**, **louder ringtone**, **silent during an existing
+  call**, **call waiting** on/off, **voicemail over SIP**, **24-hour call-history times**.
+- New options: **block unknown callers** (decline + auto-reply), **speed-dial editor**
+  for keys 1–9, **re-register SIP accounts**, **SIP call-log summary**, **SIP server
+  latency**, **OEM autostart helper** and **battery-optimisation exemption**.
+- Bengali write-up and the feature roadmap: [`docs/SETTINGS-AND-ROADMAP-BN.md`](docs/SETTINGS-AND-ROADMAP-BN.md).
+
 ## v1.5.35 — in-app updates (no more GitHub downloads)
 
 - On start (at most every 6 hours) CallerX asks the GitHub release feed for `callerx-v*` and, if

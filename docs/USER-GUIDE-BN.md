@@ -9,6 +9,27 @@ CallerX একটি Android ডায়ালার + SIP/VoIP অ্যাপ
 2. **ডিফল্ট ডায়ালার** বানাতে চাইলে Settings → *Dialer & Default Permission* → Grant all permissions।
 3. উপরের ডান দিকের পিলে SIP স্ট্যাটাস দেখায়: সবুজ ডট = অনলাইন, "Offline" = কোনো অ্যাকাউন্ট নেই।
 
+## ১ক. সেটিংস কীভাবে সাজানো (v1.5.36)
+
+Settings ট্যাব এখন এক লম্বা পেজ নয় — **১১টি গ্রুপ**। প্রতিটি গ্রুপের নিচে বর্তমান অবস্থা লেখা থাকে,
+গ্রুপে ট্যাপ করলে শুধু ওই গ্রুপের অপশন খোলে, আর Back চাপলে গ্রুপ লিস্টে ফেরে।
+
+| গ্রুপ | কী পাবেন |
+|---|---|
+| SIP account & PBX | অ্যাকাউন্ট, PBX park/pickup, forwarding, SIP log, latency, re-register |
+| Calling & SIM | default route, Ask before each call, SIM 1/2, speed dial, voicemail, call waiting, time format |
+| Audio & codec | audio output, headset, Bluetooth, ringtone, vibration, keypad tone, quiet hours, codec, diagnostics |
+| Security & privacy | TLS, SRTP, blocked numbers, block before ringing, block unknown callers, export/import |
+| Missed calls & voicemail | auto-SMS, reply text, voicemail number |
+| Recording & quality | auto recording, recordings, call quality |
+| Backup & restore | profile, auto backup folder, password, restore parts |
+| Appearance | theme color, dark mode, AMOLED, text size |
+| App lock & call alerts | PIN, skip PIN in calls, lock-screen calls, full-screen alerts, notification settings |
+| Dialer & permissions | default dialer, permissions, power mode, autostart, battery |
+| App updates & support | updates, auto check, audio diagnostics, crash log |
+
+> পূর্ণ তালিকা ও পরবর্তী ফিচার পরিকল্পনা: `docs/SETTINGS-AND-ROADMAP-BN.md`
+
 ## ২. SIP অ্যাকাউন্ট যোগ করা
 
 1. Settings → **SIP Account** → ➕।
