@@ -2702,7 +2702,8 @@ class MainActivity : ComponentActivity() {
         )
         for (name in candidates) {
             try {
-                startActivity(Intent().setComponent(android.content.ComponentName.parseComponent(name)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                val component = android.content.ComponentName.unflattenFromString(name) ?: continue
+                startActivity(Intent().setComponent(component).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 errorMessage = "Turn on autostart / background start for CallerX on this screen."
                 return
             } catch (_: Exception) { }
@@ -5307,6 +5308,7 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     val openGroup = groups.firstOrNull { it.id == openGroupId }
     /* Back always steps from a group page to the settings list first. */
     BackHandler(enabled = openGroup != null) { openGroupId = null }
+    @Composable
     fun subRow(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit) {
         SettingRow(icon, MaterialTheme.colorScheme.primary, title, subtitle, onClick = onClick)
     }
@@ -5921,6 +5923,8 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                     subRow(Icons.Filled.Headset, "Audio diagnostics", "Every speaker / USB-C / Bluetooth device Android reports · share it if a headset stays silent") { showAudioDiag = true }
                     subRow(Icons.Filled.BugReport, "Crash log", if (activity.hasCrashLog()) "An error was recorded · tap to share the log" else "No error recorded") { activity.shareCrashLog() }
                 }
+
+                else -> { }
             }
         }
     }
