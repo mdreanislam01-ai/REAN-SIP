@@ -183,11 +183,18 @@ private fun loadCallLog(context: Context): List<Person> {
         while (c.moveToNext()) {
             val name = c.getString(0).orEmpty(); val number = c.getString(1).orEmpty(); val date = c.getLong(2); val accountId = c.getString(4).orEmpty(); val dur = c.getLong(5)
             val source = subSlots[accountId]?.let { "SIM $it" } ?: if (accountId.isNotBlank() && accountId.toIntOrNull() == null) "SIP" else "SIM 1"
-            result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(date)), callType = c.getInt(3), source = source, dur = dur, ts = date))
+            result.add(Person(name.ifBlank { number }, number, name.firstOrNull()?.toString() ?: "?", time = callLogTime(context, date), callType = c.getInt(3), source = source, dur = dur, ts = date))
         }
     }
     return result
 }
+/** Call-history time label; Settings → Calling can force 24-hour times. */
+private fun callLogTime(context: Context, ts: Long): String = try {
+    if (context.getSharedPreferences("callerx", Context.MODE_PRIVATE).getBoolean("setting:time24", false)) {
+        java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(Date(ts))
+    } else DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(ts))
+} catch (_: Exception) { "" }
+
 private fun loadSms(context: Context): List<Pair<String,String>> {
     if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return emptyList()
     val rows = mutableListOf<Pair<String,String>>()
@@ -213,7 +220,7 @@ private fun loadSipLog(context: Context): List<Person> {
             val name = o.optString("name").ifBlank { number }
             val ts = o.optLong("ts", 0L)
             rows.add(Person(name, number, name.firstOrNull()?.toString() ?: "?",
-                time = if (ts > 0) DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(ts)) else "",
+                time = if (ts > 0) callLogTime(context, ts) else "",
                 callType = o.optInt("type", CallLog.Calls.OUTGOING_TYPE), source = "SIP", dur = o.optLong("dur", 0L), ts = ts))
         }
         rows
@@ -604,11 +611,35 @@ object SipEngine {
                                 acquireAudioFocus()
                                 routeAudio(false)
                                 val ctx = appContext
-                                if (ctx != null && isBlockedNumber(ctx, remoteNumber)) {
-                                    incomingCallerNumber = ""
-                                    missedReplyDone = true
-                                    try { call.decline(Reason.Busy) } catch (_: Exception) { }
-                                } else if (!applyForwarding(call, waiting)) { startIncomingVibration(); startIncomingRingtone() }
+                                /* Settings → Security: silence unknown callers. Numbers that are not
+                                   in the phone's contacts are declined and get the auto-reply SMS. */
+                                val unknownCaller = sipPrefBool("setting:blockUnknown", false) && contactNameFor(remoteNumber).isBlank()
+                                /* Settings → Calling: call waiting off means a second call is refused. */
+                                val waitingRefused = waiting && !sipPrefBool("setting:callWaiting", true)
+                                when {
+                                    ctx != null && isBlockedNumber(ctx, remoteNumber) -> {
+                                        incomingCallerNumber = ""
+                                        missedReplyDone = true
+                                        try { call.decline(Reason.Busy) } catch (_: Exception) { }
+                                    }
+                                    waitingRefused -> {
+                                        try { call.decline(Reason.Busy) } catch (_: Exception) { }
+                                        CallBridge.activity?.errorMessage = "Call waiting is off · $remoteNumber was told you are busy."
+                                    }
+                                    unknownCaller -> {
+                                        missedReplyDone = true
+                                        try { call.decline(Reason.Busy) } catch (_: Exception) { }
+                                        showMissedCallNotification(remoteNumber, "Unknown caller")
+                                        autoReplyToMissedCall(remoteNumber)
+                                    }
+                                    !applyForwarding(call, waiting) -> {
+                                        /* Quiet hours: forwarding above still applies, only the sound is muted. */
+                                        if (quietHoursActive()) {
+                                            stopIncomingVibration()
+                                            CallBridge.activity?.errorMessage = "Quiet hours · ringing muted for $remoteNumber."
+                                        } else { startIncomingVibration(); startIncomingRingtone() }
+                                    }
+                                }
                             }
                             Call.State.OutgoingInit, Call.State.OutgoingProgress -> {
                                 speakerPreferred = false
@@ -1305,6 +1336,8 @@ object SipEngine {
         try {
             val vibrator = ctx.getSystemService(Vibrator::class.java) ?: return
             if (!vibrator.hasVibrator()) return
+            /* Settings → Audio: stop vibrating while an existing call is up. */
+            if (ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getBoolean("setting:silentDuringCall", false) && callActive) return
             val style = ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE).getInt("setting:vibration", 1)
             val pattern = when (style) {
                 0 -> longArrayOf(0, 400)            // short buzz
@@ -1346,8 +1379,12 @@ object SipEngine {
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                 .build()
             if (Build.VERSION.SDK_INT >= 28) rt.isLooping = true
-            rt.play()
-            incomingRingtone = rt
+            /* Settings → Audio: ringtone volume, and silence while on another call. */
+            val stored2 = ctx.getSharedPreferences("callerx", Context.MODE_PRIVATE)
+            val louder = stored2.getBoolean("setting:ringLouder", false)
+            try { rt.volume = if (louder) 1f else 0.6f } catch (_: Exception) { }
+            val silentDuringCall = stored2.getBoolean("setting:silentDuringCall", false) && callActive
+            if (!silentDuringCall) { rt.play(); incomingRingtone = rt }
         } catch (_: Exception) { }
     }
 
@@ -1686,6 +1723,36 @@ object SipEngine {
             CallBridge.activity?.errorMessage = "Attended transfer failed: ${e.message ?: "unknown error"}"
             false
         }
+    }
+
+    /* ---------- Incoming-call behaviour switches (Settings) ----------
+       These used to be on/off rows with nothing behind them. Each one is read here,
+       at the moment the call arrives, so a change in Settings applies immediately. */
+    private fun sipPrefBool(key: String, def: Boolean): Boolean =
+        appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getBoolean(key, def) ?: def
+
+    private fun sipPrefInt(key: String, def: Int): Int =
+        appContext?.getSharedPreferences("callerx", Context.MODE_PRIVATE)?.getInt(key, def) ?: def
+
+    /** True when "Silence ringing during quiet hours" is on and the clock is inside the window. */
+    fun quietHoursActive(): Boolean {
+        if (!sipPrefBool("setting:quietOn", false)) return false
+        val start = sipPrefInt("setting:quietStart", 22).coerceIn(0, 23)
+        val end = sipPrefInt("setting:quietEnd", 7).coerceIn(0, 23)
+        if (start == end) return false
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        return if (start < end) hour in start until end else (hour >= start || hour < end)
+    }
+
+    /** The contact name saved on this phone for a number, or "" when the number is unknown. */
+    fun contactNameFor(number: String): String {
+        val ctx = appContext ?: return ""
+        return try {
+            val uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number))
+            ctx.contentResolver.query(uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0).orEmpty() else ""
+            } ?: ""
+        } catch (_: Exception) { "" }
     }
 
     /* ---------- Missed-call auto-SMS (Voicemail / away reply) ---------- */
@@ -2622,6 +2689,54 @@ class MainActivity : ComponentActivity() {
         catch (_: Exception) { try { startActivity(Intent(Settings.ACTION_SETTINGS)) } catch (_: Exception) { errorMessage = "Could not open battery settings." } }
     }
 
+    /** OEM autostart screens: Xiaomi, Oppo/Realme, Vivo, Huawei, Letv, then the app details page. */
+    fun openAutostartSettings() {
+        val candidates = listOf(
+            "com.miui.securitycenter/com.miui.permcenter.autostart.AutoStartManagementActivity",
+            "com.coloros.safecenter/com.coloros.safecenter.permission.startup.StartupAppListActivity",
+            "com.coloros.safecenter/com.coloros.safecenter.startupapp.StartupAppListActivity",
+            "com.oppo.safe/com.oppo.safe.permission.startup.StartupAppListActivity",
+            "com.vivo.permissionmanager/com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+            "com.iqoo.secure/com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity",
+            "com.huawei.systemmanager/com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+            "com.letv.android.letvsafe/com.letv.android.letvsafe.AutobootManageActivity"
+        )
+        for (name in candidates) {
+            try {
+                val component = android.content.ComponentName.unflattenFromString(name) ?: continue
+                startActivity(Intent().setComponent(component).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                errorMessage = "Turn on autostart / background start for CallerX on this screen."
+                return
+            } catch (_: Exception) { }
+        }
+        try {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+            errorMessage = "This phone keeps autostart in its own settings app. Look for Autostart / Startup manager for CallerX."
+        } catch (_: Exception) { errorMessage = "Open the phone's settings and allow CallerX to start automatically." }
+    }
+
+    fun batteryOptimizationIgnored(): Boolean = try {
+        val pm = getSystemService(PowerManager::class.java)
+        pm?.isIgnoringBatteryOptimizations(packageName) ?: false
+    } catch (_: Exception) { false }
+
+    /** The system dialog that exempts CallerX from battery optimisation (no Play policy issue: user initiated). */
+    fun requestIgnoreBatteryOptimization() {
+        if (batteryOptimizationIgnored()) { openPowerSettings(); return }
+        try {
+            @Suppress("BatteryLife")
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+        } catch (_: Exception) { openPowerSettings() }
+    }
+
+    /** Tears the SIP core down and registers again — fixes a stuck "Registering…" state. */
+    fun forceReregister() {
+        try {
+            SipEngine.applyAccounts(this)
+            errorMessage = "Re-registering your SIP accounts…"
+        } catch (e: Exception) { errorMessage = "Could not re-register: ${e.message}" }
+    }
+
     fun openNotificationSettings() {
         try {
             val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
@@ -3238,10 +3353,12 @@ class MainActivity : ComponentActivity() {
     fun dialVoicemail() {
         val num = prefs().getString("setting:voicemail", "").orEmpty().trim()
         if (num.isBlank()) {
-            errorMessage = "No voicemail number saved. Add it in Settings → Voicemail number."
+            errorMessage = "No voicemail number saved. Add it in Settings → Calling & SIM → Voicemail number."
             return
         }
-        startCellCall(num, 0)
+        /* Settings → Calling: voicemail can also be a SIP extension, not only a SIM call. */
+        if (prefs().getBoolean("setting:vmSip", false) && registered) startSipCall(num, "Voicemail")
+        else startCellCall(num, 0)
     }
 
     fun recordingCount(): Int = try { File(filesDir, "recordings").listFiles()?.size ?: 0 } catch (_: Exception) { 0 }
@@ -3282,6 +3399,56 @@ class MainActivity : ComponentActivity() {
             if (noAnswer.isNotBlank()) add("No answer → $noAnswer")
         }
         return if (parts.isEmpty()) "Off · no forwarding rule set" else parts.joinToString(" · ")
+    }
+
+    /* ---------- Settings helpers: SIP log summary + server latency ---------- */
+
+    /** Readable summary of the newest SIP activity (Settings → SIP account & PBX). */
+    fun sipHistorySummary(): String {
+        val sb = StringBuilder()
+        val acc = accountsList().firstOrNull { it.isDefault } ?: accountsList().firstOrNull()
+        sb.appendLine("Registration: ${registrationMessage}")
+        if (acc != null) sb.appendLine("Account: ${acc.user}@${acc.domain}:${acc.port} · ${acc.transport.uppercase()}")
+        sb.appendLine("Registration refresh: 300 s · keepalive: 15 s")
+        sb.appendLine()
+        val rows = try { loadSipLog(this).sortedByDescending { it.ts }.take(8) } catch (_: Exception) { emptyList() }
+        if (rows.isEmpty()) {
+            sb.append("No SIP calls in your history yet.")
+        } else {
+            sb.appendLine("Recent SIP calls (newest first):")
+            rows.forEach { p ->
+                val kind = when (p.callType) {
+                    CallLog.Calls.MISSED_TYPE -> "missed"
+                    CallLog.Calls.INCOMING_TYPE -> "incoming"
+                    CallLog.Calls.OUTGOING_TYPE -> "outgoing"
+                    else -> "call"
+                }
+                val dur = if (p.dur > 0) " · ${fmtDur(p.dur)}" else ""
+                val whenText = try { DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(p.ts)) } catch (_: Exception) { "" }
+                sb.appendLine("• $whenText · ${p.name} ($kind)$dur")
+            }
+        }
+        return sb.toString().trim()
+    }
+
+    /** TCP connect time to the default SIP server — the same probe the SIP status pill uses. */
+    fun measureSipLatency() {
+        val acc = accountsList().firstOrNull { it.isDefault } ?: accountsList().firstOrNull { it.enabled }
+        if (acc == null) { errorMessage = "Add a SIP account first (SIP account & PBX → SIP account)."; return }
+        val host = acc.domain
+        val port = acc.port.toIntOrNull() ?: if (acc.transport.equals("tls", true)) 5061 else 5060
+        errorMessage = "Measuring latency to $host:$port…"
+        lifecycleScope.launch {
+            val ms = withContext(Dispatchers.IO) {
+                try {
+                    val started = System.currentTimeMillis()
+                    java.net.Socket().use { sock -> sock.connect(java.net.InetSocketAddress(host, port), 3000) }
+                    System.currentTimeMillis() - started
+                } catch (_: Exception) { -1L }
+            }
+            errorMessage = if (ms >= 0) "SIP server $host:$port answered in $ms ms."
+            else "SIP server $host:$port did not answer within 3 s — check the domain, port and transport (UDP/TCP/TLS)."
+        }
     }
 
     /* ---------- Ongoing-call notification (owned by SipEngine) ---------- */
@@ -5107,12 +5274,70 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
     var restoreParts by remember { mutableStateOf(setOf("sip", "speed", "blocked", "settings")) }
     var parkCode by remember { mutableStateOf(prefs.getString("pbx:park", "*0") ?: "*0") }
     var pickupCode by remember { mutableStateOf(prefs.getString("pbx:pickup", "*8") ?: "*8") }
+    /* New grouped-page options */
+    var showQuietHours by remember { mutableStateOf(false) }
+    var showTimeFormat by remember { mutableStateOf(false) }
+    var speedEditSlot by rememberSaveable { mutableIntStateOf(0) }
+    var speedEditNumber by rememberSaveable { mutableStateOf("") }
+    var showSpeedEdit by remember { mutableStateOf(false) }
+    var showSpeedSlots by remember { mutableStateOf(false) }
     val accounts = activity.accountsList()
     val defaultAcc = accounts.firstOrNull { it.isDefault }
     val route = activity.defaultRoute()
 
+    /* ---------- Grouped navigation ----------
+       The settings page used to be one very long list. Every option now lives in its
+       own group on the first page, and tapping a group opens a short page with only
+       that group's options — so nothing has to be hunted for by scrolling for a minute.
+       The open group survives Activity recreation and works with the system back button. */
+    val groups = remember {
+        listOf(
+            SettingsGroup("sip", "SIP account & PBX", "Account, registration, PBX codes, forwarding", Icons.Filled.Cloud),
+            SettingsGroup("calls", "Calling & SIM", "Default route, SIM 1/2, SIM calling options", Icons.Filled.SimCard),
+            SettingsGroup("audio", "Audio & codec", "Audio output, headset, codecs, diagnostics", Icons.Filled.Headset),
+            SettingsGroup("security", "Security & privacy", "TLS, SRTP, call screening, blocked list", Icons.Filled.Security),
+            SettingsGroup("missed", "Missed calls & voicemail", "Auto-SMS, reply text, voicemail number", Icons.Filled.Voicemail),
+            SettingsGroup("recordings", "Recording & quality", "Auto record, saved recordings, quality", Icons.Filled.Mic),
+            SettingsGroup("backup", "Backup & restore", "Profile, Drive folder, encryption, restore", Icons.Filled.CloudUpload),
+            SettingsGroup("appearance", "Appearance", "Theme, accent, dark mode, text size", Icons.Filled.Palette),
+            SettingsGroup("lock", "App lock & call alerts", "PIN lock, lock screen, vibration, ringtone", Icons.Filled.Lock),
+            SettingsGroup("dialer", "Dialer & permissions", "Default dialer, Android permissions, power", Icons.Filled.Phone),
+            SettingsGroup("updates", "App updates & support", "Version, updates, crash log, diagnostics", Icons.Filled.SystemUpdate)
+        )
+    }
+    var openGroupId by rememberSaveable { mutableStateOf<String?>(null) }
+    val openGroup = groups.firstOrNull { it.id == openGroupId }
+    /* Back always steps from a group page to the settings list first. */
+    BackHandler(enabled = openGroup != null) { openGroupId = null }
+    @Composable
+    fun subRow(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit) {
+        SettingRow(icon, MaterialTheme.colorScheme.primary, title, subtitle, onClick = onClick)
+    }
+    /* A short "what is inside" line under every group on the first page, so the list
+       shows the current state without opening anything. */
+    fun groupSubtitle(id: String): String = when (id) {
+        "sip" -> defaultAcc?.let { "${it.domain} · ${activity.registrationMessage}" } ?: "No account added · tap to add one"
+        "calls" -> when {
+            route.isNotBlank() -> "Every call goes via $route · ${listOf("SIP", "SIM 1", "SIM 2").count { activity.routeAvailable(it) }} route(s) ready"
+            ask -> "Default route not set · you choose SIP or SIM on every call"
+            else -> "Default route not set · change the route or the SIM options"
+        }
+        "audio" -> "Output: ${activity.callRouteLabel()}" + if (activity.headsetOnlyEnabled()) " · headset only" else ""
+        "security" -> "${activity.blockedNumbers().size} blocked · TLS ${if (tls) "on" else "off"} · SRTP ${if (srtp) "on" else "off"} · screening ${if (activity.screeningEnabled()) "on" else "off"}"
+        "missed" -> "Auto-SMS ${if (missedSms) "on" else "off"} · voicemail ${if (voicemail.isBlank()) "not set" else voicemail}"
+        "recordings" -> "${activity.recordingCount()} saved · auto record ${if (autoRec) "on" else "off"}"
+        "backup" -> if (activity.backupPasswordSet()) "Encrypted backups on · ${activity.lastBackupLabel()}" else activity.lastBackupLabel()
+        "appearance" -> "Text size ${when { fontScale < 0.95f -> "small"; fontScale > 1.25f -> "extra large"; fontScale > 1.05f -> "large"; else -> "default" }} · ${if (dark) "dark" else "light"}${if (dark && amoled) " · AMOLED" else ""}"
+        "lock" -> if (pinDraft.isBlank()) "App lock off · lock-screen calls ${if (activity.callOverLockEnabled()) "on" else "off"}" else "App lock on · lock-screen calls ${if (activity.callOverLockEnabled()) "on" else "off"}"
+        "dialer" -> if (activity.isDefaultDialer()) "Default dialer · permissions" else "Not the default dialer · permissions"
+        "updates" -> "v${activity.installedVersion()}" + (activity.updateInfo?.let { " · v${it.version} available" } ?: "")
+        else -> ""
+    }
+
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        if (onBack != null) {
+        if (openGroup != null) {
+            TopBar(openGroup.title, { openGroupId = null })
+        } else if (onBack != null) {
             TopBar("Settings", onBack)
         } else {
             Row(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.primary).statusBarsPadding().padding(start = 20.dp, end = 12.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -5378,138 +5603,356 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                 dismissButton = { TextButton(onClick = { showRestoreParts = false }) { Text("Cancel") } }
             )
         }
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
-            SectionTitle("ACCOUNT")
-            SettingRow(Icons.Filled.Person, MaterialTheme.colorScheme.primary, "Profile & Backup Account", if (activity.googleBackupAccount().isNotBlank()) "Google · ${activity.googleBackupAccount()}" else "Profile, Google account backup & phone storage", onProfile)
-            SettingRow(Icons.Filled.Folder, MaterialTheme.colorScheme.primary, "Automatic backup & restore",
-                activity.autoBackupFolderLabel(), onClick = { activity.chooseBackupFolder() })
-            SectionTitle("VOIP & SIP")
-            SettingRow(Icons.Filled.Cloud, MaterialTheme.colorScheme.primary, "SIP Account", if (defaultAcc != null) "${defaultAcc.domain} · ${activity.registrationMessage}" else "No account added", onSip)
-            SettingRow(Icons.Filled.Dialpad, MaterialTheme.colorScheme.primary, "PBX feature codes",
-                "Park ${parkCode.ifBlank { "—" }} · pickup ${pickupCode.ifBlank { "—" }} · one-tap during a call",
-                onClick = { showPbx = true })
-            SettingRow(Icons.Filled.CallSplit, MaterialTheme.colorScheme.primary, "Call forwarding",
-                activity.forwardingSummary(), onClick = { onForwarding?.invoke() })
-            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio & Codec", "Opus 16 kHz mono, G.722 · echo cancellation on", onRoute = null, onClick = { activity.errorMessage = "Codecs in use: Opus 16 kHz mono (low bandwidth, stable on 4G), G.722, PCMA, PCMU and DTMF events. Echo cancellation is always on." })
-            SectionTitle("SIM CALLING & RECORDING")
-            SettingRow(Icons.Filled.SimCard, MaterialTheme.colorScheme.primary, "SIM 1", "Show SIM 1 as a call option", toggle = true, checked = sim1, onClick = { sim1 = !sim1; prefs.edit().putBoolean("setting:SIM 1", sim1).apply() })
-            SettingRow(Icons.Filled.SimCard, MaterialTheme.colorScheme.primary, "SIM 2", "Show SIM 2 as a call option", toggle = true, checked = sim2, onClick = { sim2 = !sim2; prefs.edit().putBoolean("setting:SIM 2", sim2).apply() })
-            SettingRow(Icons.Filled.SwapCalls, MaterialTheme.colorScheme.primary, "Ask before each call", if (ask) "Choose SIP or an enabled SIM" else "Use the default route automatically", toggle = true, checked = ask, onClick = { ask = !ask; prefs.edit().putBoolean("setting:Ask before each call", ask).apply() })
-            SettingRow(Icons.Filled.Mic, MaterialTheme.colorScheme.primary, "Auto Call Recording", if (autoRec) "On · every call is recorded (${activity.recordingCount()} saved)" else "Off · ${activity.recordingCount()} recordings saved", toggle = true, checked = autoRec, onClick = { autoRec = !autoRec; prefs.edit().putBoolean("setting:autoRecord", autoRec).apply() })
-            SettingRow(Icons.Filled.Call, MaterialTheme.colorScheme.primary, "Default call route", if (route.isBlank()) "Not set — you are asked every time" else "All calls go via $route", onRoute)
-            SettingRow(Icons.Filled.Speed, MaterialTheme.colorScheme.primary, "Call quality report",
-                "MOS, jitter, packet loss and delay of your last SIP calls", onClick = { onQuality?.invoke() })
-            SettingRow(Icons.Filled.PlayArrow, MaterialTheme.colorScheme.primary, "Call recordings",
-                "${activity.recordingCount()} saved · play, share or delete them", onClick = { onRecordings?.invoke() })
-            SectionTitle("MISSED CALLS & VOICEMAIL")
-            SettingRow(Icons.Filled.Message, MaterialTheme.colorScheme.primary, "Auto-SMS on missed call",
-                if (missedSms) "On · the caller gets a text when you miss a SIP call" else "Off · missed SIP calls are only logged",
-                toggle = true, checked = missedSms, onClick = {
-                    missedSms = !missedSms
-                    prefs.edit().putBoolean("setting:missedSms", missedSms).apply()
-                    if (missedSms) activity.requestSendSmsPermission()
-                })
-            SettingRow(Icons.AutoMirrored.Filled.Message, MaterialTheme.colorScheme.primary, "Auto-reply message",
-                if (missedText.isBlank()) "Default: “Sorry, I can't take your call right now…”" else missedText.take(60),
-                onClick = { showMissedText = true })
-            SettingRow(Icons.Filled.Voicemail, MaterialTheme.colorScheme.primary, "Voicemail number",
-                if (voicemail.isBlank()) "Not set · hold 1 on the dial pad to call it" else "$voicemail · hold 1 to call",
-                onClick = { showVoicemail = true })
-            SectionTitle("GENERAL & SYSTEM")
-            SettingRow(Icons.Filled.Phone, MaterialTheme.colorScheme.primary, "Dialer & Default Permission", if (activity.isDefaultDialer()) "CallerX is the default dialer" else "Set as default dialer · grant permissions", onDialer)
-            SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Blocked numbers", "${activity.blockedNumbers().size} numbers · calls are rejected", onBlocked)
-            SectionTitle("SECURITY & CALL HANDLING")
-            SettingRow(Icons.Filled.Security, MaterialTheme.colorScheme.primary, "Encrypted SIP transport (TLS)",
-                if (tls) "On · every account uses TLS on port 5061" else "Off · each account uses its own transport",
-                toggle = true, checked = tls, onClick = {
-                    tls = !tls; prefs.edit().putBoolean("setting:tls", tls).apply(); activity.applyAccounts()
-                })
-            SettingRow(Icons.Filled.Lock, MaterialTheme.colorScheme.primary, "Encrypt call audio (SRTP)",
-                if (srtp) "On · media is encrypted end to end" else "Off · only if your provider forces it",
-                toggle = true, checked = srtp, onClick = {
-                    srtp = !srtp; prefs.edit().putBoolean("setting:srtp", srtp).apply(); activity.applyAccounts()
-                })
-            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Adaptive audio (weak network)",
-                if (autoCodec) "On · drop to narrowband when quality falls" else "Off · always use HD audio",
-                toggle = true, checked = autoCodec, onClick = {
-                    autoCodec = !autoCodec; prefs.edit().putBoolean("setting:autoCodec", autoCodec).apply()
-                })
-            SettingRow(Icons.Filled.MusicNote, MaterialTheme.colorScheme.primary, "Ringtone",
-                activity.ringtoneLabel(), onClick = { activity.pickRingtone() })
-            SettingRow(Icons.Filled.Lock, MaterialTheme.colorScheme.primary, "App lock (PIN)",
-                if (pinDraft.isBlank()) "Off · lock CallerX with a 4-digit PIN" else "On · PIN required when the app opens",
-                onClick = { showPinDialog = true })
-            SettingRow(Icons.Filled.Vibration, MaterialTheme.colorScheme.primary, "Incoming vibration",
-                when (vibrationStyle) { 0 -> "Short buzz"; 2 -> "Long buzz"; else -> "Double buzz" },
-                onClick = { showVibration = true })
-            SettingRow(Icons.Filled.Dialpad, MaterialTheme.colorScheme.primary, "Speed dial",
-                "Hold 1-9 in the dial pad to call the saved number", onClick = onSpeedDial)
-            SettingRow(Icons.Filled.Lock, MaterialTheme.colorScheme.primary, "Backup password",
-                if (activity.backupPasswordSet()) "On · new backups are encrypted (AES-256-GCM)" else "Off · backups are plain JSON",
-                onClick = { showBackupPassword = true })
-            SettingRow(Icons.Filled.RestorePage, MaterialTheme.colorScheme.primary, "Restore parts of a backup",
-                "Pick SIP accounts, speed dials, blocked numbers or settings only",
-                onClick = { showRestoreParts = true })
-            SettingRow(Icons.Filled.FileUpload, MaterialTheme.colorScheme.primary, "Export blocked list",
-                "${activity.blockedNumbers().size} numbers · text file you can share or keep",
-                onClick = { activity.exportBlockedList() })
-            SettingRow(Icons.Filled.FileDownload, MaterialTheme.colorScheme.primary, "Import blocked list",
-                "One number or +88017* wildcard per line · merges with the current list",
-                onClick = { activity.pickBlockListFile() })
-            SettingRow(Icons.Filled.Block, MaterialTheme.colorScheme.primary, "Block before ringing",
-                if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined",
-                toggle = true, checked = activity.screeningEnabled(), onClick = { activity.setScreening(!activity.screeningEnabled()) })
-            SettingRow(Icons.Filled.VolumeOff, MaterialTheme.colorScheme.primary, "Call audio only through headset",
-                if (activity.headsetOnlyEnabled()) "On · never plays call audio on the phone speaker" else "Off · speaker and earpiece are allowed",
-                toggle = true, checked = activity.headsetOnlyEnabled(), onClick = { activity.setHeadsetOnly(!activity.headsetOnlyEnabled()) })
-            SettingRow(Icons.Filled.Headset, MaterialTheme.colorScheme.primary, "Audio output",
-                "Now: ${activity.callRouteLabel()} · tap to choose (also shown in the in-call ⋮ menu)",
-                onClick = { showAudioRouteSettings = true })
-            SettingRow(Icons.Filled.GraphicEq, MaterialTheme.colorScheme.primary, "Audio diagnostics",
-                "Lists every speaker / USB-C / Bluetooth device Android reports — share it if a headset stays silent",
-                onClick = { showAudioDiag = true })
-            if (Build.VERSION.SDK_INT >= 31) SettingRow(Icons.Filled.Bluetooth, MaterialTheme.colorScheme.primary, "Bluetooth call audio",
-                if (activity.needsBluetoothPermission()) "Permission needed · tap to allow headset calls" else "Allowed · headsets can carry call audio",
-                onClick = { activity.requestBluetoothPermission() })
-            SettingRow(Icons.Filled.LockOpen, MaterialTheme.colorScheme.primary, "Show calls over the lock screen",
-                if (activity.callOverLockEnabled()) "On · a ringing call appears on top of the lock screen" else "Off · calls only show as a notification",
-                toggle = true, checked = activity.callOverLockEnabled(),
-                onClick = { prefs.edit().putBoolean("setting:callOverLock", !activity.callOverLockEnabled()).apply(); activity.resumeTick++ })
-            SettingRow(Icons.Filled.Pin, MaterialTheme.colorScheme.primary, "Skip app PIN during calls",
-                if (activity.pinSkipDuringCall()) "On · the PIN keypad never covers an incoming call" else "Off · the PIN keypad also covers calls",
-                toggle = true, checked = activity.pinSkipDuringCall(),
-                onClick = { prefs.edit().putBoolean("setting:pinSkipCall", !activity.pinSkipDuringCall()).apply(); activity.resumeTick++ })
-            SettingRow(Icons.Filled.NotificationsActive, MaterialTheme.colorScheme.primary, "Full-screen call alerts",
-                if (activity.fullScreenCallAlertsAllowed()) "Allowed · Android shows the call screen instantly" else "Blocked by Android · tap to allow (needed for calls on the lock screen)",
-                onClick = { activity.openFullScreenAlertSettings() })
-            val upd = activity.updateInfo
-            SettingRow(Icons.Filled.SystemUpdate, MaterialTheme.colorScheme.primary, "App updates",
-                when {
-                    activity.updateDownloading -> "Downloading… ${(activity.updateProgress * 100).toInt()}%"
-                    activity.updateBusy -> "Checking for updates…"
-                    upd != null -> "v${upd.version} available · tap to update"
-                    else -> "v${activity.installedVersion()} · tap to check for a newer version"
+        if (showSpeedSlots) {
+            val saved = (1..9).associateWith { prefs.getString("speed:$it", "") ?: "" }
+            AlertDialog(
+                onDismissRequest = { showSpeedSlots = false },
+                title = { Text("Speed dial") },
+                text = {
+                    Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                        Text("Tap a key to set or change the number saved on it. Hold the key in the dial pad to call.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        (1..9).forEach { d ->
+                            val number = saved[d] ?: ""
+                            Row(Modifier.fillMaxWidth().clickable {
+                                speedEditSlot = d; speedEditNumber = number; showSpeedEdit = true
+                            }.padding(vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Box(Modifier.size(32.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) {
+                                    Text("$d", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
+                                }
+                                Text(
+                                    if (number.isBlank()) "Not set" else number,
+                                    fontSize = 13.sp, modifier = Modifier.weight(1f).padding(start = 12.dp),
+                                    color = if (number.isBlank()) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                                Text("Change", fontSize = 11.5.sp, color = MaterialTheme.colorScheme.primary)
+                            }
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+                        }
+                    }
                 },
-                onClick = {
-                    if (activity.updateInfo != null) activity.showUpdateDialog = true else activity.checkForUpdates(manual = true)
-                })
-            SettingRow(Icons.Filled.WifiTethering, MaterialTheme.colorScheme.primary, "Check for updates automatically",
-                if (activity.autoUpdateEnabled()) "On · checked on start (at most every 6 hours)" else "Off · only when you tap App updates",
-                toggle = true, checked = activity.autoUpdateEnabled(), onClick = { activity.setAutoUpdate(!activity.autoUpdateEnabled()) })
-            SettingRow(Icons.Filled.BugReport, MaterialTheme.colorScheme.primary, "Crash log",
-                if (activity.hasCrashLog()) "An error was recorded · tap to share the log" else "No error recorded",
-                onClick = { activity.shareCrashLog() })
-            SettingRow(Icons.Filled.FlashOn, MaterialTheme.colorScheme.primary, "Power Mode", "Unrestricted · best for background SIP", onPower)
-            SettingRow(Icons.Filled.Palette, MaterialTheme.colorScheme.primary, "Theme color", "Accent applies to the whole app", onTheme)
-            SettingRow(Icons.Filled.DarkMode, MaterialTheme.colorScheme.primary, "Dark Mode", if (dark) "On" else "Off", toggle = true, checked = dark, onClick = { onDark(!dark) })
-            SettingRow(Icons.Filled.Contrast, MaterialTheme.colorScheme.primary, "AMOLED black",
-                if (amoled) "On · pure black background, less battery on OLED" else "Off · dark grey background",
-                toggle = true, checked = amoled, onClick = { onAmoled(!amoled) })
-            SettingRow(Icons.Filled.FormatSize, MaterialTheme.colorScheme.primary, "Text size",
-                when { fontScale < 0.95f -> "Small (85%)"; fontScale > 1.25f -> "Extra large (130%)"; fontScale > 1.05f -> "Large (115%)"; else -> "Default (100%)" },
-                onClick = { showFontSize = true })
+                confirmButton = {
+                    Row {
+                        TextButton(onClick = { showSpeedSlots = false; onSpeedDial() }) { Text("All speed dials") }
+                        TextButton(onClick = { showSpeedSlots = false }) { Text("Close") }
+                    }
+                }
+            )
+        }
+        if (showQuietHours) {
+            var qOn by remember { mutableStateOf(prefs.getBoolean("setting:quietOn", false)) }
+            var qStart by remember { mutableIntStateOf(prefs.getInt("setting:quietStart", 22)) }
+            var qEnd by remember { mutableIntStateOf(prefs.getInt("setting:quietEnd", 7)) }
+            AlertDialog(
+                onDismissRequest = { showQuietHours = false },
+                title = { Text("Quiet hours") },
+                text = {
+                    Column(Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState())) {
+                        Text("Calls still arrive during quiet hours, but the ringtone and vibration stay silent. The call screen shows the call as usual.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Quiet hours on", fontSize = 13.sp, modifier = Modifier.weight(1f))
+                            Switch(checked = qOn, onCheckedChange = { qOn = it }, colors = SwitchDefaults.colors(checkedTrackColor = MaterialTheme.colorScheme.primary))
+                        }
+                        Text("From ${qStart.toString().padStart(2, '0')}:00", fontSize = 12.5.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(top = 8.dp))
+                        Slider(value = qStart.toFloat(), onValueChange = { qStart = it.toInt() }, valueRange = 0f..23f, steps = 22)
+                        Text("Until ${qEnd.toString().padStart(2, '0')}:00", fontSize = 12.5.sp, fontWeight = FontWeight.Medium)
+                        Slider(value = qEnd.toFloat(), onValueChange = { qEnd = it.toInt() }, valueRange = 0f..23f, steps = 22)
+                        if (qStart == qEnd) Text("From and until are the same, so quiet hours will not run.", fontSize = 11.sp, color = Color(0xFFD64545))
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        prefs.edit().putBoolean("setting:quietOn", qOn)
+                            .putInt("setting:quietStart", qStart).putInt("setting:quietEnd", qEnd).apply()
+                        showQuietHours = false
+                        activity.resumeTick++
+                    }) { Text("Save") }
+                },
+                dismissButton = { TextButton(onClick = { showQuietHours = false }) { Text("Cancel") } }
+            )
+        }
+        if (showTimeFormat) {
+            AlertDialog(
+                onDismissRequest = { showTimeFormat = false },
+                title = { Text("Time format") },
+                text = {
+                    Column {
+                        listOf(false to "Follow the phone's setting", true to "24-hour (14:30)").forEach { (value, label) ->
+                            Row(Modifier.fillMaxWidth().clickable {
+                                prefs.edit().putBoolean("setting:time24", value).apply()
+                                showTimeFormat = false
+                                activity.resumeTick++
+                                activity.errorMessage = "Time format saved. Call history times refresh on the next load."
+                            }.padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = prefs.getBoolean("setting:time24", false) == value, onClick = {
+                                    prefs.edit().putBoolean("setting:time24", value).apply()
+                                    showTimeFormat = false
+                                    activity.resumeTick++
+                                })
+                                Text(label, fontSize = 13.sp, modifier = Modifier.padding(start = 4.dp))
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { showTimeFormat = false }) { Text("Close") } }
+            )
+        }
+        if (showSpeedEdit) {
+            AlertDialog(
+                onDismissRequest = { showSpeedEdit = false },
+                title = { Text("Speed dial ${speedEditSlot}") },
+                text = {
+                    Column {
+                        Text("Hold ${speedEditSlot} on the dial pad to call this number.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = speedEditNumber,
+                            onValueChange = { speedEditNumber = it.filter { c -> c.isDigit() || c == '+' || c == '*' || c == '#' } },
+                            singleLine = true, label = { Text("Number (leave empty to clear)") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                            shape = RoundedCornerShape(14.dp)
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text("Saved numbers: " + (1..9).mapNotNull { d -> (prefs.getString("speed:$d", "") ?: "").takeIf { it.isNotBlank() }?.let { "$d → $it" } }.joinToString(" · ").ifBlank { "none yet" }, fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (speedEditNumber.isBlank()) prefs.edit().remove("speed:$speedEditSlot").apply()
+                        else prefs.edit().putString("speed:$speedEditSlot", speedEditNumber.trim()).apply()
+                        showSpeedEdit = false
+                        activity.errorMessage = if (speedEditNumber.isBlank()) "Speed dial $speedEditSlot cleared." else "Speed dial $speedEditSlot → $speedEditNumber saved."
+                    }) { Text("Save") }
+                },
+                dismissButton = { TextButton(onClick = { showSpeedEdit = false }) { Text("Cancel") } }
+            )
+        }
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 90.dp)) {
+            if (openGroup == null) {
+                /* ---------- First page: only the groups, one tap opens the options ---------- */
+                Text(
+                    "Everything is sorted into groups. Tap a group to open its options.",
+                    fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 2.dp)
+                )
+                groups.forEach { g ->
+                    NavigationRow(g.icon, g.title, groupSubtitle(g.id), onClick = { openGroupId = g.id })
+                }
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "v${activity.installedVersion()} · CallerX VoIP dialer",
+                    fontSize = 10.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), textAlign = TextAlign.Center
+                )
+            } else when (openGroup.id) {
+
+                /* ---------- SIP account & PBX ---------- */
+                "sip" -> {
+                    subRow(Icons.Filled.Cloud, "SIP account", if (defaultAcc != null) "${defaultAcc.domain} · ${activity.registrationMessage}" else "No account added · tap to add one", onSip)
+                    subRow(Icons.Filled.Dialpad, "PBX feature codes", "Park ${parkCode.ifBlank { "—" }} · pickup ${pickupCode.ifBlank { "—" }} · one-tap during a call") { showPbx = true }
+                    subRow(Icons.Filled.CallSplit, "Call forwarding", activity.forwardingSummary()) { onForwarding?.invoke() }
+                    subRow(Icons.Filled.History, "SIP registration log", "Last states of your SIP accounts, newest on top") { activity.errorMessage = activity.sipHistorySummary() }
+                    subRow(Icons.Filled.Speed, "Server latency (ping)", "Measure how long your SIP server takes to answer") { activity.measureSipLatency() }
+                    subRow(Icons.Filled.Refresh, "Re-register all accounts", "Force a fresh SIP registration without restarting the app") {
+                        activity.forceReregister()
+                    }
+                }
+
+                /* ---------- Calling & SIM ---------- */
+                "calls" -> {
+                    subRow(Icons.Filled.Call, "Default call route", if (route.isBlank()) "Not set — you are asked every time" else "All calls go via $route", onRoute)
+                    subRow(Icons.Filled.SwapCalls, "Ask before each call", if (ask) "Choose SIP or an enabled SIM every time" else "Use the default route automatically") {
+                        ask = !ask; prefs.edit().putBoolean("setting:Ask before each call", ask).apply()
+                    }
+                    subRow(Icons.Filled.SimCard, "SIM 1", if (sim1) "Shown in the call sheet" else "Hidden from the call sheet") {
+                        sim1 = !sim1; prefs.edit().putBoolean("setting:SIM 1", sim1).apply()
+                    }
+                    subRow(Icons.Filled.SimCard, "SIM 2", if (sim2) "Shown in the call sheet" else "Hidden from the call sheet") {
+                        sim2 = !sim2; prefs.edit().putBoolean("setting:SIM 2", sim2).apply()
+                    }
+                    subRow(Icons.Filled.Dialpad, "Speed dial", "Hold 1-9 in the dial pad to call the saved number") { showSpeedSlots = true }
+                    subRow(Icons.Filled.Voicemail, "Voicemail number", if (voicemail.isBlank()) "Not set · hold 1 on the dial pad to call it" else "$voicemail · hold 1 to call") { showVoicemail = true }
+                    subRow(Icons.Filled.Language, "Call voicemail over SIP", if (prefs.getBoolean("setting:vmSip", false)) "On · hold 1 dials the number through your SIP line" else "Off · hold 1 dials it with SIM 1") {
+                        prefs.edit().putBoolean("setting:vmSip", !prefs.getBoolean("setting:vmSip", false)).apply()
+                        activity.resumeTick++
+                    }
+                    subRow(Icons.Filled.SwapCalls, "Call waiting", if (prefs.getBoolean("setting:callWaiting", true)) "On · a second call rings and offers Answer & hold" else "Off · a second caller is told you are busy") {
+                        prefs.edit().putBoolean("setting:callWaiting", !prefs.getBoolean("setting:callWaiting", true)).apply()
+                        activity.resumeTick++
+                    }
+                    subRow(Icons.Filled.Schedule, "Time format in call history", if (prefs.getBoolean("setting:time24", false)) "24-hour · 14:30" else "Follow the phone's setting") { showTimeFormat = true }
+                }
+
+                /* ---------- Audio & codec ---------- */
+                "audio" -> {
+                    subRow(Icons.Filled.Headset, "Audio output", "Now: ${activity.callRouteLabel()} · also in the in-call ⋮ menu") { showAudioRouteSettings = true }
+                    subRow(Icons.Filled.VolumeOff, "Call audio only through headset", if (activity.headsetOnlyEnabled()) "On · never plays call audio on the phone speaker" else "Off · speaker and earpiece are allowed") {
+                        activity.setHeadsetOnly(!activity.headsetOnlyEnabled())
+                    }
+                    if (Build.VERSION.SDK_INT >= 31) subRow(Icons.Filled.Bluetooth, "Bluetooth call audio", if (activity.needsBluetoothPermission()) "Permission needed · tap to allow headset calls" else "Allowed · headsets can carry call audio") {
+                        activity.requestBluetoothPermission()
+                    }
+                    subRow(Icons.Filled.MusicNote, "Ringtone", activity.ringtoneLabel()) { activity.pickRingtone() }
+                    subRow(Icons.Filled.Vibration, "Incoming vibration", when (vibrationStyle) { 0 -> "Short buzz"; 2 -> "Long buzz"; else -> "Double buzz" }) { showVibration = true }
+                    subRow(Icons.Filled.VolumeUp, "Keypad tones", if (prefs.getBoolean("setting:keypadTone", true)) "On · a tone plays when you press a key" else "Off · the dial pad is silent") {
+                        prefs.edit().putBoolean("setting:keypadTone", !prefs.getBoolean("setting:keypadTone", true)).apply()
+                        activity.resumeTick++
+                    }
+                    subRow(Icons.Filled.VolumeUp, "Louder ringtone", if (prefs.getBoolean("setting:ringLouder", false)) "On · rings at full volume" else "Off · rings at 60% volume") {
+                        prefs.edit().putBoolean("setting:ringLouder", !prefs.getBoolean("setting:ringLouder", false)).apply()
+                        activity.resumeTick++
+                    }
+                    subRow(Icons.Filled.VolumeOff, "Silent and no vibration during a call", if (prefs.getBoolean("setting:silentDuringCall", false)) "On · a second call never rings in your ear" else "Off · a second call rings and vibrates") {
+                        prefs.edit().putBoolean("setting:silentDuringCall", !prefs.getBoolean("setting:silentDuringCall", false)).apply()
+                        activity.resumeTick++
+                    }
+                    subRow(Icons.Filled.Lock, "Quiet hours", if (prefs.getBoolean("setting:quietOn", false)) {
+                        "On · silent ${prefs.getInt("setting:quietStart", 22)}:00 – ${prefs.getInt("setting:quietEnd", 7)}:00 · calls still arrive"
+                    } else "Off · calls always ring") { showQuietHours = true }
+                    subRow(Icons.Filled.GraphicEq, "Adaptive audio (weak network)", if (autoCodec) "On · drop to narrowband when quality falls" else "Off · always use HD audio") {
+                        autoCodec = !autoCodec; prefs.edit().putBoolean("setting:autoCodec", autoCodec).apply()
+                    }
+                    subRow(Icons.Filled.Language, "Audio codecs", "Opus 16 kHz mono, G.722, PCMA, PCMU · echo cancellation on") {
+                        activity.errorMessage = "Codecs in use: Opus 16 kHz mono (low bandwidth, stable on 4G), G.722, PCMA, PCMU and DTMF events. Echo cancellation is always on."
+                    }
+                    subRow(Icons.Filled.Headset, "Audio diagnostics", "Lists every speaker / USB-C / Bluetooth device Android reports") { showAudioDiag = true }
+                }
+
+                /* ---------- Security & privacy ---------- */
+                "security" -> {
+                    subRow(Icons.Filled.Security, "Encrypted SIP transport (TLS)", if (tls) "On · every account uses TLS on port 5061" else "Off · each account uses its own transport") {
+                        tls = !tls; prefs.edit().putBoolean("setting:tls", tls).apply(); activity.applyAccounts()
+                    }
+                    subRow(Icons.Filled.Lock, "Encrypt call audio (SRTP)", if (srtp) "On · media is encrypted end to end" else "Off · only if your provider forces it") {
+                        srtp = !srtp; prefs.edit().putBoolean("setting:srtp", srtp).apply(); activity.applyAccounts()
+                    }
+                    subRow(Icons.Filled.Block, "Blocked numbers", "${activity.blockedNumbers().size} numbers · calls are rejected", onBlocked)
+                    subRow(Icons.Filled.Block, "Block before ringing", if (activity.screeningEnabled()) "On · blocked numbers never ring" else "Off · they ring once, then are declined") {
+                        activity.setScreening(!activity.screeningEnabled())
+                    }
+                    subRow(Icons.Filled.PersonAdd, "Block unknown callers", if (prefs.getBoolean("setting:blockUnknown", false)) "On · numbers not in your contacts are declined + auto-reply" else "Off · unknown numbers ring normally") {
+                        prefs.edit().putBoolean("setting:blockUnknown", !prefs.getBoolean("setting:blockUnknown", false)).apply()
+                        activity.resumeTick++
+                    }
+                    subRow(Icons.Filled.FileUpload, "Export blocked list", "${activity.blockedNumbers().size} numbers · text file you can share or keep") { activity.exportBlockedList() }
+                    subRow(Icons.Filled.FileDownload, "Import blocked list", "One number or +88017* wildcard per line · merges with the current list") { activity.pickBlockListFile() }
+                }
+
+                /* ---------- Missed calls & voicemail ---------- */
+                "missed" -> {
+                    subRow(Icons.Filled.Message, "Auto-SMS on missed call", if (missedSms) "On · the caller gets a text when you miss a SIP call" else "Off · missed SIP calls are only logged") {
+                        missedSms = !missedSms
+                        prefs.edit().putBoolean("setting:missedSms", missedSms).apply()
+                        if (missedSms) activity.requestSendSmsPermission()
+                    }
+                    subRow(Icons.AutoMirrored.Filled.Message, "Auto-reply message", if (missedText.isBlank()) "Default: “Sorry, I can't take your call right now…”" else missedText.take(60)) { showMissedText = true }
+                    subRow(Icons.Filled.Voicemail, "Voicemail number", if (voicemail.isBlank()) "Not set · hold 1 on the dial pad to call it" else "$voicemail · hold 1 to call") { showVoicemail = true }
+                }
+
+                /* ---------- Recording & quality ---------- */
+                "recordings" -> {
+                    subRow(Icons.Filled.Mic, "Auto call recording", if (autoRec) "On · every call is recorded (${activity.recordingCount()} saved)" else "Off · ${activity.recordingCount()} recordings saved") {
+                        autoRec = !autoRec; prefs.edit().putBoolean("setting:autoRecord", autoRec).apply()
+                    }
+                    subRow(Icons.Filled.PlayArrow, "Call recordings", "${activity.recordingCount()} saved · play, share or delete them") { onRecordings?.invoke() }
+                    subRow(Icons.Filled.Speed, "Call quality report", "MOS, jitter, packet loss and delay of your last SIP calls") { onQuality?.invoke() }
+                }
+
+                /* ---------- Backup & restore ---------- */
+                "backup" -> {
+                    subRow(Icons.Filled.Person, "Profile & backup account", if (activity.googleBackupAccount().isNotBlank()) "Google · ${activity.googleBackupAccount()}" else "Profile, Google account backup & phone storage", onProfile)
+                    subRow(Icons.Filled.Folder, "Automatic backup & restore", activity.autoBackupFolderLabel()) { activity.chooseBackupFolder() }
+                    subRow(Icons.Filled.Lock, "Backup password", if (activity.backupPasswordSet()) "On · new backups are encrypted (AES-256-GCM)" else "Off · backups are plain JSON") { showBackupPassword = true }
+                    subRow(Icons.Filled.RestorePage, "Restore parts of a backup", "Pick SIP accounts, speed dials, blocked numbers or settings only") { showRestoreParts = true }
+                    subRow(Icons.Filled.CloudUpload, "Save a backup now", "Opens the phone's file picker: Drive, Dropbox or storage") { activity.exportBackupToCloud() }
+                    subRow(Icons.Filled.Save, "Backup to phone storage", "Downloads/CallerX · a readable JSON file") { activity.backupToPhoneStorage() }
+                    subRow(Icons.Filled.RestorePage, "Restore from newest backup", activity.lastBackupLabel()) { activity.restoreFromBackup() }
+                }
+
+                /* ---------- Appearance ---------- */
+                "appearance" -> {
+                    subRow(Icons.Filled.Palette, "Theme color", "Accent applies to the whole app", onTheme)
+                    subRow(Icons.Filled.DarkMode, "Dark mode", if (dark) "On · dark colours everywhere" else "Off · light colours everywhere") { onDark(!dark) }
+                    subRow(Icons.Filled.Contrast, "AMOLED black", if (amoled) "On · pure black background, less battery on OLED" else "Off · dark grey background") { onAmoled(!amoled) }
+                    subRow(Icons.Filled.FormatSize, "Text size", when { fontScale < 0.95f -> "Small (85%)"; fontScale > 1.25f -> "Extra large (130%)"; fontScale > 1.05f -> "Large (115%)"; else -> "Default (100%)" }) { showFontSize = true }
+                }
+
+                /* ---------- App lock & call alerts ---------- */
+                "lock" -> {
+                    subRow(Icons.Filled.Lock, "App lock (PIN)", if (pinDraft.isBlank()) "Off · lock CallerX with a 4-digit PIN" else "On · PIN required when the app opens") { showPinDialog = true }
+                    subRow(Icons.Filled.Pin, "Skip app PIN during calls", if (activity.pinSkipDuringCall()) "On · the PIN keypad never covers an incoming call" else "Off · the PIN keypad also covers calls") {
+                        prefs.edit().putBoolean("setting:pinSkipCall", !activity.pinSkipDuringCall()).apply(); activity.resumeTick++
+                    }
+                    subRow(Icons.Filled.LockOpen, "Show calls over the lock screen", if (activity.callOverLockEnabled()) "On · a ringing call appears on top of the lock screen" else "Off · calls only show as a notification") {
+                        prefs.edit().putBoolean("setting:callOverLock", !activity.callOverLockEnabled()).apply(); activity.resumeTick++
+                    }
+                    subRow(Icons.Filled.NotificationsActive, "Full-screen call alerts", if (activity.fullScreenCallAlertsAllowed()) "Allowed · Android shows the call screen instantly" else "Blocked by Android · tap to allow (needed for calls on the lock screen)") {
+                        activity.openFullScreenAlertSettings()
+                    }
+                    subRow(Icons.Filled.NotificationsActive, "Notification settings", "Android settings for CallerX call, missed-call and backup alerts") { activity.openNotificationSettings() }
+                }
+
+                /* ---------- Dialer & permissions ---------- */
+                "dialer" -> {
+                    subRow(Icons.Filled.Phone, "Default dialer", if (activity.isDefaultDialer()) "CallerX is the default dialer" else "Not set · tap to choose CallerX as the dialer") {
+                        activity.requestDefaultDialer()
+                    }
+                    subRow(Icons.Filled.CheckCircle, "Android permissions", "Set the default dialer, grant every permission, allow SMS") { onDialer() }
+                    subRow(Icons.Filled.FlashOn, "Power mode (battery)", "Unrestricted · best for background SIP", onPower)
+                    subRow(Icons.Filled.Settings, "Allow autostart on this phone", "Xiaomi / Oppo / Vivo / Realme / Huawei hide this in their own settings · tap to open") {
+                        activity.openAutostartSettings()
+                    }
+                    subRow(Icons.Filled.BatteryFull, "Battery optimization", if (activity.batteryOptimizationIgnored()) "CallerX is exempt · the SIP line stays online" else "Android may stop the SIP line when the phone sleeps") {
+                        activity.requestIgnoreBatteryOptimization()
+                    }
+                }
+
+                /* ---------- App updates & support ---------- */
+                "updates" -> {
+                    val upd = activity.updateInfo
+                    subRow(Icons.Filled.SystemUpdate, "App updates", when {
+                        activity.updateDownloading -> "Downloading… ${(activity.updateProgress * 100).toInt()}%"
+                        activity.updateBusy -> "Checking for updates…"
+                        upd != null -> "v${upd.version} available · tap to update"
+                        else -> "v${activity.installedVersion()} · tap to check for a newer version"
+                    }) {
+                        if (activity.updateInfo != null) activity.showUpdateDialog = true else activity.checkForUpdates(manual = true)
+                    }
+                    subRow(Icons.Filled.WifiTethering, "Check for updates automatically", if (activity.autoUpdateEnabled()) "On · checked on start (at most every 6 hours)" else "Off · only when you tap App updates") {
+                        activity.setAutoUpdate(!activity.autoUpdateEnabled())
+                    }
+                    subRow(Icons.Filled.Headset, "Audio diagnostics", "Every speaker / USB-C / Bluetooth device Android reports · share it if a headset stays silent") { showAudioDiag = true }
+                    subRow(Icons.Filled.BugReport, "Crash log", if (activity.hasCrashLog()) "An error was recorded · tap to share the log" else "No error recorded") { activity.shareCrashLog() }
+                }
+
+                else -> { }
+            }
         }
     }
+}
+
+/* One entry of the first Settings page (a group that opens its own short page). */
+private data class SettingsGroup(val id: String, val title: String, val subtitle: String, val icon: ImageVector)
+
+/* A row on the first page: icon, title, what is inside, and a chevron. */
+@Composable
+private fun NavigationRow(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit) {
+    val tint = MaterialTheme.colorScheme.primary
+    Row(
+        Modifier.fillMaxWidth().clickable { onClick() }.padding(horizontal = 18.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(44.dp).clip(CircleShape).background(tint.copy(alpha = 0.13f)), contentAlignment = Alignment.Center) {
+            Icon(icon, null, tint = tint, modifier = Modifier.size(21.dp))
+        }
+        Spacer(Modifier.width(13.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+            Text(subtitle, fontSize = 11.5.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+        Icon(Icons.Filled.ChevronRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+    }
+    HorizontalDivider(Modifier.padding(start = 75.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
 }
 
 @Composable
@@ -5596,7 +6039,9 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
         val t = numberRef.value
         if (!t.startsWith("+")) onNumber("+" + t)
     }
-    // DTMF tones like a real dialer (Google Dialer / Truecaller behaviour)
+    // DTMF tones like a real dialer (Google Dialer / Truecaller behaviour).
+    // Settings → Audio can switch the keypad tones off for a silent dial pad.
+    val keypadTonesOn = remember { context.getSharedPreferences("callerx", Context.MODE_PRIVATE).getBoolean("setting:keypadTone", true) }
     val toneGenerator = remember {
         try { ToneGenerator(AudioManager.STREAM_DTMF, 70) } catch (_: Exception) { null }
     }
@@ -5619,7 +6064,7 @@ private fun DialerScreen(number: String, onNumber: (String) -> Unit, contacts: L
             "#" -> ToneGenerator.TONE_DTMF_P
             else -> -1
         }
-        if (tone >= 0) try { toneGenerator?.startTone(tone, 150) } catch (_: Exception) { }
+        if (keypadTonesOn && tone >= 0) try { toneGenerator?.startTone(tone, 150) } catch (_: Exception) { }
     }
     // Live contact suggestions while typing (T9 + number), like Truecaller / Google Dialer
     val suggestions = remember(contacts, number) {
