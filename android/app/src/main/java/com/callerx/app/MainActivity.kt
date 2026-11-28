@@ -632,12 +632,13 @@ object SipEngine {
                                         showMissedCallNotification(remoteNumber, "Unknown caller")
                                         autoReplyToMissedCall(remoteNumber)
                                     }
-                                    /* Quiet hours: the phone stays silent but the call still comes in. */
-                                    quietHoursActive() -> {
-                                        stopIncomingVibration()
-                                        CallBridge.activity?.errorMessage = "Quiet hours · ringing muted for $remoteNumber."
+                                    !applyForwarding(call, waiting) -> {
+                                        /* Quiet hours: forwarding above still applies, only the sound is muted. */
+                                        if (quietHoursActive()) {
+                                            stopIncomingVibration()
+                                            CallBridge.activity?.errorMessage = "Quiet hours · ringing muted for $remoteNumber."
+                                        } else { startIncomingVibration(); startIncomingRingtone() }
                                     }
-                                    !applyForwarding(call, waiting) -> { startIncomingVibration(); startIncomingRingtone() }
                                 }
                             }
                             Call.State.OutgoingInit, Call.State.OutgoingProgress -> {
@@ -5896,7 +5897,7 @@ private fun SettingsScreen(activity: MainActivity, dark: Boolean, onDark: (Boole
                     subRow(Icons.Filled.Phone, "Default dialer", if (activity.isDefaultDialer()) "CallerX is the default dialer" else "Not set · tap to choose CallerX as the dialer") {
                         activity.requestDefaultDialer()
                     }
-                    subRow(Icons.Filled.CheckCircle, "Android permissions", "Microphone, phone, contacts, SMS and notifications") { activity.requestStartupPermissions() }
+                    subRow(Icons.Filled.CheckCircle, "Android permissions", "Set the default dialer, grant every permission, allow SMS") { onDialer() }
                     subRow(Icons.Filled.FlashOn, "Power mode (battery)", "Unrestricted · best for background SIP", onPower)
                     subRow(Icons.Filled.Settings, "Allow autostart on this phone", "Xiaomi / Oppo / Vivo / Realme / Huawei hide this in their own settings · tap to open") {
                         activity.openAutostartSettings()
